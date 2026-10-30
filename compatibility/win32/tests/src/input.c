@@ -101,6 +101,21 @@ static void icons_and_clipboard(HWND w) {
     check("close twice fails",!CloseClipboard() && GetLastError()==ERROR_CLIPBOARD_NOT_OPEN);
     SetLastError(0);
     check("data needs an open clipboard",GetClipboardData(CF_UNICODETEXT)==NULL && GetLastError()==ERROR_CLIPBOARD_NOT_OPEN);
+    check("open clipboard for text conversion",OpenClipboard(w));
+    check("empty clipboard",EmptyClipboard());
+    HGLOBAL text=GlobalAlloc(GMEM_FIXED | GMEM_ZEROINIT, 8);
+    if (text) { WCHAR *p=(WCHAR *)text; p[0]='O'; p[1]='K'; }
+    check("set unicode text",text && SetClipboardData(CF_UNICODETEXT,text)==text);
+    check("synthesized ANSI format is available",IsClipboardFormatAvailable(CF_TEXT));
+    const char *ansi=(const char *)GetClipboardData(CF_TEXT);
+    check("unicode to ANSI clipboard",ansi && ansi[0]=='O' && ansi[1]=='K' && ansi[2]==0);
+    check("clear clipboard for reverse conversion",EmptyClipboard());
+    HGLOBAL narrow=GlobalAlloc(GMEM_FIXED | GMEM_ZEROINIT, 4);
+    if (narrow) { char *p=(char *)narrow; p[0]='h'; p[1]='i'; }
+    check("set ANSI text",narrow && SetClipboardData(CF_TEXT,narrow)==narrow);
+    const WCHAR *wide=(const WCHAR *)GetClipboardData(CF_UNICODETEXT);
+    check("ANSI to unicode clipboard",wide && wide[0]=='h' && wide[1]=='i' && wide[2]==0);
+    check("close clipboard after conversion",CloseClipboard());
     UINT f=RegisterClipboardFormatW(L"OSyx Named Format"); WCHAR name[64]={0};
     int n=GetClipboardFormatNameW(f,name,64);
     check("format name",n==17 && name[0]=='O' && name[16]=='t' && name[17]==0);

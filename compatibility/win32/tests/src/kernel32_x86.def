@@ -1,0 +1,13 @@
+; kernel32 import stubs for the 32-bit test fixture (hello32.exe).
+; The i686 ABI decorates stdcall references (_GetStdHandle@4, and the
+; dllimport pointers __imp__GetStdHandle@4), but the OSyx loader resolves
+; imports by undecorated name, so the import table must carry the plain
+; names. ld.lld's stdcall fixup maps the decorated references onto these
+; plain stubs and prints "Resolving ... by linking to ..." for each.
+; Built once per run with:
+;   lld-link /lib /def:kernel32_x86.def /machine:x86 /out:kernel32_x86.lib
+LIBRARY kernel32.dll
+EXPORTS
+    GetStdHandle
+    WriteFile
+    ExitProcess

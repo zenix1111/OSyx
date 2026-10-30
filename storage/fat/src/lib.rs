@@ -185,6 +185,7 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) free_count: u32,
     next_free: u32,
     fsinfo_dirty: bool,
+    fat_generation: u64,
 }
 
 impl<D: BlockDevice> FileSystem<D> {
@@ -194,7 +195,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let mut bs = [0u8; SECTOR_SIZE];
         dev.read_sectors(0, &mut bs)?;
         let geo = parse_bpb(&bs, dev.sector_count())?;
-        let mut fs = FileSystem { dev, geo, fat_cache: Vec::new(), free_count: 0, next_free: 2, fsinfo_dirty: false };
+        let mut fs = FileSystem { dev, geo, fat_cache: Vec::new(), free_count: 0, next_free: 2, fsinfo_dirty: false, fat_generation: 0 };
         let mut have_info = false;
         if geo.fsinfo_sector != 0 && geo.fsinfo_sector != 0xFFFF && geo.fsinfo_sector < geo.reserved_sectors {
             let mut info = [0u8; SECTOR_SIZE];
@@ -218,6 +219,11 @@ impl<D: BlockDevice> FileSystem<D> {
             fs.free_count = fs.count_free()?;
             fs.fsinfo_dirty = true;
         }
+        // A label set by an operating system lives in the root directory;
+        // an unreadable root directory only costs the label.
+        if let Ok(Some(label)) = fs.root_dir_label() {
+            fs.geo.label = label;
+        }
         Ok(fs)
     }
 
@@ -225,7 +231,8 @@ impl<D: BlockDevice> FileSystem<D> {
         &self.geo
     }
 
-    /// Volume label from the boot sector (trailing spaces removed).
+    /// Volume label: the root directory's label entry if there is one, else
+    /// the boot sector's (trailing spaces removed).
     pub fn label(&self) -> &str {
         let l = &self.geo.label;
         let end = l.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |i| i + 1);
@@ -332,6 +339,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let new = (old & !FAT_MASK) | (value & FAT_MASK);
         s.data[off..off + 4].copy_from_slice(&new.to_le_bytes());
         s.dirty = true;
+        self.fat_generation = self.fat_generation.saturating_add(1);
         Ok(())
     }
 

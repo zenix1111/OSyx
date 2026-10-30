@@ -246,6 +246,27 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
+    /// The volume label entry of the root directory (what Windows and
+    /// `label` set; the boot sector copy is often left at "NO NAME").
+    pub(crate) fn root_dir_label(&mut self) -> Result<Option<[u8; 11]>> {
+        let root = self.geo.root_cluster;
+        let mut found = None;
+        self.for_each_slot(root, |_, e| {
+            if e[0] == 0 {
+                return Ok(false);
+            }
+            let attr = e[11];
+            if e[0] != 0xE5 && attr & 0x3F != ATTR_LFN && attr & ATTR_VOLUME_ID != 0 && attr & ATTR_DIRECTORY == 0 {
+                let mut l = [0u8; 11];
+                l.copy_from_slice(&e[..11]);
+                found = Some(l);
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(found)
+    }
+
     /// Parses the directory at cluster `dir` into items (including `.`/`..`,
     /// excluding the volume label and deleted entries).
     pub(crate) fn read_items(&mut self, dir: u32) -> Result<Vec<Item>> {

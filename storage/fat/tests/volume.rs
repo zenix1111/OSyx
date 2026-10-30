@@ -268,6 +268,34 @@ fn rename_and_move() {
 }
 
 #[test]
+fn directory_cannot_replace_file() {
+    let mut fs = fresh(64 * MIB);
+    fs.create_dir("/directory").unwrap();
+    write_file(&mut fs, "/file", b"keep this data");
+    assert_eq!(fs.rename("/directory", "/file"), Err(FsError::NotADirectory));
+    assert!(fs.metadata("/directory").unwrap().is_dir);
+    assert_eq!(read_file(&mut fs, "/file"), b"keep this data");
+    check(&mut fs);
+}
+
+#[test]
+fn cached_cluster_is_invalidated_after_another_handle_rewrites_chain() {
+    let mut fs = fresh(64 * MIB);
+    write_file(&mut fs, "/data", &vec![1; 1536]);
+    let mut reader = fs.open("/data", OpenOptions::default()).unwrap();
+    let mut writer = fs.open("/data", OpenOptions::default()).unwrap();
+    let mut byte = [0];
+    fs.read(&mut reader, 1024, &mut byte).unwrap();
+    fs.truncate(&mut writer, 512).unwrap();
+    write_file(&mut fs, "/other", &vec![9; 1024]);
+    fs.truncate(&mut writer, 1536).unwrap();
+    fs.read(&mut reader, 1024, &mut byte).unwrap();
+    assert_eq!(byte, [0]);
+    assert_eq!(read_file(&mut fs, "/other"), vec![9; 1024]);
+    check(&mut fs);
+}
+
+#[test]
 fn full_volume_reports_no_space_and_stays_consistent() {
     let mut fs = fresh(34 * MIB);
     let chunk = pattern(MIB, 1);
@@ -327,10 +355,80 @@ fn rejects_corrupted_volumes() {
 }
 
 #[test]
+fn rejects_nonempty_file_without_first_cluster() {
+    let mut fs = fresh(64 * MIB);
+    write_file(&mut fs, "/broken.bin", b"data");
+    let g = *fs.geometry();
+    let mut image = fs.unmount().unwrap();
+    let root = (g.data_start + (g.root_cluster - 2) * g.sectors_per_cluster) as usize * 512;
+    let entry = image[root..root + g.cluster_bytes() as usize]
+        .as_chunks::<32>().0.iter()
+        .position(|entry| &entry[..11] == b"BROKEN  BIN")
+        .unwrap();
+    let entry = root + entry * 32;
+    image[entry + 20..entry + 22].fill(0);
+    image[entry + 26..entry + 28].fill(0);
+    let mut fs = FileSystem::mount(image).unwrap();
+    let mut file = fs.open("/broken.bin", OpenOptions::default()).unwrap();
+    assert!(matches!(fs.read(&mut file, 0, &mut [0; 1]), Err(FsError::Corrupt(_))));
+    assert!(matches!(fs.write(&mut file, 0, b"x"), Err(FsError::Corrupt(_))));
+}
+
+#[test]
+fn rejects_directory_without_first_cluster() {
+    let mut fs = fresh(64 * MIB);
+    fs.create_dir("/broken").unwrap();
+    write_file(&mut fs, "/protected", b"keep");
+    let g = *fs.geometry();
+    let mut image = fs.unmount().unwrap();
+    let root = (g.data_start + (g.root_cluster - 2) * g.sectors_per_cluster) as usize * 512;
+    let entry = image[root..root + g.cluster_bytes() as usize]
+        .as_chunks::<32>().0.iter()
+        .position(|entry| &entry[..11] == b"BROKEN     ")
+        .unwrap();
+    let entry = root + entry * 32;
+    image[entry + 20..entry + 22].fill(0);
+    image[entry + 26..entry + 28].fill(0);
+    let mut fs = FileSystem::mount(image).unwrap();
+    assert!(matches!(fs.read_dir("/broken"), Err(FsError::Corrupt(_))));
+    assert!(matches!(fs.remove_file("/broken/protected"), Err(FsError::Corrupt(_))));
+    assert_eq!(read_file(&mut fs, "/protected"), b"keep");
+}
+
+#[test]
+fn rejects_invalid_parent_directory_cluster() {
+    let mut fs = fresh(64 * MIB);
+    fs.create_dir("/child").unwrap();
+    write_file(&mut fs, "/protected", b"keep");
+    let cluster = fs.metadata("/child").unwrap().first_cluster;
+    let g = *fs.geometry();
+    let mut image = fs.unmount().unwrap();
+    let child = (g.data_start + (cluster - 2) * g.sectors_per_cluster) as usize * 512;
+    assert_eq!(&image[child + 32..child + 43], b"..         ");
+    image[child + 32 + 26..child + 32 + 28].copy_from_slice(&1u16.to_le_bytes());
+    let mut fs = FileSystem::mount(image).unwrap();
+    assert!(matches!(fs.metadata("/child/../protected"), Err(FsError::Corrupt(_))));
+    assert!(matches!(fs.create_dir("/child/../new"), Err(FsError::Corrupt(_))));
+    assert_eq!(read_file(&mut fs, "/protected"), b"keep");
+}
+
+#[test]
 fn block_device_bounds() {
     let mut img = vec![0u8; 4096];
     let mut buf = [0u8; 512];
     assert!(img.read_sectors(7, &mut buf).is_ok());
     assert!(img.read_sectors(8, &mut buf).is_err());
     assert!(img.write_sectors(u64::MAX, &buf).is_err());
+}
+
+#[test]
+fn root_directory_label_wins_over_the_boot_sector() {
+    // Windows stores a label it sets only in the root directory entry.
+    let mut img = vec![0u8; 64 * MIB];
+    format(&mut img, "NO NAME", 1).unwrap();
+    let fs = FileSystem::mount(img.clone()).unwrap();
+    let root = fs.geometry().data_start as usize * 512;
+    assert_eq!(fs.label(), "NO NAME");
+    img[root..root + 11].copy_from_slice(b"PENDRIVE   ");
+    assert_eq!(FileSystem::mount(img).unwrap().label(), "PENDRIVE");
 }

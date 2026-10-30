@@ -29,16 +29,25 @@ pub(crate) fn parse(pe: PeFile<'_>) -> Result<Option<TlsInfo<'_>>> {
     if !d.is_present() {
         return Ok(None);
     }
-    if (d.size as usize) < DIRECTORY_SIZE {
-        return Err(bad("directory smaller than IMAGE_TLS_DIRECTORY64"));
+    // IMAGE_TLS_DIRECTORY32 has 32-bit pointers: 24 bytes, zero fill at 16.
+    let pe32 = pe.is_pe32();
+    let size = if pe32 { 24 } else { DIRECTORY_SIZE };
+    if (d.size as usize) < size {
+        return Err(bad("directory smaller than IMAGE_TLS_DIRECTORY"));
     }
-    let raw = pe.slice_at_rva(d.virtual_address, DIRECTORY_SIZE).map_err(|_| bad("directory not in file"))?;
-    let q = |i: usize| {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&raw[i..i + 8]);
-        u64::from_le_bytes(a)
-    };
+    let raw = pe.slice_at_rva(d.virtual_address, size).map_err(|_| bad("directory not in file"))?;
     let l = |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]);
+    // The pointer fields, widened: 4 bytes each in a PE32 image, 8 in PE32+.
+    let q = |i: usize| {
+        if pe32 {
+            l(i / 2) as u64
+        } else {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&raw[i..i + 8]);
+            u64::from_le_bytes(a)
+        }
+    };
+    let (zero_fill_at, flags_at) = if pe32 { (16, 20) } else { (32, 36) };
     let to_rva = |va: u64, what| if va == 0 { Ok(0) } else { pe.va_to_rva(va).ok_or(bad(what)) };
     let start = to_rva(q(0), "raw data start outside the image")?;
     let end = to_rva(q(8), "raw data end outside the image")?;
@@ -56,8 +65,8 @@ pub(crate) fn parse(pe: PeFile<'_>) -> Result<Option<TlsInfo<'_>>> {
         raw_data_end_rva: end,
         index_rva,
         callbacks_rva,
-        size_of_zero_fill: l(32),
-        characteristics: l(36),
+        size_of_zero_fill: l(zero_fill_at),
+        characteristics: l(flags_at),
     }))
 }
 
@@ -95,12 +104,17 @@ impl Iterator for TlsCallbacks<'_> {
             if self.count == MAX_CALLBACKS {
                 return Err(bad("callback array not terminated"));
             }
-            let va = self.pe.u64_at_rva(self.next).map_err(|_| bad("callback array not in file"))?;
+            let width = if self.pe.is_pe32() { 4 } else { 8 };
+            let va = if self.pe.is_pe32() {
+                self.pe.u32_at_rva(self.next).map_err(|_| bad("callback array not in file"))? as u64
+            } else {
+                self.pe.u64_at_rva(self.next).map_err(|_| bad("callback array not in file"))?
+            };
             if va == 0 {
                 return Ok(None);
             }
             let rva = self.pe.va_to_rva(va).ok_or(bad("callback outside the image"))?;
-            self.next = self.next.checked_add(8).ok_or(bad("callback array overflows"))?;
+            self.next = self.next.checked_add(width).ok_or(bad("callback array overflows"))?;
             self.count += 1;
             Ok(Some(rva))
         })();

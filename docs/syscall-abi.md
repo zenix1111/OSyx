@@ -1,7 +1,9 @@
-# System call ABI (version 10)
+# System call ABI (version 13)
 
 Defined in `shared/abi`; kernel side in `kernel/src/syscall.rs`, user side in
-`runtime/os-sys`.
+`runtime/os-sys`. Version 13 adds `set_fs32_base` (96); the table below lists
+the calls up to the file system set, newer numbers are documented in
+`osyx_abi::nr`.
 
 ## Convention
 
@@ -156,6 +158,14 @@ in FIFO order; callers must tolerate spurious returns.
 Each thread has its own FS base, saved and restored on context switch.
 OSyx Std points it at a thread control block whose first word is its own
 address (`fs:[0]`).
+
+`set_fs32_base` (96) sets the descriptor-based FS base of 32-bit
+compatibility-mode code, which reads its TEB at `fs:[0x18]`. The value must
+be page-aligned and below 4 GiB (and 0 or a user address); it is switched
+with the thread and cleared by `execve`. IA-32e has one hidden FS base, so a
+non-zero base also replaces the base 64-bit code sees until `set_fs_base`
+(14) is called again; a zero base restores the thread's 64-bit base. A mixed
+32/64-bit program switches the two at each mode crossing.
 
 ## Errors
 
