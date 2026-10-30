@@ -39,7 +39,9 @@ pub fn truncate<T>(key: (u64, u64), size: u64, operation: impl FnOnce() -> Resul
 }
 
 struct State {
-    pages: Vec<Arc<SharedMemory>>,
+    /// Page index -> contents. Read-only views fill pages on first touch, so
+    /// indices may be missing; writable views are filled when they are made.
+    pages: BTreeMap<u64, Arc<SharedMemory>>,
     size: u64,
     file: process::FileHandle,
     can_write: bool,
@@ -82,10 +84,17 @@ pub fn create(file: process::FileHandle, requested: u64, writable: bool) -> Resu
             Some(b) => b.clone(),
             None => Arc::new(Backing {
                 key,
-                state: KMutex::new(State { pages: Vec::new(), size: 0, file: file.clone(), can_write: writable }),
+                state: KMutex::new(State { pages: BTreeMap::new(), size: 0, file: file.clone(), can_write: writable }),
             }),
         };
-        backing.grow(file, size, writable)?;
+        if writable {
+            backing.grow(file, size, writable)?;
+        } else {
+            // Read-only views load pages from the first page fault: a browser
+            // archive of 177 MiB is mapped whole but touches only a fraction.
+            let mut state = backing.state.lock();
+            state.size = state.size.max(size);
+        }
         cache.insert(key, backing.clone());
         backing
     };
@@ -117,54 +126,50 @@ impl Backing {
         if size > source.stat()?.size {
             source.truncate(size)?;
         }
-        let old_pages = state.pages.len();
-        let total = size.div_ceil(mem::PAGE_SIZE) as usize;
+        let old_size = state.size;
+        let total = size.div_ceil(mem::PAGE_SIZE);
         let started = crate::interrupts::uptime_ms();
-        let mut extra = Vec::with_capacity(total - old_pages);
-        let key = source.cache_key();
         let mut scratch: Vec<u8> = Vec::new();
-        let mut index = old_pages;
+        let mut index = 0;
         while index < total {
-            let offset = index as u64 * mem::PAGE_SIZE;
-            if !writable && !state.can_write {
-                if let Some((page, _)) = crate::filecache::peek(key, index as u64) {
-                    extra.push(page);
-                    index += 1;
-                    continue;
-                }
+            if state.pages.contains_key(&index) {
+                index += 1;
+                continue;
             }
+            let offset = index * mem::PAGE_SIZE;
             let bytes = (size - offset).min(READ_RUN) as usize;
-            let pages = bytes.div_ceil(mem::PAGE_SIZE as usize);
             scratch.resize(bytes, 0);
             read_run(&source, offset, &mut scratch)?;
+            let pages = bytes.div_ceil(mem::PAGE_SIZE as usize);
             for k in 0..pages {
+                let at = index + k as u64;
+                if state.pages.contains_key(&at) {
+                    continue;
+                }
                 let start = k * mem::PAGE_SIZE as usize;
                 let count = (bytes - start).min(mem::PAGE_SIZE as usize);
-                extra.push(SharedMemory::page_from(&scratch[start..start + count])?);
+                state.pages.insert(at, SharedMemory::page_from(&scratch[start..start + count])?);
             }
-            index += pages;
+            index += pages as u64;
         }
         // A section may grow within the final page of an earlier view.
         // Load only the newly covered bytes, preserving live mapped data.
-        if state.size != 0 && !state.size.is_multiple_of(mem::PAGE_SIZE) {
-            let offset = state.size;
-            let index = (offset / mem::PAGE_SIZE) as usize;
-            let within = offset % mem::PAGE_SIZE;
-            let count = (size - offset).min(mem::PAGE_SIZE - within) as usize;
-            // SAFETY: the backing retains this RAM page throughout the copy.
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (mem::phys_to_virt(state.pages[index].frames()[0]) + within) as *mut u8,
-                    count,
-                )
-            };
-            read_run(&source, offset, bytes)?;
+        if old_size != 0 && !old_size.is_multiple_of(mem::PAGE_SIZE) {
+            let index = old_size / mem::PAGE_SIZE;
+            let within = old_size % mem::PAGE_SIZE;
+            let count = (size - old_size).min(mem::PAGE_SIZE - within) as usize;
+            if let Some(page) = state.pages.get(&index) {
+                // SAFETY: the backing retains this RAM page throughout the copy.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut((mem::phys_to_virt(page.frames()[0]) + within) as *mut u8, count)
+                };
+                read_run(&source, old_size, bytes)?;
+            }
         }
         let elapsed = crate::interrupts::uptime_ms().saturating_sub(started);
         if elapsed >= 200 {
             crate::kprintln!("filemap: {} MiB read in {} ms", size >> 20, elapsed);
         }
-        state.pages.extend(extra);
         state.size = size;
         Ok(())
     }
@@ -188,17 +193,25 @@ impl Backing {
             let mut copied = 0u64;
             while copied < run {
                 let pos = at + copied;
-                let index = (pos / mem::PAGE_SIZE) as usize;
+                let index = pos / mem::PAGE_SIZE;
                 let within = pos % mem::PAGE_SIZE;
                 let count = (run - copied).min(mem::PAGE_SIZE - within);
-                // SAFETY: this cached RAM page remains owned while state is held.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (mem::phys_to_virt(state.pages[index].frames()[0]) + within) as *const u8,
-                        count as usize,
-                    )
-                };
-                scratch.extend_from_slice(bytes);
+                match state.pages.get(&index) {
+                    // SAFETY: this cached RAM page remains owned while state is held.
+                    Some(page) => {
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(
+                                (mem::phys_to_virt(page.frames()[0]) + within) as *const u8,
+                                count as usize,
+                            )
+                        };
+                        scratch.extend_from_slice(bytes);
+                    }
+                    // Never loaded (read-only view): the file already holds
+                    // the same bytes, so write zeros only to keep the run
+                    // length; a writable view is always fully loaded.
+                    None => scratch.resize(scratch.len() + count as usize, 0),
+                }
                 copied += count;
             }
             let mut done = 0;
@@ -231,61 +244,53 @@ fn read_run(file: &crate::vfs::OpenFile, offset: u64, out: &mut [u8]) -> Result<
     Ok(())
 }
 
+/// Bytes read into the backing on one page fault: the faulting page and the
+/// following ones, so a sequential reader faults once per 256 KiB instead of
+/// once per page. The disk request overlaps nothing, but the run bounds the
+/// latency of a single fault.
+const FAULT_READ_RUN: u64 = 256 * 1024;
+
 impl Section {
-    pub fn map(&self, offset: u64, len: u64, writable: bool) -> Result<u64, Errno> {
-        if writable && !self.writable {
+    /// Reserves `[offset, offset + len)` of the section in the current
+    /// process. Read-only sections map no frames yet: the first touch of each
+    /// run loads it from the file (see [`Section::page`]).
+    pub fn map(section: &Arc<Section>, offset: u64, len: u64, writable: bool) -> Result<u64, Errno> {
+        if writable && !section.writable {
             return Err(Errno::PermissionDenied);
         }
-        if !offset.is_multiple_of(mem::PAGE_SIZE) || len == 0 || offset >= self.size || len > self.size - offset {
+        if !offset.is_multiple_of(mem::PAGE_SIZE) || len == 0 || offset >= section.size || len > section.size - offset {
             return Err(Errno::InvalidArgument);
         }
-        let frames = {
-            let state = self.backing.state.lock();
-            let first = (offset / mem::PAGE_SIZE) as usize;
-            let count = len.div_ceil(mem::PAGE_SIZE) as usize;
-            let heap = crate::mem::heap::HEAP_START;
-            let heap_end = heap + crate::mem::heap::HEAP_MAX;
-            let max_phys = mem::hhdm_size();
-            let mut frames = Vec::with_capacity(count);
-            let mut bad = None;
-            for (i, p) in state.pages[first..first + count].iter().enumerate() {
-                let arc = Arc::as_ptr(p) as usize;
-                if !(heap..heap_end).contains(&(arc as u64)) {
-                    if bad.is_none() {
-                        bad = Some((i, arc as u64, 0, 0));
-                    }
-                    frames.push(0);
-                    continue;
-                }
-                let f = p.frames();
-                let ptr = f.as_ptr() as u64;
-                let good = (heap..heap_end).contains(&ptr) && f.len() == 1 && f[0] < max_phys;
-                if !good {
-                    if bad.is_none() {
-                        bad = Some((i, arc as u64, ptr, f.len() as u64));
-                    }
-                    frames.push(0);
-                    continue;
-                }
-                frames.push(f[0]);
-            }
-            if let Some((i, arc, ptr, n)) = bad {
-                crate::kprintln!(
-                    "filemap: CORRUPT key={:?} off={offset:#x} len={len:#x} vec={:p} vlen={} vcap={} size={} strong={} i={i} arc={arc:#x} fptr={ptr:#x} fn={n}",
-                    self.backing.key,
-                    state.pages.as_ptr(),
-                    state.pages.len(),
-                    state.pages.capacity(),
-                    state.size,
-                    Arc::strong_count(&self.backing),
-                );
-                return Err(Errno::Io);
-            }
-            frames
-        };
-        let identity = (Arc::as_ptr(&self.backing) as usize, offset);
-        let alias = SharedMemory::alias(frames, self.backing.clone(), identity);
-        process::map_shared(alias, writable)
+        process::map_section(section.clone(), offset, len, writable)
+    }
+
+    /// Page `index` of the section, loading it (and the rest of its read run)
+    /// from the file on a miss. Called from a page fault without the process
+    /// table held; the backing state lock serialises concurrent faults and
+    /// the delayed writeback.
+    pub fn page(&self, index: u64) -> Result<Arc<SharedMemory>, Errno> {
+        let mut state = self.backing.state.lock();
+        if let Some(page) = state.pages.get(&index) {
+            return Ok(page.clone());
+        }
+        let total = self.size.div_ceil(mem::PAGE_SIZE);
+        if index >= total {
+            return Err(Errno::InvalidArgument);
+        }
+        let offset = index * mem::PAGE_SIZE;
+        let bytes = (self.size - offset).min(FAULT_READ_RUN) as usize;
+        let mut buf = alloc::vec![0u8; bytes];
+        {
+            let file = state.file.lock();
+            read_run(&file, offset, &mut buf)?;
+        }
+        let pages = bytes.div_ceil(mem::PAGE_SIZE as usize);
+        for k in 0..pages {
+            let start = k * mem::PAGE_SIZE as usize;
+            let count = (bytes - start).min(mem::PAGE_SIZE as usize);
+            state.pages.entry(index + k as u64).or_insert(SharedMemory::page_from(&buf[start..start + count])?);
+        }
+        state.pages.get(&index).cloned().ok_or(Errno::Io)
     }
 
     pub fn flush(&self, offset: u64, len: u64) -> Result<(), Errno> {

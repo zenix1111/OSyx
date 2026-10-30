@@ -1,12 +1,13 @@
-# Builds the Windows PE32+ test programs of the OSyx Windows runtime
-# (compatibility/win32/tests/src) with the MSYS2 clang + lld toolchain and no
-# C runtime, into build/wintests. build.ps1 installs them as /opt/wintests on
-# the root file system. Rebuilds only what changed; without clang it warns
-# and builds nothing (the Windows tests are then skipped).
+# Builds the Windows PE32+ and 32-bit PE32 test programs of the OSyx Windows
+# runtime (compatibility/win32/tests/src) with the MSYS2 clang + lld toolchain
+# and no C runtime, into build/wintests. build.ps1 installs them as
+# /opt/wintests on the root file system. Rebuilds only what changed; without
+# clang it warns and builds nothing (the Windows tests are then skipped).
 param([switch]$Force)
 . (Join-Path $PSScriptRoot 'common.ps1')
 $clang = Find-Tool 'clang' @('C:\msys64\ucrt64\bin\clang.exe')
 $dlltool = Find-Tool 'dlltool' @('C:\msys64\ucrt64\bin\dlltool.exe')
+$lldLink = Find-Tool 'lld-link' @('C:\msys64\ucrt64\bin\lld-link.exe')
 $out = Join-Path $BuildDir 'wintests'
 if (-not $clang -or -not $dlltool) {
     Write-Warning 'clang or dlltool not found (MSYS2 ucrt64): Windows test programs not built'
@@ -53,7 +54,7 @@ $programs = [ordered]@{
     'mapping.exe' = @{ Src = @('mapping.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lkernel32') }
     'winmm.exe' = @{ Src = @('winmm.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lwinmm', '-lkernel32') }
     'sandbox.exe' = @{ Src = @('sandbox.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-ladvapi32', '-lkernel32') }
-    'ole2.exe' = @{ Src = @('ole2.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lole32', '-luser32', '-lkernel32') }
+    'ole2.exe' = @{ Src = @('ole2.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lole32', '-lshell32', '-luser32', '-lkernel32') }
     'interop.exe' = @{ Src = @('interop.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lole32', '-loleaut32', '-luser32', '-luserenv', '-ldbghelp', '-lcrypt32', '-ladvapi32', '-lkernel32') }
     'msgwait.exe' = @{ Src = @('msgwait.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-lshell32', '-lole32', '-luser32', '-lgdi32', '-lkernel32') }
     'dwm.exe' = @{ Src = @('dwm.c'); Args = @('-Wl,--subsystem,console', '-Wl,-e,start', '-ldwmapi', '-limm32', '-lwtsapi32', '-luser32', '-lkernel32') }
@@ -101,4 +102,44 @@ foreach ($name in $programs.Keys) {
     }
 }
 Remove-Item "$out\*.lib" -ErrorAction SilentlyContinue
+# 32-bit (PE32) fixtures. There is no i686 sysroot on this machine, so the
+# programs import kernel32 through one import library built from
+# kernel32_x86.def, and ld.lld's stdcall fixup maps the decorated i686
+# references onto the plain import names. Compile and link run through clang
+# --target=i686-pc-windows-gnu with lld; lld-link is required for /lib.
+$pe32Programs = [ordered]@{
+    'hello32.exe' = @{ Src = @('hello32.c') }
+}
+$pe32Common = @('--target=i686-pc-windows-gnu', '-nostdlib', '-ffreestanding', '-O2', '-Wall', '-Werror')
+if ($pe32Programs.Count -gt 0) {
+    if (-not $lldLink) {
+        throw 'lld-link not found (C:\msys64\ucrt64\bin\lld-link.exe): the i686 toolchain is needed to build hello32.exe'
+    }
+    $kernel32x86 = Join-Path $out 'kernel32_x86.lib'
+    if (Stale $kernel32x86 @("$src\kernel32_x86.def", (Join-Path $PSScriptRoot 'build-wintests.ps1'))) {
+        Invoke-Checked 'kernel32 x86 import library' {
+            & $lldLink /lib "/def:$src\kernel32_x86.def" /machine:x86 /out:$kernel32x86
+        }
+    }
+    foreach ($name in $pe32Programs.Keys) {
+        $p = $pe32Programs[$name]
+        $objects = @()
+        foreach ($s in $p.Src) {
+            $srcFile = Join-Path $src $s
+            $obj = Join-Path $out (($s -replace '\.c$', '') + '.32.o')
+            $objects += $obj
+            if (Stale $obj @($srcFile, (Join-Path $PSScriptRoot 'build-wintests.ps1'))) {
+                Invoke-Checked "$s (i686)" { & $clang @pe32Common -c $srcFile -o $obj }
+            }
+        }
+        $target = Join-Path $out $name
+        $inputs = $objects + @($kernel32x86, "$src\kernel32_x86.def", (Join-Path $PSScriptRoot 'build-wintests.ps1'))
+        if (Stale $target $inputs) {
+            Invoke-Checked $name {
+                & $clang '-fuse-ld=lld' @pe32Common '-Wl,--subsystem,console' '-Wl,-e,start' `
+                    '-Wl,--no-insert-timestamp' '-Wl,--build-id=none' @objects $kernel32x86 -o $target
+            }
+        }
+    }
+}
 Get-ChildItem $out -File -Include *.exe, *.dll -Recurse | ForEach-Object { Write-Host ("    {0,-14} {1,7} bytes" -f $_.Name, $_.Length) }

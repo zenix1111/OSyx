@@ -28,6 +28,7 @@
 //! compatibility layer, above this module (see docs/windows-compatibility.md).
 
 pub mod devfs;
+pub mod exfat;
 pub mod ext4;
 pub mod fat;
 pub mod tmpfs;
@@ -290,7 +291,10 @@ fn cache_forget(mount: u64, dir: u64, name: &str) {
     let lo = (mount, dir, false, String::new());
     let hi = (mount, dir, true, String::from("\u{10ffff}"));
     let stale: Vec<(u64, u64, bool, String)> =
-        t.range(lo..=hi).filter(|(_, c)| c.stored.eq_ignore_ascii_case(name)).map(|(k, _)| k.clone()).collect();
+        t.range(lo..=hi)
+            .filter(|(_, c)| c.stored.to_lowercase() == name.to_lowercase())
+            .map(|(k, _)| k.clone())
+            .collect();
     for k in stale {
         t.remove(&k);
     }
@@ -514,6 +518,42 @@ pub fn unmount(cx: &Lookup, p: &str) -> Result<()> {
     Ok(())
 }
 
+/// Takes the volumes mounted at `paths` out of the mount table in one
+/// step, so a group of volumes (the partitions of one USB stick) is either
+/// all detached or none is. Without `force`, a volume with open files or
+/// other mounts below it makes the whole call fail with `Busy` and changes
+/// nothing; `force` (the device is gone) detaches regardless, and open
+/// files then fail with I/O errors. The caller finishes each volume with
+/// `fs.unmount()`.
+pub fn detach_volumes(paths: &[String], force: bool) -> Result<Vec<Arc<Mount>>> {
+    let mut order: Vec<&String> = paths.iter().collect();
+    // Innermost first.
+    order.sort_by_key(|p| core::cmp::Reverse(p.len()));
+    let mut t = MOUNTS.lock();
+    let found: Vec<Arc<Mount>> = order.iter().filter_map(|p| t.exact(p).cloned()).collect();
+    if !force {
+        for m in &found {
+            // The table and `found` hold references; anything more is an
+            // open file or an operation in progress.
+            if Arc::strong_count(m) > 2 {
+                return Err(Errno::Busy);
+            }
+            let nested = t.iter().any(|(p, _)| p != m.path && path::is_within(p, &m.path) && !paths.iter().any(|q| q == p));
+            if nested {
+                return Err(Errno::Busy);
+            }
+        }
+    }
+    for m in &found {
+        if t.remove(&m.path).is_err() && force {
+            kprintln!("vfs: {} still has mounts below it", m.path);
+        }
+    }
+    drop(t);
+    cache_invalidate();
+    Ok(found)
+}
+
 /// Starts the write-back thread: once a second it lets every volume write
 /// what it has held in memory for too long (ext4: 5 s), so data written
 /// without `fsync` reaches the disk within seconds instead of only at the
@@ -546,8 +586,13 @@ pub fn mounts() -> Vec<Arc<Mount>> {
 /// True if a mounted volume lives on block device `name` (a disk or one
 /// of its partitions).
 pub fn device_in_use(name: &str) -> bool {
+    let devs = crate::block::devices();
+    let parent_of = |n: &str| devs.iter().find(|d| d.name() == n).and_then(|d| d.parent_name().map(String::from));
+    let wanted_parent = parent_of(name);
     mounts().iter().any(|m| {
-        m.fs.backing_device().is_some_and(|d| d == name || d.starts_with(name) || name.starts_with(d.as_str()))
+        m.fs.backing_device().is_some_and(|d| {
+            d == name || wanted_parent.as_deref() == Some(d.as_str()) || parent_of(&d).as_deref() == Some(name)
+        })
     })
 }
 
@@ -1067,7 +1112,7 @@ impl OpenFile {
 
 // ---- mount from user space ----------------------------------------------------
 
-/// `mount(2)`: `fstype` is "tmpfs", "fat32" or "ext4"; disk file systems
+/// `mount(2)`: `fstype` is "tmpfs", "fat32", "exfat" or "ext4"; disk file systems
 /// take a block device node path as `source`.
 pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, size_limit: u64) -> Result<()> {
     if !cx.cred.is_root() {
@@ -1085,7 +1130,7 @@ pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, 
             let limit = if size_limit == 0 { tmpfs::DEFAULT_LIMIT } else { size_limit };
             Arc::new(tmpfs::TmpfsVolume::new(limit, 0o1777))
         }
-        "fat32" | "ext4" => {
+        "fat32" | "ext4" | "exfat" => {
             let dev = walk(cx, source, true)?;
             let disk = dev.mount.fs.device(dev.ino).and_then(|d| d.block()).ok_or(Errno::InvalidArgument)?;
             if device_in_use(disk.name()) {
@@ -1101,8 +1146,21 @@ pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, 
 
 /// Opens a disk file system driver on `disk`.
 pub fn mount_disk(fstype: &str, disk: Arc<dyn crate::block::BlockDev>, read_only: bool) -> Result<Arc<dyn Filesystem>> {
+    mount_disk_owned(fstype, disk, read_only, None)
+}
+
+/// Like [`mount_disk`]; `owner` (uid, gid) becomes the owner of every file
+/// and directory of a FAT32 or exFAT volume, which have no owners of their
+/// own (ext4 keeps the ones on disk). Root owns them otherwise.
+pub fn mount_disk_owned(
+    fstype: &str,
+    disk: Arc<dyn crate::block::BlockDev>,
+    read_only: bool,
+    owner: Option<(u32, u32)>,
+) -> Result<Arc<dyn Filesystem>> {
     match fstype {
-        "fat32" => Ok(Arc::new(fat::FatVolume::mount(disk, read_only)?)),
+        "fat32" => Ok(Arc::new(fat::FatVolume::mount(disk, read_only, owner)?)),
+        "exfat" => Ok(Arc::new(exfat::ExfatVolume::mount(disk, read_only, owner)?)),
         "ext4" => Ok(Arc::new(ext4::Ext4Volume::mount(disk, read_only)?)),
         _ => Err(Errno::InvalidArgument),
     }

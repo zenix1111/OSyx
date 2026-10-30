@@ -58,6 +58,8 @@ pub struct FatVolume {
     label: String,
     device: String,
     read_only: bool,
+    /// Owner of every node (FAT has none on disk); root when `None`.
+    owner: (u32, u32),
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -117,7 +119,7 @@ impl State {
 }
 
 impl FatVolume {
-    pub fn mount(disk: Arc<dyn BlockDev>, read_only: bool) -> Result<FatVolume> {
+    pub fn mount(disk: Arc<dyn BlockDev>, read_only: bool, owner: Option<(u32, u32)>) -> Result<FatVolume> {
         let device = disk.name().to_string();
         let read_only = read_only || disk.read_only();
         let fs = FileSystem::mount(Disk(disk)).map_err(fs_errno)?;
@@ -127,7 +129,7 @@ impl FatVolume {
         let mut by_path = BTreeMap::new();
         by_path.insert(String::from("/"), ROOT);
         let state = State { fs, paths, by_path, next: ROOT + 1, open: BTreeMap::new(), files: BTreeMap::new() };
-        Ok(FatVolume { state: KMutex::new(state), label, device, read_only })
+        Ok(FatVolume { state: KMutex::new(state), label, device, read_only, owner: owner.unwrap_or((0, 0)) })
     }
 
     /// Full consistency check of the volume (FAT chains, sizes, free count).
@@ -150,7 +152,7 @@ impl FatVolume {
     }
 }
 
-fn stat_of(ino: u64, md: &osyx_fat::Metadata, cluster: u64) -> FileStat {
+fn stat_of(ino: u64, md: &osyx_fat::Metadata, cluster: u64, owner: (u32, u32)) -> FileStat {
     let (kind, mode) = if md.is_dir {
         (KIND_DIR, 0o755)
     } else if md.attributes & osyx_fat::ATTR_READ_ONLY != 0 {
@@ -170,6 +172,8 @@ fn stat_of(ino: u64, md: &osyx_fat::Metadata, cluster: u64) -> FileStat {
         mode,
         nlink: if md.is_dir { 2 } else { 1 },
         attributes: md.attributes as u32,
+        uid: owner.0,
+        gid: owner.1,
         ..Default::default()
     }
 }
@@ -209,7 +213,7 @@ impl Filesystem for FatVolume {
         let mut s = self.state.lock();
         let p = s.path(ino)?;
         let md = s.fs.metadata(&p).map_err(fs_errno)?;
-        Ok(stat_of(ino, &md, s.fs.geometry().cluster_bytes() as u64))
+        Ok(stat_of(ino, &md, s.fs.geometry().cluster_bytes() as u64, self.owner))
     }
 
     fn read_dir(&self, dir: u64) -> Result<Vec<DirEntry>> {

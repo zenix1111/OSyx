@@ -204,7 +204,13 @@ pub fn parse_response(msg: &[u8], id: u16, qname: &str, qtype: u16) -> Result<Re
         let data = match rtype {
             TYPE_A if rdlen == 4 => Data::A(Ipv4Addr([rdata[0], rdata[1], rdata[2], rdata[3]])),
             TYPE_A => return Err(DnsError::Truncated),
-            TYPE_CNAME => Data::Cname(read_name(msg, rdata_off)?.0),
+            TYPE_CNAME => {
+                let (target, next) = read_name(msg, rdata_off)?;
+                if next > rdata_off + rdlen {
+                    return Err(DnsError::Truncated);
+                }
+                Data::Cname(target)
+            }
             other => Data::Other(other),
         };
         answers.push(Record { name, ttl, data });

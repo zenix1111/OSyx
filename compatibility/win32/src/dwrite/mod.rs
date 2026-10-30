@@ -262,8 +262,8 @@ fn build(files: &[Arc<FileData>]) -> System {
         let bytes = file.bytes.clone();
         for index in 0..ttf::face_count(&bytes) {
             let Some(face) = ttf::Face::parse(bytes.clone(), index) else { continue };
-            // Faces without TrueType outlines would draw nothing.
-            if !face.has_glyf() {
+            // Faces without supported outlines would draw nothing.
+            if !face.has_outlines() {
                 continue;
             }
             let family_name = face.family();

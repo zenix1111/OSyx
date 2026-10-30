@@ -326,9 +326,18 @@ int timeout_add(struct timeout *to, int t)
 	return !was;
 }
 
-int timeout_add_msec(struct timeout *to, int ms) { return timeout_add(to, ms * hz / 1000); }
-int timeout_add_usec(struct timeout *to, int us) { return timeout_add(to, us / 1000 * hz / 1000); }
-int timeout_add_sec(struct timeout *to, int s) { return timeout_add(to, s * hz); }
+/* Round up so a timer never fires early; widen before multiplying. */
+static int timeout_units(struct timeout *to, int value, uint64_t units_per_sec)
+{
+	uint64_t ticks64 = value > 0 ? ((uint64_t)value * (uint64_t)hz + units_per_sec - 1) / units_per_sec : 1;
+	if (ticks64 > 0x7fffffffU)
+		ticks64 = 0x7fffffffU;
+	return timeout_add(to, (int)ticks64);
+}
+
+int timeout_add_msec(struct timeout *to, int ms) { return timeout_units(to, ms, 1000); }
+int timeout_add_usec(struct timeout *to, int us) { return timeout_units(to, us, 1000000); }
+int timeout_add_sec(struct timeout *to, int s) { return timeout_units(to, s, 1); }
 
 int timeout_del(struct timeout *to)
 {
@@ -634,6 +643,9 @@ int pci_mapreg_map(struct pci_attach_args *pa, int reg, pcireg_t type, int flags
 	(void)flags;
 	pcitag_t tag = pa->pa_tag;
 	pcireg_t low = osyx_bsd_pci_read(tag, reg);
+	/* Do not treat a different memory BAR type as the requested BAR. */
+	if (_PCI_MAPREG_TYPEBITS(low) != _PCI_MAPREG_TYPEBITS(type))
+		return EINVAL;
 	pcireg_t cmd = osyx_bsd_pci_read(tag, PCI_COMMAND_STATUS_REG);
 	osyx_bsd_pci_write(tag, PCI_COMMAND_STATUS_REG, cmd & ~(PCI_COMMAND_IO_ENABLE | PCI_COMMAND_MEM_ENABLE));
 	osyx_bsd_pci_write(tag, reg, 0xffffffff);
