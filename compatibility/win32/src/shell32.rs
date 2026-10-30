@@ -808,8 +808,34 @@ extern "win64" fn Shell_NotifyIconW(_message: u32, _data: u64) -> i32 {
     0
 }
 
-extern "win64" fn DragQueryFileW(_drop: u64, _index: u32, _buf: *mut u16, _count: u32) -> u32 {
-    0 // no shell drag-and-drop source exists
+extern "win64" fn DragQueryFileW(drop: u64, index: u32, buf: *mut u16, count: u32) -> u32 {
+    if drop == 0 { return 0; }
+    // SAFETY: HDROP is an HGLOBAL returned by the data object.
+    let len = kernel32::heap_size(drop);
+    if len < 20 { return 0; }
+    let data = unsafe { core::slice::from_raw_parts(drop as *const u8, len) };
+    let offset = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let wide = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) != 0;
+    let Some(bytes) = data.get(offset..) else { return 0 };
+    let units: Vec<u16> = if wide { bytes.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect() }
+        else { bytes.iter().map(|&b| b as u16).collect() };
+    let mut files = Vec::new();
+    let mut start = 0;
+    while start < units.len() {
+        let Some(end) = units[start..].iter().position(|&u| u == 0).map(|n| start + n) else { return 0 };
+        if end == start { break; }
+        files.push(&units[start..end]);
+        start = end + 1;
+    }
+    if index == u32::MAX { return files.len() as u32; }
+    let Some(file) = files.get(index as usize) else { return 0 };
+    if !buf.is_null() && count > 0 {
+        let n = file.len().min(count as usize - 1);
+        // SAFETY: the caller supplies a writable buffer of `count` WCHARs.
+        unsafe { core::ptr::copy_nonoverlapping(file.as_ptr(), buf, n); *buf.add(n) = 0; }
+        return n as u32;
+    }
+    file.len() as u32
 }
 
 extern "win64" fn ILCreateFromPathW(path: *const u16) -> u64 {

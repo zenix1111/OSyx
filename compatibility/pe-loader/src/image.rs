@@ -1,13 +1,45 @@
-//! Turns a parsed PE32+ file into its in-memory image: headers and sections
-//! laid out at their RVAs (zero-filled tails), base relocations applied for
-//! the address it is loaded at, and the page protections each part needs.
-//! Nothing here touches real memory; the caller supplies the destination and
-//! applies the protections.
+//! Turns a parsed PE32+ (or PE32) file into its in-memory image: headers and
+//! sections laid out at their RVAs (zero-filled tails), base relocations
+//! applied for the address it is loaded at, and the page protections each
+//! part needs. Nothing here touches real memory; the caller supplies the
+//! destination and applies the protections.
 
 use alloc::vec::Vec;
 use osyx_pe::{PeFile, RelocationKind};
 
 pub const PAGE: u32 = 4096;
+
+/// The width of the image's pointers: 4 bytes for PE32, 8 for PE32+.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeKind {
+    /// 32-bit (i386) image: HIGHLOW relocations, 4-byte thunks.
+    Pe32,
+    /// 64-bit (x86-64) image: DIR64 relocations, 8-byte thunks.
+    Pe32Plus,
+}
+
+/// Exclusively addresses a 32-bit image may use: `[0, 4 GiB)`.
+pub const ADDRESS_LIMIT32: u64 = 1 << 32;
+
+/// Raw `IMAGE_REL_BASED_DIR64` type, reported when a PE32 image asks for one.
+const REL_BASED_DIR64: u8 = 10;
+
+/// [`PeKind`] of `pe`.
+pub fn kind(pe: &PeFile<'_>) -> PeKind {
+    if pe.is_pe32() {
+        PeKind::Pe32
+    } else {
+        PeKind::Pe32Plus
+    }
+}
+
+/// Size of a pointer, a thunk and an IAT slot in `pe` (4 or 8 bytes).
+pub fn pointer_size(pe: &PeFile<'_>) -> u32 {
+    match kind(pe) {
+        PeKind::Pe32 => 4,
+        PeKind::Pe32Plus => 8,
+    }
+}
 
 pub const SUBSYSTEM_GUI: u16 = 2;
 pub const SUBSYSTEM_CONSOLE: u16 = 3;
@@ -15,7 +47,8 @@ pub const SUBSYSTEM_CONSOLE: u16 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageError {
     Parse(osyx_pe::PeError),
-    /// Not an x86-64 image.
+    /// The machine type does not match the optional header magic (x86-64
+    /// must be PE32+, i386 must be PE32).
     Machine(u16),
     /// Executables must be console or GUI programs.
     Subsystem(u16),
@@ -25,6 +58,8 @@ pub enum ImageError {
     Relocation(u8),
     /// A 32-bit relocation would truncate the new address.
     RelocationOverflow(u32),
+    /// A 32-bit image would extend past 4 GiB at the requested base.
+    BaseTooHigh,
     TooLarge,
     /// A section is both writable and executable (OSyx enforces W^X).
     WritableCode(u32),
@@ -51,7 +86,13 @@ pub const MAX_IMAGE: u32 = 512 << 20;
 
 /// Checks that the file is something OSyx can run or load.
 pub fn check(pe: &PeFile<'_>, want_dll: bool) -> Result<(), ImageError> {
-    if pe.machine() != osyx_pe::MACHINE_AMD64 {
+    // The machine type must match the header magic: an i386 image is PE32,
+    // an x86-64 image is PE32+.
+    let machine_ok = matches!(
+        (pe.machine(), kind(pe)),
+        (osyx_pe::MACHINE_I386, PeKind::Pe32) | (osyx_pe::MACHINE_AMD64, PeKind::Pe32Plus)
+    );
+    if !machine_ok {
         return Err(ImageError::Machine(pe.machine()));
     }
     if !want_dll {
@@ -113,6 +154,12 @@ pub fn relocatable(pe: &PeFile<'_>) -> bool {
 /// Applies base relocations for loading at `base` instead of the linked
 /// image base. Returns how many fields were patched.
 pub fn relocate(pe: &PeFile<'_>, img: &mut [u8], base: u64) -> Result<usize, ImageError> {
+    let pe32 = pe.is_pe32();
+    // 32-bit code cannot address anything at or above 4 GiB: the whole image
+    // must fit below it.
+    if pe32 && base.checked_add(pe.size_of_image() as u64).is_none_or(|end| end > ADDRESS_LIMIT32) {
+        return Err(ImageError::BaseTooHigh);
+    }
     let delta = base.wrapping_sub(pe.image_base());
     if delta == 0 {
         return Ok(0);
@@ -130,6 +177,11 @@ pub fn relocate(pe: &PeFile<'_>, img: &mut [u8], base: u64) -> Result<usize, Ima
         match r.kind {
             RelocationKind::Absolute => {}
             RelocationKind::Dir64 => {
+                // A 64-bit field in a 32-bit image is a malformed image, never
+                // patched in half.
+                if pe32 {
+                    return Err(ImageError::Relocation(REL_BASED_DIR64));
+                }
                 let f = img.get_mut(at..at + 8).ok_or(ImageError::TooLarge)?;
                 let v = u64::from_le_bytes(f.try_into().expect("8 bytes")).wrapping_add(delta);
                 f.copy_from_slice(&v.to_le_bytes());
@@ -195,4 +247,27 @@ pub fn read_u64(img: &[u8], rva: u32) -> Option<u64> {
 pub fn write_u64(img: &mut [u8], rva: u32, v: u64) -> Option<()> {
     img.get_mut(rva as usize..rva as usize + 8)?.copy_from_slice(&v.to_le_bytes());
     Some(())
+}
+
+/// Reads an ILT entry or IAT slot of the image's width at `rva`, widened to
+/// 64 bits (a PE32 slot is 4 bytes, zero-extended).
+pub fn read_thunk(img: &[u8], rva: u32, pe32: bool) -> Option<u64> {
+    if pe32 {
+        let s = img.get(rva as usize..rva as usize + 4)?;
+        Some(u32::from_le_bytes(s.try_into().expect("4 bytes")) as u64)
+    } else {
+        read_u64(img, rva)
+    }
+}
+
+/// Writes an IAT slot of the image's width. A PE32 slot keeps the low 32
+/// bits: 32-bit code cannot reach a 64-bit address, so the runtime must
+/// resolve 32-bit imports to stubs inside the low 4 GiB.
+pub fn write_thunk(img: &mut [u8], rva: u32, v: u64, pe32: bool) -> Option<()> {
+    if pe32 {
+        img.get_mut(rva as usize..rva as usize + 4)?.copy_from_slice(&(v as u32).to_le_bytes());
+        Some(())
+    } else {
+        write_u64(img, rva, v)
+    }
 }
