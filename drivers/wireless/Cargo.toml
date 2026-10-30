@@ -14,4 +14,4 @@ wpa = ["dep:sha1", "dep:hmac", "dep:pbkdf2", "dep:aes"]
 sha1 = { version = "0.10", default-features = false, features = ["force-soft"], optional = true }
 hmac = { version = "0.12", default-features = false, optional = true }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
-aes = { version = "0.8", default-features = false, optional = true }
+aes = { version = "0.9", default-features = false, optional = true }
