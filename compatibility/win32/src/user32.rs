@@ -76,6 +76,7 @@ pub const WM_MBUTTONDOWN: u32 = 0x0207;
 pub const WM_MBUTTONUP: u32 = 0x0208;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_CAPTURECHANGED: u32 = 0x0215;
+const WM_OSYX_FILE_DROP: u32 = 0x7fff_ff01;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const WS_CHILD: u32 = 0x4000_0000;
@@ -515,6 +516,7 @@ impl Gui {
             | Event::FocusChanged { window, .. }
             | Event::Key { window, .. }
             | Event::Pointer { window, .. }
+            | Event::FileDrop { window, .. }
             | Event::CloseRequest { window } => self.by_prism.get(window).copied(),
             Event::BufferRelease { surface } | Event::FrameDone { surface, .. } => self.by_prism.get(surface).copied(),
             _ => None,
@@ -557,6 +559,12 @@ impl Gui {
                 } else {
                     self.post(hwnd, WM_KILLFOCUS, 0, 0);
                     self.post(hwnd, WM_ACTIVATE, 0, 0);
+                }
+            }
+            Event::FileDrop { path, x, y, .. } => {
+                if let Some(w) = self.windows.get(&hwnd) {
+                    let token = crate::ole32::queue_file_drop(hwnd, path, w.pos.0 + x, w.pos.1 + y);
+                    if token != 0 { self.post(hwnd, WM_OSYX_FILE_DROP, token, 0); }
                 }
             }
             Event::CloseRequest { .. } => self.post(hwnd, WM_CLOSE, 0, 0),
@@ -746,6 +754,7 @@ impl Gui {
                 Event::Notification { .. } => 10,
                 Event::Error { .. } => 11,
                 Event::ClipboardChanged { .. } => 12,
+                Event::FileDrop { .. } => 5,
             };
             KINDS[k].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             diag(|d| {
@@ -2157,6 +2166,10 @@ extern "win64" fn DispatchMessageA(msg: *const u8) -> i64 {
     }
     if crate::EVENTS.load(core::sync::atomic::Ordering::Relaxed) && m.msg == WM_CHAR {
         os_std::eprintln!("winrun: char hwnd={:#x} c={:#x} ({})", m.hwnd, m.wparam, m.wparam as u8 as char);
+    }
+    if m.msg == WM_OSYX_FILE_DROP {
+        crate::ole32::dispatch_file_drop(m.hwnd, m.wparam);
+        return 0;
     }
     if m.msg == WM_TIMER && m.lparam != 0 {
         // SAFETY: a TIMERPROC passed to SetTimer.

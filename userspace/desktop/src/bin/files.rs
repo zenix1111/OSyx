@@ -20,6 +20,7 @@ use common::{become_user, human_size, run_app, system_tz, App, Ctx, USER_HOME};
 use os_std::fs::{self, Metadata};
 use os_std::prelude::*;
 use os_std::process::Command;
+use os_std::time::{Duration, Instant};
 use os_std::{env, system, thread};
 use osyx_gfx::Rect;
 use osyx_input::{button, key};
@@ -157,6 +158,7 @@ struct Files {
     dialog: Option<Dialog>,
     preview: Option<Preview>,
     drag: Option<FileDrag>,
+    pending_move: Option<(String, Instant)>,
     tz: Tz,
     size: (u32, u32),
     hint: Option<&'static str>,
@@ -197,6 +199,7 @@ fn main() -> i32 {
         dialog: None,
         preview: None,
         drag: None,
+        pending_move: None,
         tz: system_tz(),
         size: (0, 0),
         hint: None,
@@ -371,7 +374,7 @@ impl Files {
         } else if e.is_program()
             || is_win_program(&e.name)
             || e.name.ends_with(".app")
-            || [".html", ".htm", ".xhtml"].iter().any(|ext| e.name.to_ascii_lowercase().ends_with(ext))
+            || [".html", ".htm", ".xhtml", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|ext| e.name.to_ascii_lowercase().ends_with(ext))
         {
             let shortcut = if e.name.ends_with(".app") { common::load_app(&path) } else { None };
             let command = if let Some(app) = &shortcut {
@@ -810,6 +813,8 @@ impl App for Files {
                             self.move_entry(d.index, &target, &label);
                             let (w, h) = self.size;
                             self.layout_inner(w, h);
+                        } else if let Some(entry) = self.entries.get(d.index) {
+                            self.pending_move = Some((join(&self.cwd, &entry.name), Instant::now()));
                         }
                         return true;
                     }
@@ -928,6 +933,7 @@ impl App for Files {
         if let Ui::PointerDown { x, y, button: b, clicks } = ev {
             if b == button::LEFT && clicks == 1 && self.preview.is_none() {
                 if let Some(i) = self.list.row_at(x, y) {
+                    cx.drag_file = self.entries.get(i).map(|entry| join(&self.cwd, &entry.name));
                     self.drag = Some(FileDrag { index: i, start: (x, y), pointer: (x, y), moved: false });
                 }
             }
@@ -956,6 +962,45 @@ impl App for Files {
             r => redraw |= r.needs_redraw(),
         }
         redraw
+    }
+
+    fn tick_ms(&self) -> Option<u64> { self.pending_move.as_ref().map(|_| 500) }
+
+    fn tick(&mut self, _cx: &mut Ctx) -> bool {
+        let Some((path, since)) = &self.pending_move else { return false };
+        if fs::symlink_metadata(path).is_err_and(|e| e.kind() == os_std::error::ErrorKind::NotFound) {
+            self.pending_move = None;
+            self.refresh();
+            return true;
+        }
+        if since.elapsed() >= Duration::from_secs(10) { self.pending_move = None; }
+        false
+    }
+
+    fn file_drop(&mut self, path: &str, x: i32, y: i32, _cx: &mut Ctx) -> bool {
+        if self.preview.is_some() || self.dialog.is_some() || !path.starts_with('/') { return false; }
+        let name = path.rsplit('/').next().unwrap_or("");
+        if name.is_empty() || name == "." || name == ".." { return false; }
+        let target = self.list.row_at(x, y).and_then(|i| self.entries.get(i))
+            .filter(|e| e.is_dir()).map(|e| join(&self.cwd, &e.name))
+            .or_else(|| self.place_rects().iter().zip(&self.places).find(|(r, _)| contains(r, x, y)).map(|(_, p)| p.1.clone()))
+            .or_else(|| contains(&self.list.rect, x, y).then(|| self.cwd.clone()));
+        let Some(target) = target else { return false };
+        let to = join(&target, name);
+        if path == to || fs::symlink_metadata(&to).is_ok() {
+            self.set_status(format!("Cannot move {name}: destination already exists"), true);
+            return true;
+        }
+        let result = match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => fs::rename(path, &to).or_else(|_| fs::copy(path, &to).map(|_| ()).and_then(|_| fs::remove_file(path))),
+            Ok(_) => fs::rename(path, &to),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => { self.refresh(); self.set_status(format!("Moved {name} to {target}"), false); }
+            Err(e) => self.set_status(format!("Cannot move {name}: {e}"), true),
+        }
+        true
     }
 
     fn draw(&mut self, p: &mut Painter, w: u32, h: u32, cx: &Ctx) {

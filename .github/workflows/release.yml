@@ -1,0 +1,109 @@
+name: Release
+
+# Publishes a release for every update of main that passed CI: the version is
+# the highest vX.Y.Z tag with the patch raised by one, unless VERSION names a
+# newer major.minor, which is released and then incremented patch by patch
+# (scripts/next-version.sh). Only the newest KEEP_RELEASES releases stay on
+# GitHub. The signing key is the RELEASE_SIGNING_KEY secret (hex Ed25519,
+# matching shared/update/release.pub); it never enters the repository.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload the artifacts without publishing a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish a release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       !contains(github.event.workflow_run.head_commit.message, '[skip release]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KEEP_RELEASES: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils clang cpio e2fsprogs lld mingw-w64 python3 zstd
+      - name: Install Rust targets
+        run: rustup show
+      - name: Compute the next version
+        id: version
+        run: echo "version=$(bash scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+      - name: Build the live images and the update tree
+        run: |
+          echo "${{ steps.version.outputs.version }}" > VERSION
+          bash scripts/build-linux.sh build/release
+      - name: Sign the system update
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo '::error::Add the Ed25519 release key (the hex file release.ps1 uses) as the RELEASE_SIGNING_KEY repository secret.'
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release-signing.key"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          cargo run -q --locked -p osyx-update --example release -- \
+            build build/release/rootfs.tar "$VERSION" "$key" build/release
+          rm -f "$key"
+      - name: Name the images after the version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mv build/release/osyx-live.iso "build/release/osyx-$VERSION-live.iso"
+          mv build/release/osyx-live-usb.img "build/release/osyx-$VERSION-live-usb.img"
+          rm -f build/release/rootfs.tar
+      - name: Publish the release
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --target "$(git rev-parse HEAD)" \
+            --title "OSyx $VERSION" --generate-notes \
+            "build/release/osyx-$VERSION-live.iso" \
+            "build/release/osyx-$VERSION-live-usb.img" \
+            build/release/manifest.txt build/release/manifest.sig build/release/payload.bin
+      - name: Keep only the newest releases
+        if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[$KEEP_RELEASES:] | .[].tagName" |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "deleting $tag"
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+      - name: Upload the artifacts of a dry run
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: osyx-live-${{ steps.version.outputs.version }}
+          path: build/release/*.iso

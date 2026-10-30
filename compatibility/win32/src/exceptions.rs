@@ -221,6 +221,8 @@ extern "win64" fn RemoveVectoredContinueHandler(id: u64) -> u32 {
     remove(id, true)
 }
 fn windows_context(n: &NativeContext) -> Context {
+    let mut fx = [0u8; 512];
+    fx.copy_from_slice(&n.fx[..512]);
     let mut c = Context {
         home: [0; 6],
         flags: 0x0010_000b,
@@ -230,7 +232,7 @@ fn windows_context(n: &NativeContext) -> Context {
         debug: [0; 6],
         regs: [0; 16],
         rip: if n.vector == 3 { n.rip.saturating_sub(1) } else { n.rip },
-        fx: n.fx,
+        fx,
         vectors: [0; 26],
         vector_control: 0,
         debug_control: 0,
@@ -295,7 +297,7 @@ fn apply(c: &Context, n: &mut NativeContext) {
     }
     if c.flags & 8 != 0 {
         let old_mxcsr = u32::from_le_bytes(n.fx[24..28].try_into().unwrap());
-        n.fx = c.fx;
+        n.fx[..512].copy_from_slice(&c.fx);
         if c.mxcsr != old_mxcsr {
             n.fx[24..28].copy_from_slice(&c.mxcsr.to_le_bytes());
         }

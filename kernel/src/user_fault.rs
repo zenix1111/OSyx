@@ -1,6 +1,7 @@
 //! CPU exception delivery to ring 3. The kernel retains trusted selectors,
-//! checks continuation pointers and MXCSR before IRET/FXRSTOR, and never
-//! accepts a return without a matching outstanding fault in this thread.
+//! checks continuation pointers and MXCSR before IRET/XRSTOR, sanitizes the
+//! user-supplied XSAVE header, and never accepts a return without a matching
+//! outstanding fault in this thread.
 use crate::{
     arch::{cpu, idt::TrapFrame},
     fixup, sched,
@@ -35,7 +36,15 @@ osyx_fault_resume:
     add rsp,8
     pop rsi
     pop rdi
-    fxrstor64 [rsi]
+    mov rax, cr4
+    test rax, 0x40000
+    jz 1f
+    xor ecx, ecx
+    xgetbv
+    xrstor64 [rsi]
+    jmp 2f
+1:  fxrstor64 [rsi]
+2:
     mov rsp,rdi
     pop r15
     pop r14
@@ -104,12 +113,12 @@ pub fn deliver(f: &mut TrapFrame) -> bool {
         return false;
     }
     let mut c = from_frame(f);
-    // The soft-float kernel has not changed the user's x87/SSE registers.
+    // The soft-float kernel has not changed the user's x87/SSE/AVX registers.
     unsafe {
-        cpu::fxsave(c.fx.as_mut_ptr());
+        cpu::fpu_save(c.fx.as_mut_ptr());
     }
     let mask = u32::from_le_bytes(c.fx[28..32].try_into().unwrap());
-    let Some(addr) = f.rsp.checked_sub(128 + core::mem::size_of::<Context>() as u64).map(|n| n & !15) else {
+    let Some(addr) = f.rsp.checked_sub(128 + core::mem::size_of::<Context>() as u64).map(|n| n & !63) else {
         return false;
     };
     let Some(stack) = addr.checked_sub(8) else { return false };
@@ -125,11 +134,25 @@ pub fn deliver(f: &mut TrapFrame) -> bool {
     f.rflags = (f.rflags & !((1 << 8) | (1 << 10) | (1 << 16))) | 0x202;
     true
 }
+
+/// The XSAVE header comes from user memory: keep only enabled state
+/// components, force the standard (non-compacted) format and zero the
+/// reserved bytes so XRSTOR cannot fault or read offsets under user control.
+fn sanitize_xsave(fx: &mut [u8]) {
+    let mask = cpu::fpu_mask();
+    if mask == 0 || fx.len() < 576 {
+        return;
+    }
+    let bv = u64::from_le_bytes(fx[512..520].try_into().unwrap()) & mask;
+    fx[512..520].copy_from_slice(&bv.to_le_bytes());
+    fx[520..576].fill(0);
+}
 pub fn resume(addr: u64) -> Result<u64, Errno> {
     let mut c = Context::default();
     let bytes =
         unsafe { core::slice::from_raw_parts_mut(&mut c as *mut Context as *mut u8, core::mem::size_of::<Context>()) };
     fixup::copy_from_user(bytes, addr)?;
+    sanitize_xsave(&mut c.fx);
     if !fixup::user_range_ok(c.rip, 1) || !fixup::user_range_ok(c.gpr[fault::RSP], 1) {
         return Err(Errno::InvalidArgument);
     }

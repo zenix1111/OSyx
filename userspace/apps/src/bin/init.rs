@@ -607,6 +607,11 @@ fn desktop_session() -> i32 {
         Ok(c) => println!("init: battery state kept by process {}", c.id()),
         Err(e) => eprintln!("init: cannot start /bin/batteryd: {e}"),
     }
+    // Recover an established Wi-Fi connection when its gateway stops responding.
+    match Command::new("/bin/wifi-watch").spawn() {
+        Ok(c) => println!("init: Wi-Fi recovery running (process {})", c.id()),
+        Err(e) => eprintln!("init: cannot start /bin/wifi-watch: {e}"),
+    }
     // Network time: the clock is set once a network is up.
     match Command::new("/bin/timesync").arg("--daemon").spawn() {
         Ok(c) => println!("init: network time kept by process {}", c.id()),

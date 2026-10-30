@@ -180,12 +180,12 @@ fn read_header<R: SectorReader>(r: &mut R, lba: u64) -> Result<Table, GptError> 
     if esize < ENTRY_SIZE || !esize.is_multiple_of(8) || esize > SECTOR * 8 || count == 0 || count > MAX_ENTRIES {
         return Err(GptError::Corrupt("bad partition entry geometry"));
     }
-    if first < 2 || last >= disk || first > last {
+    if first < 2 || last >= disk - 1 || first > last {
         return Err(GptError::Corrupt("usable range outside the disk"));
     }
     let bytes = count as usize * esize;
     let array_sectors = bytes.div_ceil(SECTOR) as u64;
-    if entries_lba < 2 || entries_lba.checked_add(array_sectors).is_none_or(|e| e > disk) {
+    if entries_lba < 2 || entries_lba.checked_add(array_sectors).is_none_or(|e| e > disk - 1) {
         return Err(GptError::Corrupt("partition array outside the disk"));
     }
     // The array must not overlap the usable area.
@@ -240,7 +240,6 @@ pub fn parse<R: SectorReader>(r: &mut R) -> Result<Table, GptError> {
     }
     match read_header(r, 1) {
         Ok(t) => Ok(t),
-        Err(GptError::Io) => Err(GptError::Io),
         Err(primary) => {
             let backup = r.sectors() - 1;
             match read_header(r, backup) {
@@ -274,11 +273,19 @@ pub fn build(disk_sectors: u64, disk_guid: Guid, parts: &[NewPartition<'_>]) -> 
         return Err(GptError::Corrupt("disk too small"));
     }
     let mut array = vec![0u8; ENTRY_COUNT * ENTRY_SIZE];
+    let mut ranges = Vec::with_capacity(parts.len());
     for (i, p) in parts.iter().enumerate() {
-        let end = p.first_lba + p.sectors - 1;
-        if p.sectors == 0 || p.first_lba < first || end > last {
+        if p.type_guid.is_zero() {
+            return Err(GptError::Corrupt("partition type is zero"));
+        }
+        let end = p.sectors.checked_sub(1).and_then(|n| p.first_lba.checked_add(n)).ok_or(GptError::Corrupt("partition outside the usable range"))?;
+        if p.first_lba < first || end > last {
             return Err(GptError::Corrupt("partition outside the usable range"));
         }
+        if ranges.iter().any(|&(start, stop)| p.first_lba <= stop && start <= end) {
+            return Err(GptError::Corrupt("partitions overlap"));
+        }
+        ranges.push((p.first_lba, end));
         let e = &mut array[i * ENTRY_SIZE..(i + 1) * ENTRY_SIZE];
         e[0..16].copy_from_slice(&p.type_guid.0);
         e[16..32].copy_from_slice(&p.unique_guid.0);

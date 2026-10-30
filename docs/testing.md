@@ -88,11 +88,9 @@ decorated exports of up to 699 bytes; limit raised to 4096), zero-length
 `RUNTIME_FUNCTION` entries (`symcryptk.dll`), and empty unwind-code arrays
 ending exactly at a section's file data (kernel-mode modules).
 
-## Not covered yet
+## Coverage limits
 
-Real hardware, other firmware, resolutions other than the default GOP choice
-(the layout itself is unit-tested for 640×480 – 3840×2160), multi-core,
-memory sizes other than 512 MiB, disk controllers other than virtio-blk,
-full or damaged volumes inside QEMU (covered by the host tests of the
-drivers), ext4 volumes written by Linux with journal checksums v3 (the
-replay path is implemented, but the fixtures' journals use no checksums).
+The recorded result above describes that particular run, not every current feature.
+Dedicated scripts cover SMP, USB hubs, networking and other paths; see scripts/.
+Real-hardware coverage is limited to selected machines and firmware. QEMU results
+do not establish compatibility with other hardware or configurations.

@@ -44,6 +44,7 @@ const CLOCK_W: u32 = 132;
 const QUICK_W: u32 = 64;
 const QUICK_PANEL_W: u32 = 360;
 const QUICK_PANEL_H: u32 = 316;
+const WIFI_PANEL_H: u32 = 400;
 /// Opened by the network tile; the Win32 Network Center.
 const NETWORK_APP: &str = "/opt/apps/netcenter.exe";
 const SETTINGS_APP: &str = "/system/bin/settings";
@@ -153,8 +154,10 @@ struct WifiState {
     keys: bool,
     /// "wrong-password" when the handshake failed.
     error: Option<String>,
+    last_error: Option<String>,
     /// Joins the kernel has applied (the state belongs to the last one).
     join: u64,
+    diagnostics: Vec<String>,
     /// Saved networks (the kernel keeps their passphrases).
     known: Vec<String>,
     /// (RSSI, SSID, security) of the networks seen, strongest first.
@@ -175,6 +178,8 @@ impl WifiState {
                 w.keys = s == "yes";
             } else if let Some(s) = line.strip_prefix("error ") {
                 w.error = Some(String::from(s));
+            } else if let Some(s) = line.strip_prefix("last_error ") {
+                w.last_error = Some(String::from(s));
             } else if let Some(s) = line.strip_prefix("join ") {
                 w.join = s.parse().unwrap_or(0);
             } else if let Some(s) = line.strip_prefix("known\t") {
@@ -184,6 +189,21 @@ impl WifiState {
             }
         }
         w.networks.sort_by_key(|n| core::cmp::Reverse(n.0));
+        if let Some(i) = os_std::net::interfaces().ok().and_then(|v| v.into_iter().find(|i| i.flags & os_std::net::IFF_WIRELESS != 0)) {
+            let ip = os_std::net::Ipv4Addr(i.addr);
+            let gw = os_std::net::Ipv4Addr(i.gateway);
+            w.diagnostics.push(format!("IP: {ip}   Gateway: {gw}"));
+            let phase = os_std::net::DHCP_PHASE_NAMES.get(i.dhcp_phase as usize).copied().unwrap_or("unknown");
+            w.diagnostics.push(if i.method == os_std::net::CONFIG_DHCP { format!("DHCP: {phase}   Lease: {} s", i.lease_left) } else { String::from("DHCP: not enabled") });
+        } else {
+            w.diagnostics.push(String::from("No Wi-Fi interface"));
+        }
+        let dns = os_std::net::dns_servers().unwrap_or_default().iter().map(|d| format!("{d}")).collect::<Vec<_>>().join(", ");
+        w.diagnostics.push(format!("DNS: {}", if dns.is_empty() { "none" } else { &dns }));
+        let health = os_std::fs::read_to_string("/run/wifi.health").unwrap_or_default();
+        if let Some(line) = health.lines().find_map(|l| l.strip_prefix("status ")) { w.diagnostics.push(format!("Recovery: {line}")); }
+        let health_error = health.lines().find_map(|l| l.strip_prefix("last_error ")).filter(|s| !s.is_empty());
+        w.diagnostics.push(format!("Last error: {}", w.last_error.as_deref().or(w.error.as_deref()).or(health_error).unwrap_or("none")));
         Some(w)
     }
 }
@@ -366,6 +386,7 @@ struct Shell {
     /// connects or reports a wrong password.
     wifi_joining: Option<(String, u64, u64)>,
     wifi_checked: u64,
+    wifi_popup_checked: u64,
     /// When `/run/update.status` was last read (ms), and whether an
     /// installed system update was announced.
     update_checked: u64,
@@ -477,6 +498,7 @@ fn main() -> i32 {
         shortcut_scan: 0,
         wifi_joining: None,
         wifi_checked: 0,
+        wifi_popup_checked: 0,
         update_checked: 0,
         update_announced: false,
         battery: None,
@@ -558,6 +580,22 @@ impl Shell {
             if self.wifi_joining.is_some() && self.now().saturating_sub(self.wifi_checked) >= 1000 {
                 self.wifi_checked = self.now();
                 self.check_wifi_join();
+            }
+            if self.now().saturating_sub(self.wifi_popup_checked) >= 2000 {
+                self.wifi_popup_checked = self.now();
+                if let Some(p) = self.popup.as_mut() {
+                    if let PopupKind::Wifi { state, .. } = &mut p.kind {
+                        if let Some(fresh) = WifiState::read() {
+                            state.state = fresh.state;
+                            state.ssid = fresh.ssid;
+                            state.keys = fresh.keys;
+                            state.error = fresh.error;
+                            state.last_error = fresh.last_error;
+                            state.diagnostics = fresh.diagnostics;
+                            p.win.dirty = true;
+                        }
+                    }
+                }
             }
             if !self.update_announced && self.now().saturating_sub(self.update_checked) >= 5000 {
                 self.update_checked = self.now();
@@ -905,6 +943,7 @@ impl Shell {
         let mut wifi_open: Option<WifiState> = None;
         let mut wifi_join: Option<(String, String)> = None;
         let mut wifi_forget: Option<String> = None;
+        let mut wifi_reconnect = false;
         match &mut p.kind {
             PopupKind::Launcher { search, list, shown, list_focus } => {
                 if let Ui::PointerDown { x, y, button: button::RIGHT, .. } = ui {
@@ -1003,6 +1042,9 @@ impl Shell {
                         _ => {}
                     }
                 } else {
+                    if let Ui::PointerDown { x, y, button: button::LEFT, .. } = ui {
+                        if contains(&wifi_reconnect_rect(), x, y) { wifi_reconnect = true; }
+                    }
                     match list.event(&ui, true) {
                         Response::Activated(i) => {
                             if let Some((_, ssid, sec)) = state.networks.get(i) {
@@ -1013,7 +1055,7 @@ impl Shell {
                                     let mut f = TextField::new("");
                                     f.masked = true;
                                     f.placeholder = String::from("Password");
-                                    f.rect = Rect::new(20, (QUICK_PANEL_H - 120) as i32, QUICK_PANEL_W - 40, 36);
+                                    f.rect = Rect::new(20, (WIFI_PANEL_H - 120) as i32, QUICK_PANEL_W - 40, 36);
                                     let mut show = Checkbox::new("Show password", false);
                                     show.rect = Rect::new(20, f.rect.bottom() as i32 + 36, QUICK_PANEL_W - 40, 24);
                                     *pass = Some((ssid.clone(), f, show));
@@ -1094,6 +1136,7 @@ impl Shell {
             || wifi_open.is_some()
             || wifi_join.is_some()
             || wifi_forget.is_some()
+            || wifi_reconnect
         {
             self.close_popup();
         }
@@ -1110,6 +1153,13 @@ impl Shell {
                     self.wifi_joining = Some((String::from(&ssid[..]), self.now(), joins_before));
                 }
                 Err(e) => self.show_note("Wi-Fi", &format!("Cannot save the network: {e}")),
+            }
+        }
+        if wifi_reconnect {
+            let request = format!("manual {}\n", self.now());
+            match os_std::fs::write("/run/wifi.reconnect", request) {
+                Ok(()) => self.show_note("Wi-Fi", "Reconnect requested."),
+                Err(e) => self.show_note("Wi-Fi", &format!("Cannot reconnect: {e}")),
             }
         }
         if let Some(ssid) = wifi_forget {
@@ -1420,7 +1470,7 @@ impl Shell {
         let mut list = ListView::new(vec![Column::new("Network", 0, Align::Left), Column::new("Security", 120, Align::Right)]);
         list.show_header = false;
         list.row_height = 40;
-        list.rect = Rect::new(8, 84, QUICK_PANEL_W - 16, QUICK_PANEL_H - 84 - 40);
+        list.rect = Rect::new(8, 180, QUICK_PANEL_W - 16, WIFI_PANEL_H - 180 - 40);
         let items = state
             .networks
             .iter()
@@ -1436,9 +1486,9 @@ impl Shell {
             .collect();
         list.set_items(items);
         let x = self.w as i32 - QUICK_PANEL_W as i32 - 8;
-        let y = (self.h - PANEL_H) as i32 - QUICK_PANEL_H as i32 - 8;
+        let y = (self.h - PANEL_H) as i32 - WIFI_PANEL_H as i32 - 8;
         println!("desktop: Wi-Fi picker opened ({} networks)", state.networks.len());
-        self.open_popup(x, y, QUICK_PANEL_W, QUICK_PANEL_H, PopupKind::Wifi { state, list, pass: None, message: String::new() });
+        self.open_popup(x, y, QUICK_PANEL_W, WIFI_PANEL_H, PopupKind::Wifi { state, list, pass: None, message: String::new() });
     }
 
     fn toggle_quick(&mut self) {
@@ -1974,14 +2024,25 @@ fn draw_quick(p: &mut Painter, net: &NetSummary, radios: &Radios, sound: Option<
     p.text_in(FontKind::Ui, Rect::new(s.x + 40, s.y, s.w - 48, s.h), "All settings", t.text, Align::Left);
 }
 
+fn wifi_reconnect_rect() -> Rect { Rect::new(220, 14, 120, 32) }
+
 fn draw_wifi(p: &mut Painter, state: &WifiState, list: &ListView, pass: Option<&(String, TextField, Checkbox)>, message: &str) {
     let t = *p.theme;
     p.text(FontKind::Large, 20, 16, "Wi-Fi", t.text);
     let status = match &state.ssid {
-        Some(s) => format!("Connected to {s}"),
+        Some(s) if state.keys => format!("Connected to {s}"),
+        Some(s) => format!("Connecting to {s}"),
         None => format!("Not connected ({})", state.state),
     };
     p.text(FontKind::Ui, 20, 52, &status, t.text_dim);
+    if pass.is_none() {
+        let r = wifi_reconnect_rect();
+        p.rounded(r, t.radius_small, t.raised, 255);
+        p.text_in(FontKind::Ui, r, "Reconnect", t.text, Align::Center);
+        for (i, line) in state.diagnostics.iter().take(5).enumerate() {
+            p.text(FontKind::Ui, 20, 76 + i as i32 * 19, line, t.text_dim);
+        }
+    }
     match pass {
         Some((ssid, field, show)) => {
             show.draw(p, false);
@@ -1998,7 +2059,7 @@ fn draw_wifi(p: &mut Painter, state: &WifiState, list: &ListView, pass: Option<&
         None => {
             list.draw(p, true);
             let hint = if state.known.is_empty() { "Enter to join" } else { "Enter to join, Delete to forget a saved network" };
-            p.text(FontKind::Ui, 20, (QUICK_PANEL_H - 44) as i32, hint, t.text_faint);
+            p.text(FontKind::Ui, 20, (WIFI_PANEL_H - 34) as i32, hint, t.text_faint);
         }
     }
 }

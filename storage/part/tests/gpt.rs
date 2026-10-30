@@ -61,6 +61,27 @@ fn damaged_primary_falls_back_to_backup() {
 }
 
 #[test]
+fn primary_io_error_falls_back_to_backup() {
+    struct FailingPrimary(Mem, u64);
+    impl SectorReader for FailingPrimary {
+        fn sectors(&self) -> u64 { self.0.sectors() }
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), GptError> {
+            if lba == self.1 { Err(GptError::Io) } else { self.0.read(lba, buf) }
+        }
+    }
+    for failing_lba in [1, 2] {
+        let (disk, _) = disk(8);
+        let table = parse(&mut FailingPrimary(disk, failing_lba)).unwrap();
+        assert!(table.used_backup);
+        assert_eq!(table.partitions.len(), 2);
+    }
+    let (mut disk, _) = disk(8);
+    let backup = disk.0.len() - SECTOR;
+    disk.0[backup] = 0;
+    assert_eq!(parse(&mut FailingPrimary(disk, 1)), Err(GptError::Io));
+}
+
+#[test]
 fn corrupt_tables_are_rejected() {
     let (mut d, _) = disk(8);
     let last = d.0.len() - SECTOR;
@@ -75,6 +96,51 @@ fn corrupt_tables_are_rejected() {
         NewPartition { type_guid: TYPE_ESP, unique_guid: Guid([1; 16]), first_lba: 1 << 30, sectors: 100, name: "" },
     ];
     assert!(build(1 << 14, Guid([0; 16]), &bad).is_err());
+}
+
+#[test]
+fn build_rejects_overlaps_and_invalid_lengths() {
+    let part = |first_lba, sectors| NewPartition { type_guid: TYPE_ESP, unique_guid: Guid([1; 16]), first_lba, sectors, name: "" };
+    assert!(build(1 << 14, Guid([9; 16]), &[part(2048, 100), part(2147, 20)]).is_err());
+    assert!(build(1 << 14, Guid([9; 16]), &[part(2048, 0)]).is_err());
+    assert!(build(1 << 14, Guid([9; 16]), &[part(u64::MAX, 2)]).is_err());
+    assert!(build(1 << 14, Guid([9; 16]), &[part(2148, 20), part(2048, 100)]).is_ok());
+}
+
+#[test]
+fn build_rejects_unused_partition_type() {
+    let p = NewPartition { type_guid: Guid([0; 16]), unique_guid: Guid([1; 16]), first_lba: 2048, sectors: 100, name: "missing" };
+    assert_eq!(build(1 << 14, Guid([9; 16]), &[p]), Err(GptError::Corrupt("partition type is zero")));
+}
+
+#[test]
+fn rejects_usable_range_covering_backup_header() {
+    let (mut d, _) = disk(8);
+    let backup = d.sectors() - 1;
+    let h = &mut d.0[SECTOR..2 * SECTOR];
+    h[48..56].copy_from_slice(&backup.to_le_bytes());
+    h[16..20].fill(0);
+    let crc = crc32(&h[..92]);
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    assert!(parse(&mut d).unwrap().used_backup);
+}
+
+#[test]
+fn rejects_partition_array_covering_backup_header() {
+    let (mut d, _) = disk(8);
+    let backup = d.sectors() - 1;
+    let offset = backup as usize * SECTOR;
+    d.0[offset + 32..offset + 40].copy_from_slice(&2048u64.to_le_bytes());
+    d.0[offset + 40..offset + 48].copy_from_slice(&2048u64.to_le_bytes());
+    let array_crc = crc32(&d.0[offset..offset + 128]);
+    let h = &mut d.0[SECTOR..2 * SECTOR];
+    h[72..80].copy_from_slice(&backup.to_le_bytes());
+    h[80..84].copy_from_slice(&1u32.to_le_bytes());
+    h[88..92].copy_from_slice(&array_crc.to_le_bytes());
+    h[16..20].fill(0);
+    let crc = crc32(&h[..92]);
+    h[16..20].copy_from_slice(&crc.to_le_bytes());
+    assert!(matches!(parse(&mut d), Err(GptError::Corrupt(_))));
 }
 
 /// Flips every byte of the primary header and array one at a time: parsing

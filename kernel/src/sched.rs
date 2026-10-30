@@ -1,7 +1,8 @@
 //! Threads and the preemptive round-robin scheduler (SMP, one current/idle thread per CPU).
 //!
 //! * Every thread has its own 64 KiB kernel stack (the boot thread keeps the
-//!   loader's stack), a saved stack pointer and a 512-byte FXSAVE area.
+//!   loader's stack), a saved stack pointer and a 64-byte aligned XSAVE area
+//!   (832 bytes: x87, SSE and AVX YMM upper halves; FXSAVE fallback).
 //! * [`schedule`] picks the next ready thread and calls `osyx_switch`, which
 //!   saves the callee-saved registers and RFLAGS on the old stack and resumes
 //!   the new one. Caller-saved registers are already saved by whoever called
@@ -10,7 +11,8 @@
 //!   running thread has used its time slice and another thread is ready,
 //!   switches from inside the interrupt handler. The interrupted thread later
 //!   resumes inside that handler and returns with `iretq`.
-//! * x87/SSE state is switched eagerly (`fxsave`/`fxrstor` on every switch).
+//! * x87/SSE/AVX state is switched eagerly (`xsave`/`xrstor`, or
+//!   `fxsave`/`fxrstor` when XSAVE is unavailable, on every switch).
 //! * CR3, TSS.RSP0 and the SYSCALL kernel stack follow the incoming thread.
 //! * A thread that exits cannot free the stack it runs on; the next thread
 //!   frees it right after the switch ([`after_switch`]).
@@ -47,17 +49,19 @@ pub enum State {
     Dead,
 }
 
-/// FXSAVE image (x87 + SSE registers, MXCSR).
-#[repr(C, align(16))]
-pub struct FpuState([u8; 512]);
+/// XSAVE image (x87 + SSE + AVX when enabled), 64-byte aligned.
+#[repr(C, align(64))]
+pub struct FpuState([u8; cpu::FPU_AREA_SIZE]);
 
 impl FpuState {
     /// The state after `fninit` + default MXCSR: all exceptions masked,
-    /// round to nearest.
+    /// round to nearest. XSTATE_BV marks x87 and SSE as initialized; AVX
+    /// upper halves are left in their initial (zero) state.
     fn initial() -> Box<FpuState> {
-        let mut s = Box::new(FpuState([0; 512]));
+        let mut s = Box::new(FpuState([0; cpu::FPU_AREA_SIZE]));
         s.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
         s.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+        s.0[512..520].copy_from_slice(&0x3u64.to_le_bytes()); // XSTATE_BV
         s
     }
 }
@@ -606,8 +610,8 @@ pub fn schedule() {
         // SAFETY: the pointers refer to boxed fields of threads that stay
         // alive across the switch (a dead thread is reaped only after it).
         unsafe {
-            cpu::fxsave(old_fpu as *mut u8);
-            cpu::fxrstor(new_fpu as *const u8);
+            cpu::fpu_save(old_fpu as *mut u8);
+            cpu::fpu_restore(new_fpu as *const u8);
             osyx_switch(old_rsp, new_rsp);
         }
         after_switch();
@@ -922,13 +926,13 @@ pub fn set_current_fs_base(value: u64) {
     unsafe { cpu::wrmsr(IA32_FS_BASE, value) };
 }
 
-/// Loads the initial x87/SSE state into the CPU for the current thread
+/// Loads the initial x87/SSE/AVX state into the CPU for the current thread
 /// (`execve`: nothing of the old program's registers survives). The saved
 /// copy is refreshed from the CPU at the next switch.
 pub fn reset_current_fpu() {
     let init = FpuState::initial();
-    // SAFETY: a valid, 16-byte aligned FXSAVE image.
-    unsafe { cpu::fxrstor(&*init as *const FpuState as *const u8) };
+    // SAFETY: a valid, 64-byte aligned XSAVE image.
+    unsafe { cpu::fpu_restore(&*init as *const FpuState as *const u8) };
 }
 
 pub fn rename_current(name: &str) {

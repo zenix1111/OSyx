@@ -326,9 +326,18 @@ int timeout_add(struct timeout *to, int t)
 	return !was;
 }
 
-int timeout_add_msec(struct timeout *to, int ms) { return timeout_add(to, ms * hz / 1000); }
-int timeout_add_usec(struct timeout *to, int us) { return timeout_add(to, us / 1000 * hz / 1000); }
-int timeout_add_sec(struct timeout *to, int s) { return timeout_add(to, s * hz); }
+/* Round up so a timer never fires early; widen before multiplying. */
+static int timeout_units(struct timeout *to, int value, uint64_t units_per_sec)
+{
+	uint64_t ticks64 = value > 0 ? ((uint64_t)value * (uint64_t)hz + units_per_sec - 1) / units_per_sec : 1;
+	if (ticks64 > 0x7fffffffU)
+		ticks64 = 0x7fffffffU;
+	return timeout_add(to, (int)ticks64);
+}
+
+int timeout_add_msec(struct timeout *to, int ms) { return timeout_units(to, ms, 1000); }
+int timeout_add_usec(struct timeout *to, int us) { return timeout_units(to, us, 1000000); }
+int timeout_add_sec(struct timeout *to, int s) { return timeout_units(to, s, 1); }
 
 int timeout_del(struct timeout *to)
 {

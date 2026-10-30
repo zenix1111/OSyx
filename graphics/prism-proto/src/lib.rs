@@ -74,6 +74,7 @@ pub mod opcode {
     pub const SET_WINDOW_VISIBILITY: u16 = 0x0E;
     pub const SYNC: u16 = 0x0F;
     pub const CLIPBOARD_SET: u16 = 0x10;
+    pub const FILE_DRAG: u16 = 0x11;
 
     pub const EV_HELLO: u16 = 0x81;
     pub const CONFIGURE: u16 = 0x82;
@@ -88,6 +89,7 @@ pub mod opcode {
     pub const ERROR: u16 = 0x8B;
     pub const SYNC_DONE: u16 = 0x8C;
     pub const CLIPBOARD_CHANGED: u16 = 0x8D;
+    pub const FILE_DROP: u16 = 0x8E;
 }
 
 /// `HELLO` flags.
@@ -293,6 +295,7 @@ pub enum Request {
     Notify { title: String, body: String },
     /// Replaces the system clipboard contents.
     ClipboardSet { entries: Vec<ClipEntry> },
+    FileDrag { window: u32, path: String },
 }
 
 /// Compositor -> client.
@@ -327,6 +330,7 @@ pub enum Event {
     /// The system clipboard contents, broadcast on every change and once to
     /// each client after `HELLO`. `seq` is monotonic, 0 for "never set".
     ClipboardChanged { seq: u32, entries: Vec<ClipEntry> },
+    FileDrop { window: u32, x: i32, y: i32, path: String },
     Error { code: u32, serial: u32, message: String },
 }
 
@@ -574,6 +578,7 @@ impl Request {
             Request::Notify { .. } => NOTIFY,
             Request::DestroyBuffer { .. } => DESTROY_BUFFER,
             Request::ClipboardSet { .. } => CLIPBOARD_SET,
+            Request::FileDrag { .. } => FILE_DRAG,
         }
     }
 
@@ -631,6 +636,7 @@ impl Request {
             Request::ClipboardSet { entries } => {
                 clip_entries(&mut w, entries);
             }
+            Request::FileDrag { window, path } => { w.u32(*window).str(path, MAX_TEXT); }
         }
         w.finish()
     }
@@ -703,6 +709,7 @@ impl Request {
             opcode::NOTIFY => Request::Notify { title: r.str(MAX_TITLE)?, body: r.str(MAX_TEXT)? },
             opcode::SYNC => Request::Sync { cookie: r.u32()? },
             opcode::CLIPBOARD_SET => Request::ClipboardSet { entries: read_clip_entries(&mut r)? },
+            opcode::FILE_DRAG => Request::FileDrag { window: r.id()?, path: r.str(MAX_TEXT)? },
             op => return Err(ProtoError::UnknownOpcode(op)),
         };
         r.end()?;
@@ -725,6 +732,7 @@ impl Event {
             Event::WindowList { .. } => WINDOW_LIST,
             Event::Notification { .. } => NOTIFICATION,
             Event::ClipboardChanged { .. } => CLIPBOARD_CHANGED,
+            Event::FileDrop { .. } => FILE_DROP,
             Event::Error { .. } => ERROR,
             Event::SyncDone { .. } => SYNC_DONE,
         }
@@ -789,6 +797,7 @@ impl Event {
                 w.u32(*seq);
                 clip_entries(&mut w, entries);
             }
+            Event::FileDrop { window, x, y, path } => { w.u32(*window).i32(*x).i32(*y).str(path, MAX_TEXT); }
             Event::Error { code, message, .. } => {
                 w.u32(*code).str(message, MAX_TEXT);
             }
@@ -861,6 +870,7 @@ impl Event {
             }
             opcode::NOTIFICATION => Event::Notification { from_pid: r.u32()?, title: r.str(MAX_TITLE)?, body: r.str(MAX_TEXT)? },
             opcode::CLIPBOARD_CHANGED => Event::ClipboardChanged { seq: r.u32()?, entries: read_clip_entries(&mut r)? },
+            opcode::FILE_DROP => Event::FileDrop { window: r.id()?, x: r.i32()?, y: r.i32()?, path: r.str(MAX_TEXT)? },
             opcode::ERROR => Event::Error { code: r.u32()?, serial, message: r.str(MAX_TEXT)? },
             op => return Err(ProtoError::UnknownOpcode(op)),
         };

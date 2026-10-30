@@ -15,11 +15,12 @@ pub struct FileRef {
     pub(crate) is_dir: bool,
     /// Cached (cluster index, cluster) of the last access, for sequential I/O.
     cursor: Option<(u32, u32)>,
+    cursor_generation: u64,
 }
 
 impl FileRef {
     pub(crate) fn new(entry: Pos, first_cluster: u32, size: u32, is_dir: bool) -> FileRef {
-        FileRef { entry, first_cluster, size, is_dir, cursor: None }
+        FileRef { entry, first_cluster, size, is_dir, cursor: None, cursor_generation: 0 }
     }
 
     pub fn size(&self) -> u32 {
@@ -39,12 +40,17 @@ impl<D: BlockDevice> FileSystem<D> {
             return Err(FsError::NotFound);
         }
         let first = (crate::le16(&e, 20) as u32) << 16 | crate::le16(&e, 26) as u32;
-        if first != f.first_cluster {
+        // A different handle can change the chain without changing its size
+        // or first cluster. Any FAT mutation invalidates cached links.
+        if first != f.first_cluster || f.cursor_generation != self.fat_generation || self.fat_generation == u64::MAX {
             f.cursor = None;
         }
         f.first_cluster = first;
         f.size = crate::le32(&e, 28);
         f.is_dir = e[11] & ATTR_DIRECTORY != 0;
+        if !f.is_dir && f.size != 0 && f.first_cluster == 0 {
+            return Err(FsError::Corrupt("nonempty file has no first cluster"));
+        }
         if f.first_cluster != 0 && !self.geo.is_valid_cluster(f.first_cluster) {
             return Err(FsError::Corrupt("file starts at an invalid cluster"));
         }
@@ -60,6 +66,9 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Cluster number `index` of the file, using the cursor cache.
     fn cluster_of(&mut self, f: &mut FileRef, index: u32) -> Result<u32> {
+        if f.cursor_generation != self.fat_generation || self.fat_generation == u64::MAX {
+            f.cursor = None;
+        }
         let (mut i, mut c) = match f.cursor {
             Some((ci, cc)) if ci <= index => (ci, cc),
             _ => (0, f.first_cluster),
@@ -69,6 +78,7 @@ impl<D: BlockDevice> FileSystem<D> {
             i += 1;
         }
         f.cursor = Some((index, c));
+        f.cursor_generation = self.fat_generation;
         Ok(c)
     }
 
@@ -259,5 +269,29 @@ impl<D: BlockDevice> FileSystem<D> {
         f.cursor = None;
         f.size = size as u32;
         self.update_entry(f.entry, f.first_cluster, f.size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{format, OpenOptions};
+    use alloc::vec;
+
+    #[test]
+    fn sequential_reads_keep_cursor_until_fat_changes() {
+        let mut image = vec![0; 64 * 1024 * 1024];
+        format(&mut image, "TEST", 1).unwrap();
+        let mut fs = FileSystem::mount(image).unwrap();
+        let mut file = fs.open("/file", OpenOptions { create: true, ..Default::default() }).unwrap();
+        fs.write(&mut file, 0, &vec![1; 1536]).unwrap();
+        fs.read(&mut file, 512, &mut [0]).unwrap();
+        let cursor = file.cursor;
+        fs.stat(&mut file).unwrap();
+        assert_eq!(file.cursor, cursor);
+        let mut other = fs.open("/other", OpenOptions { create: true, ..Default::default() }).unwrap();
+        fs.write(&mut other, 0, b"x").unwrap();
+        fs.stat(&mut file).unwrap();
+        assert_eq!(file.cursor, None);
     }
 }

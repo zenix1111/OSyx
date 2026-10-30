@@ -178,7 +178,7 @@ pub unsafe extern "C" fn _start(info: *const BootInfo) -> ! {
     // enabled for user code (the kernel itself is soft-float).
     unsafe {
         core::arch::asm!("mov rax, cr0", "or rax, 0x10000", "mov cr0, rax", out("rax") _);
-        cpu::enable_sse();
+        cpu::enable_sse(0);
     }
 
     log_memory_map(boot.memory_map());

@@ -24,6 +24,7 @@ pub struct Ctx {
     pub title: Option<String>,
     /// Notifications to post: (title, body).
     pub notes: Vec<(String, String)>,
+    pub drag_file: Option<String>,
 }
 
 /// A program with one PRISM window driven by [`run_app`].
@@ -32,6 +33,7 @@ pub trait App {
     fn layout(&mut self, w: u32, h: u32, cx: &mut Ctx);
     /// A toolkit event; returns true if the window must be redrawn.
     fn event(&mut self, ev: Ui, cx: &mut Ctx) -> bool;
+    fn file_drop(&mut self, _path: &str, _x: i32, _y: i32, _cx: &mut Ctx) -> bool { false }
     fn draw(&mut self, p: &mut Painter, w: u32, h: u32, cx: &Ctx);
     /// Extra handles to wait on (pipes, ...).
     fn wait_items(&self) -> Vec<WaitItem> {
@@ -78,6 +80,7 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
         quit: false,
         title: None,
         notes: Vec::new(),
+        drag_file: None,
     };
     let mut adapter = Adapter::default();
     let mut size = (0, 0);
@@ -113,6 +116,9 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
                         cx.quit = true;
                     }
                 }
+                Event::FileDrop { window, path, x, y } if *window == win.id => {
+                    if app.file_drop(path, *x, *y, &mut cx) { win.dirty = true; }
+                }
                 Event::Error { message, .. } => eprintln!("{name}: PRISM error: {message}"),
                 _ => {}
             }
@@ -124,6 +130,9 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
             if let Some((_, ui)) = adapter.translate(&ev) {
                 if app.event(ui, &mut cx) {
                     win.dirty = true;
+                }
+                if let Some(path) = cx.drag_file.take() {
+                    let _ = conn.send(&prism_client::Request::FileDrag { window: win.id, path }, &[]);
                 }
             }
         }

@@ -192,7 +192,7 @@ own launcher entries. They draw through the same PRISM compositor.
   the toolkit apps redraw whole windows).
 * Popups and notifications are square (no per-pixel alpha in the toolkit
   yet; the protocol supports ARGB buffers).
-* HID: boot-protocol keyboards only; no hubs (devices on root ports only);
+* HID: boot-protocol keyboards; xHCI hubs are supported;
   no isochronous or bulk endpoints; no USB 3 streams.
 * No IOMMU support (none is assumed); DMA buffers are kernel pages.
 * AXIS is minimal (see above); the terminal is a line-mode terminal.

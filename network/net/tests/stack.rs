@@ -435,6 +435,15 @@ fn dhcp_configures_address_route_and_dns() {
     let p = n.b.icmp_open().unwrap();
     n.b.icmp_echo(p, Ipv4Addr::new(10, 0, 2, 15), 1, b"hi").unwrap();
     assert!(n.run_until(100, |n| matches!(n.b.icmp_recv(p), Ok(IcmpEvent::Reply { .. }))));
+    // Reassociation must not reuse an address from the previous network.
+    n.a.dns_cache.put("old.example", vec![server], 3600, n.now);
+    n.a.set_link(1, false);
+    n.a.set_link(1, true);
+    assert_eq!(n.a.dns_cache.get("old.example", n.now), None);
+    assert_eq!(n.a.interfaces()[1].addr, None);
+    assert_eq!(n.a.dhcp_state(1).unwrap().0, dhcp::Phase::Init);
+    n.a.poll();
+    assert_eq!(n.a.dhcp_state(1).unwrap().0, dhcp::Phase::Selecting);
 }
 
 /// A tiny DNS server on B: answers A queries from a table, can truncate.

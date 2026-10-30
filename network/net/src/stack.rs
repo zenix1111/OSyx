@@ -447,15 +447,18 @@ impl Stack {
         if let Some(i) = self.ifaces.get_mut(iface) {
             if i.link_up != up {
                 i.link_up = up;
-                // A link that comes (back) up without a lease asks at once
-                // instead of waiting out the backoff of the attempts made
-                // while it was down (Wi-Fi joins long after boot).
-                restart = up && i.dhcp.as_ref().is_some_and(|d| d.lease().is_none());
+                // Reacquire configuration after a link change: Wi-Fi may have
+                // rejoined a different network while the old lease is valid.
+                restart = up && i.dhcp.is_some();
+                if up {
+                    i.arp.flush();
+                }
                 let line = alloc::format!("{}: link {}", i.name, if up { "up" } else { "down" });
                 self.logf(line);
             }
         }
         if restart {
+            self.dns_cache.flush();
             let _ = self.enable_dhcp(iface);
         }
     }
@@ -1013,11 +1016,10 @@ impl Stack {
         match ev {
             Some(dhcp::Event::Bound(l)) | Some(dhcp::Event::Renewed(l)) => {
                 let name = self.ifaces[iface].name.clone();
-                if self.ifaces[iface].addr != Some((l.addr, l.prefix)) {
-                    self.set_address(iface, Some((l.addr, l.prefix)), l.router, RouteOrigin::Dhcp);
-                }
-                if !self.dns_static && !l.dns.is_empty() {
+                self.set_address(iface, Some((l.addr, l.prefix)), l.router, RouteOrigin::Dhcp);
+                if !self.dns_static && self.dns_servers != l.dns {
                     self.dns_servers = l.dns.clone();
+                    self.dns_cache.flush();
                 }
                 let dns: Vec<String> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
                 self.logf(alloc::format!(
@@ -1039,6 +1041,7 @@ impl Stack {
                 self.set_address(iface, None, None, RouteOrigin::Dhcp);
                 if !self.dns_static {
                     self.dns_servers.clear();
+                    self.dns_cache.flush();
                 }
                 self.logf(alloc::format!("{}: DHCP lease lost", name));
             }

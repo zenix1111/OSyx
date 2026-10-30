@@ -48,7 +48,7 @@
 pub mod ipc;
 pub mod net;
 
-pub const ABI_VERSION: u32 = 11;
+pub const ABI_VERSION: u32 = 12;
 pub mod fault;
 
 /// Highest user virtual address + 1 (the canonical lower half).
