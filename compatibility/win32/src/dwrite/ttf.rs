@@ -27,6 +27,7 @@ pub fn tag(s: &[u8; 4]) -> u32 {
 /// One face of a font file.
 pub struct Face {
     pub data: alloc::sync::Arc<Vec<u8>>,
+    index: u32,
     /// Offset of the face's table directory (non-zero inside a collection).
     dir: usize,
     tables: Vec<(u32, usize, usize)>,
@@ -85,7 +86,7 @@ impl Face {
                 tables.push((t, off, len));
             }
         }
-        let mut f = Face { data: data.clone(), dir, tables, units_per_em: 0, glyph_count: 0, long_loca: false, hmetrics: 0, vmetrics: 0, cmap: None };
+        let mut f = Face { data: data.clone(), index, dir, tables, units_per_em: 0, glyph_count: 0, long_loca: false, hmetrics: 0, vmetrics: 0, cmap: None };
         let head = f.table(b"head")?;
         let (upem, long_loca) = (u16_at(head, 18).filter(|&u| (16..=16384).contains(&u))?, i16_at(head, 50)? == 1);
         f.units_per_em = upem;
@@ -103,6 +104,10 @@ impl Face {
 
     pub fn has_glyf(&self) -> bool {
         self.table(b"glyf").is_some() && self.table(b"loca").is_some()
+    }
+
+    pub fn has_outlines(&self) -> bool {
+        self.has_glyf() || self.table(b"CFF ").is_some() || self.table(b"CFF2").is_some()
     }
 
     pub fn table(&self, t: &[u8; 4]) -> Option<&[u8]> {
@@ -390,6 +395,9 @@ impl Face {
 
     /// The glyph's box (xMin, yMin, xMax, yMax) from its header.
     pub fn glyph_box(&self, glyph: u16) -> Option<(i16, i16, i16, i16)> {
+        if !self.has_glyf() {
+            return osyx_font::glyph_box(&self.data, self.index, glyph);
+        }
         let g = self.glyph_data(glyph)?;
         if g.len() < 10 {
             return None;
@@ -397,8 +405,14 @@ impl Face {
         Some((i16_at(g, 2)?, i16_at(g, 4)?, i16_at(g, 6)?, i16_at(g, 8)?))
     }
 
-    /// The glyph's contours in font units (empty for a space or a CFF font).
+    /// The glyph's contours in font units (empty for a space).
     pub fn outline(&self, glyph: u16) -> Outline {
+        if !self.has_glyf() {
+            return osyx_font::outline(&self.data, self.index, glyph)
+                .unwrap_or_default().into_iter()
+                .map(|contour| contour.into_iter().map(|p| Point { x: p.x, y: p.y, on: p.on }).collect())
+                .collect();
+        }
         let mut out = Vec::new();
         self.add_outline(glyph, [65536, 0, 0, 65536, 0, 0], &mut out, 0);
         out

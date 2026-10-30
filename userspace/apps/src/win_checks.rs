@@ -1,5 +1,5 @@
-//! Windows compatibility checks (`init win,<tcp>,<udp>`): the PE32+ test
-//! programs in /opt/wintests (built from compatibility/win32/tests/src by
+//! Windows compatibility checks (`init win,<tcp>,<udp>`): the PE32+ and PE32
+//! test programs in /opt/wintests (built from compatibility/win32/tests/src by
 //! scripts/build-wintests.ps1) run under /bin/winrun. Each program prints
 //! its own checks to the log and exits with its failure count; the GUI
 //! program runs inside a PRISM session started here.
@@ -38,6 +38,8 @@ pub fn run_all(t: &mut Tests, tcp: u16, udp: u16) {
     t.check("kernel32 console program: TEB/PEB, last error, modules (target B)", || {
         run("hello.exe", &["first arg", "second"]) == Some(0)
     });
+    // 32-bit PE32 image: the loader maps it and i386 code runs; it exits 7.
+    t.check("PE32 32-bit program: i386 code runs and exits 7", || run("hello32.exe", &[]) == Some(7));
     t.check("Windows file I/O on OSyx file systems (target C)", || run("fileio.exe", &[]) == Some(0));
     t.check("Windows volume, device and adapter inventory", || run("sysadmin.exe", &[]) == Some(0));
     t.check("Windows file version resources and queries", || run("version.exe", &[]) == Some(0));

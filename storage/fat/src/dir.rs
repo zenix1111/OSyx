@@ -36,6 +36,8 @@ pub(crate) struct Item {
     pub attr: u8,
     pub first_cluster: u32,
     pub size: u32,
+    /// Modification time, seconds since 1970-01-01 UTC (0 if unset).
+    pub mtime: u32,
     /// The short entry.
     pub sfn: Pos,
     /// All entries of the item (long-name entries first, then the short one).
@@ -246,6 +248,27 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
+    /// The volume label entry of the root directory (what Windows and
+    /// `label` set; the boot sector copy is often left at "NO NAME").
+    pub(crate) fn root_dir_label(&mut self) -> Result<Option<[u8; 11]>> {
+        let root = self.geo.root_cluster;
+        let mut found = None;
+        self.for_each_slot(root, |_, e| {
+            if e[0] == 0 {
+                return Ok(false);
+            }
+            let attr = e[11];
+            if e[0] != 0xE5 && attr & 0x3F != ATTR_LFN && attr & ATTR_VOLUME_ID != 0 && attr & ATTR_DIRECTORY == 0 {
+                let mut l = [0u8; 11];
+                l.copy_from_slice(&e[..11]);
+                found = Some(l);
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(found)
+    }
+
     /// Parses the directory at cluster `dir` into items (including `.`/`..`,
     /// excluding the volume label and deleted entries).
     pub(crate) fn read_items(&mut self, dir: u32) -> Result<Vec<Item>> {
@@ -316,6 +339,7 @@ impl<D: BlockDevice> FileSystem<D> {
                 attr,
                 first_cluster: (le16(e, 20) as u32) << 16 | le16(e, 26) as u32,
                 size: le32(e, 28),
+                mtime: crate::dos_to_unix(le16(e, 24), le16(e, 22)),
                 sfn: pos,
                 slots,
             });
@@ -454,10 +478,12 @@ impl<D: BlockDevice> FileSystem<D> {
         e[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
         e[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
         e[28..32].copy_from_slice(&size.to_le_bytes());
-        // Timestamps: FAT epoch 1980-01-01 00:00 (no clock yet).
-        let date: u16 = 1 << 5 | 1;
+        // Creation, access and modification times.
+        let (date, time) = self.timestamp();
+        e[14..16].copy_from_slice(&time.to_le_bytes());
         e[16..18].copy_from_slice(&date.to_le_bytes());
         e[18..20].copy_from_slice(&date.to_le_bytes());
+        e[22..24].copy_from_slice(&time.to_le_bytes());
         e[24..26].copy_from_slice(&date.to_le_bytes());
         self.write_entry(sfn, &e)?;
         Ok(sfn)
@@ -485,6 +511,10 @@ impl<D: BlockDevice> FileSystem<D> {
         if e[11] & ATTR_DIRECTORY == 0 {
             e[11] |= ATTR_ARCHIVE;
         }
+        let (date, time) = self.timestamp();
+        e[18..20].copy_from_slice(&date.to_le_bytes());
+        e[22..24].copy_from_slice(&time.to_le_bytes());
+        e[24..26].copy_from_slice(&date.to_le_bytes());
         self.write_entry(pos, &e)
     }
 }

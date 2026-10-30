@@ -74,6 +74,7 @@ pub mod opcode {
     pub const SET_WINDOW_VISIBILITY: u16 = 0x0E;
     pub const SYNC: u16 = 0x0F;
     pub const CLIPBOARD_SET: u16 = 0x10;
+    pub const FILE_DRAG: u16 = 0x11;
 
     pub const EV_HELLO: u16 = 0x81;
     pub const CONFIGURE: u16 = 0x82;
@@ -88,6 +89,7 @@ pub mod opcode {
     pub const ERROR: u16 = 0x8B;
     pub const SYNC_DONE: u16 = 0x8C;
     pub const CLIPBOARD_CHANGED: u16 = 0x8D;
+    pub const FILE_DROP: u16 = 0x8E;
 }
 
 /// `HELLO` flags.
@@ -250,6 +252,166 @@ pub struct ClipEntry {
     pub data: Vec<u8>,
 }
 
+/// Win32 CF_UNICODETEXT, also used by native clients for shared text.
+pub const CLIP_UNICODE_TEXT: u32 = 13;
+/// Registered clipboard format for absolute OSyx file paths.
+pub const CLIP_FILES_NAME: &str = "application/x-osyx-files";
+
+/// Encode a file selection without relying on delimiters in file names.
+pub fn clipboard_files_entry(paths: &[String], cut: bool) -> Option<ClipEntry> {
+    if paths.is_empty() || paths.len() > u16::MAX as usize { return None; }
+    let mut data = Vec::new();
+    data.push(u8::from(cut));
+    data.extend_from_slice(&(paths.len() as u16).to_le_bytes());
+    for path in paths {
+        if !path.starts_with('/') || path.contains('\0') { return None; }
+        let len = u32::try_from(path.len()).ok()?;
+        if data.len().checked_add(4 + path.len())? > MAX_CLIPBOARD_BYTES { return None; }
+        data.extend_from_slice(&len.to_le_bytes());
+        data.extend_from_slice(path.as_bytes());
+    }
+    Some(ClipEntry { format: 0xc000, name: Some(String::from(CLIP_FILES_NAME)), data })
+}
+
+/// Decode a complete file selection; reject malformed or relative paths.
+pub fn clipboard_files(entries: &[ClipEntry]) -> Option<(Vec<String>, bool)> {
+    let Some(entry) = entries.iter().find(|entry| entry.name.as_deref() == Some(CLIP_FILES_NAME)) else {
+        return clipboard_hdrop_files(entries);
+    };
+    let data = &entry.data;
+    if data.len() < 3 || data.len() > MAX_CLIPBOARD_BYTES || data[0] > 1 { return None; }
+    let count = u16::from_le_bytes([data[1], data[2]]) as usize;
+    if count == 0 { return None; }
+    let mut at = 3usize;
+    let mut paths = Vec::new();
+    for _ in 0..count {
+        let b = data.get(at..at.checked_add(4)?)?;
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        at += 4;
+        let end = at.checked_add(len)?;
+        let path = core::str::from_utf8(data.get(at..end)?).ok()?;
+        if !path.starts_with('/') || path.contains('\0') { return None; }
+        paths.push(String::from(path));
+        at = end;
+    }
+    if at != data.len() { return None; }
+    Some((paths, data[0] != 0))
+}
+
+/// Decode local C: paths from a Windows CF_HDROP clipboard entry.
+fn clipboard_hdrop_files(entries: &[ClipEntry]) -> Option<(Vec<String>, bool)> {
+    let data = &entries.iter().find(|e| e.format == 15)?.data;
+    if data.len() < 20 || data.len() > MAX_CLIPBOARD_BYTES { return None; }
+    let offset = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?) as usize;
+    if offset < 20 { return None; }
+    let wide = u32::from_le_bytes(data.get(16..20)?.try_into().ok()?) != 0;
+    let bytes = data.get(offset..)?;
+    let units: Vec<u16> = if wide {
+        if bytes.len() % 2 != 0 { return None; }
+        bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    } else {
+        core::str::from_utf8(bytes).ok()?.encode_utf16().collect()
+    };
+    let mut paths = Vec::new();
+    let mut at = 0;
+    loop {
+        let end = units[at..].iter().position(|u| *u == 0)? + at;
+        if end == at { break; }
+        let win = String::from_utf16(&units[at..end]).ok()?;
+        let raw = win.as_bytes();
+        if raw.len() < 3 || !raw[0].eq_ignore_ascii_case(&b'c') || raw[1] != b':' || raw[2] != b'\\' { return None; }
+        let path = win[2..].replace('\\', "/");
+        if path.split('/').any(|part| part == "." || part == ".."
+            || part.contains([':', '<', '>', '"', '|', '?', '*'])
+            || part.ends_with(['.', ' '])) { return None; }
+        paths.push(path);
+        at = end + 1;
+        if at >= units.len() { return None; }
+    }
+    if paths.is_empty() { return None; }
+    let cut = entries.iter().find(|e| e.name.as_deref() == Some("Preferred DropEffect"))
+        .and_then(|e| e.data.get(..4)).is_some_and(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 2);
+    Some((paths, cut))
+}
+
+/// Convert native file paths to a wide Windows CF_HDROP payload.
+pub fn clipboard_hdrop(entries: &[ClipEntry]) -> Option<Vec<u8>> {
+    let (paths, _) = clipboard_files(entries)?;
+    let mut data = alloc::vec![0u8; 20];
+    data[0..4].copy_from_slice(&20u32.to_le_bytes());
+    data[16..20].copy_from_slice(&1u32.to_le_bytes());
+    for path in paths {
+        // Windows would reinterpret these names or path components.
+        if path.split('/').any(|part| part == "." || part == ".."
+            || part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
+            || part.ends_with(['.', ' '])) { return None; }
+        for c in "C:".chars().chain(path.chars().map(|c| if c == '/' { '\\' } else { c })) {
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                data.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        data.extend_from_slice(&[0, 0]);
+        if data.len() > MAX_CLIPBOARD_BYTES - 2 { return None; }
+    }
+    data.extend_from_slice(&[0, 0]);
+    Some(data)
+}
+
+/// Preferred Windows drop effect for a native file selection.
+pub fn clipboard_file_effect(entries: &[ClipEntry]) -> Option<Vec<u8>> {
+    let native = entries.iter().find(|e| e.name.as_deref() == Some(CLIP_FILES_NAME))?;
+    let (_, cut) = clipboard_files(core::slice::from_ref(native))?;
+    Some((if cut { 2u32 } else { 1u32 }).to_le_bytes().to_vec())
+}
+
+/// Encode text as a NUL-terminated UTF-16LE clipboard entry.
+pub fn clipboard_text_entry(text: &str) -> ClipEntry {
+    let mut data = Vec::new();
+    for ch in text.chars() {
+        if ch == '\0' { break; }
+        let mut units = [0u16; 2];
+        let units = ch.encode_utf16(&mut units);
+        if data.len() + units.len() * 2 + 2 > MAX_CLIPBOARD_BYTES { break; }
+        for unit in units { data.extend_from_slice(&unit.to_le_bytes()); }
+    }
+    data.extend_from_slice(&[0, 0]);
+    ClipEntry { format: CLIP_UNICODE_TEXT, name: None, data }
+}
+
+/// Decode the first CF_UNICODETEXT entry, ignoring any bytes after NUL.
+pub fn clipboard_text(entries: &[ClipEntry]) -> Option<String> {
+    if let Some(entry) = entries.iter().find(|e| e.format == CLIP_UNICODE_TEXT) {
+        if entry.data.len() % 2 != 0 { return None; }
+        let units: Vec<u16> = entry.data.chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|u| *u != 0).collect();
+        return Some(String::from_utf16_lossy(&units));
+    }
+    // OSyx's Windows ANSI code page is UTF-8.
+    let entry = entries.iter().find(|e| e.format == 1)?;
+    let end = entry.data.iter().position(|b| *b == 0).unwrap_or(entry.data.len());
+    Some(String::from_utf8_lossy(&entry.data[..end]).into_owned())
+}
+
+/// Return a text format, synthesizing it from the other text format if needed.
+/// OSyx Win32 uses UTF-8 for its ANSI code page.
+pub fn clipboard_text_format(entries: &[ClipEntry], format: u32) -> Option<Vec<u8>> {
+    if let Some(entry) = entries.iter().find(|entry| entry.format == format) {
+        return Some(entry.data.clone());
+    }
+    let text = clipboard_text(entries)?;
+    match format {
+        CLIP_UNICODE_TEXT => Some(clipboard_text_entry(&text).data),
+        1 => {
+            let mut data = text.into_bytes();
+            data.push(0);
+            Some(data)
+        }
+        _ => None,
+    }
+}
+
 /// Client -> compositor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -293,6 +455,7 @@ pub enum Request {
     Notify { title: String, body: String },
     /// Replaces the system clipboard contents.
     ClipboardSet { entries: Vec<ClipEntry> },
+    FileDrag { window: u32, path: String },
 }
 
 /// Compositor -> client.
@@ -327,6 +490,7 @@ pub enum Event {
     /// The system clipboard contents, broadcast on every change and once to
     /// each client after `HELLO`. `seq` is monotonic, 0 for "never set".
     ClipboardChanged { seq: u32, entries: Vec<ClipEntry> },
+    FileDrop { window: u32, x: i32, y: i32, path: String },
     Error { code: u32, serial: u32, message: String },
 }
 
@@ -574,6 +738,7 @@ impl Request {
             Request::Notify { .. } => NOTIFY,
             Request::DestroyBuffer { .. } => DESTROY_BUFFER,
             Request::ClipboardSet { .. } => CLIPBOARD_SET,
+            Request::FileDrag { .. } => FILE_DRAG,
         }
     }
 
@@ -631,6 +796,7 @@ impl Request {
             Request::ClipboardSet { entries } => {
                 clip_entries(&mut w, entries);
             }
+            Request::FileDrag { window, path } => { w.u32(*window).str(path, MAX_TEXT); }
         }
         w.finish()
     }
@@ -703,6 +869,7 @@ impl Request {
             opcode::NOTIFY => Request::Notify { title: r.str(MAX_TITLE)?, body: r.str(MAX_TEXT)? },
             opcode::SYNC => Request::Sync { cookie: r.u32()? },
             opcode::CLIPBOARD_SET => Request::ClipboardSet { entries: read_clip_entries(&mut r)? },
+            opcode::FILE_DRAG => Request::FileDrag { window: r.id()?, path: r.str(MAX_TEXT)? },
             op => return Err(ProtoError::UnknownOpcode(op)),
         };
         r.end()?;
@@ -725,6 +892,7 @@ impl Event {
             Event::WindowList { .. } => WINDOW_LIST,
             Event::Notification { .. } => NOTIFICATION,
             Event::ClipboardChanged { .. } => CLIPBOARD_CHANGED,
+            Event::FileDrop { .. } => FILE_DROP,
             Event::Error { .. } => ERROR,
             Event::SyncDone { .. } => SYNC_DONE,
         }
@@ -789,6 +957,7 @@ impl Event {
                 w.u32(*seq);
                 clip_entries(&mut w, entries);
             }
+            Event::FileDrop { window, x, y, path } => { w.u32(*window).i32(*x).i32(*y).str(path, MAX_TEXT); }
             Event::Error { code, message, .. } => {
                 w.u32(*code).str(message, MAX_TEXT);
             }
@@ -861,6 +1030,7 @@ impl Event {
             }
             opcode::NOTIFICATION => Event::Notification { from_pid: r.u32()?, title: r.str(MAX_TITLE)?, body: r.str(MAX_TEXT)? },
             opcode::CLIPBOARD_CHANGED => Event::ClipboardChanged { seq: r.u32()?, entries: read_clip_entries(&mut r)? },
+            opcode::FILE_DROP => Event::FileDrop { window: r.id()?, x: r.i32()?, y: r.i32()?, path: r.str(MAX_TEXT)? },
             opcode::ERROR => Event::Error { code: r.u32()?, serial, message: r.str(MAX_TEXT)? },
             op => return Err(ProtoError::UnknownOpcode(op)),
         };
@@ -1077,6 +1247,58 @@ mod tests {
         let n = m.len();
         m[n - 4..].copy_from_slice(&0xD800u32.to_le_bytes());
         assert_eq!(Event::decode(&m), Err(ProtoError::BadValue));
+    }
+
+    #[test]
+    fn file_clipboard_round_trips_and_rejects_bad_paths() {
+        let paths = vec![String::from("/home/user/a\nb"), String::from("/tmp/ż")];
+        let entry = clipboard_files_entry(&paths, true).unwrap();
+        assert_eq!(clipboard_file_effect(&[entry.clone()]), Some(2u32.to_le_bytes().to_vec()));
+        assert_eq!(clipboard_file_effect(&[clipboard_files_entry(&paths, false).unwrap()]), Some(1u32.to_le_bytes().to_vec()));
+        let hdrop = clipboard_hdrop(&[entry.clone()]).unwrap();
+        assert_eq!(&hdrop[..4], &20u32.to_le_bytes());
+        assert_eq!(&hdrop[16..20], &1u32.to_le_bytes());
+        let units: Vec<u16> = hdrop[20..].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(units, "C:\\home\\user\\a\nb\0C:\\tmp\\ż\0\0".encode_utf16().collect::<Vec<_>>());
+        let windows = ClipEntry { format: 15, name: None, data: hdrop };
+        assert_eq!(clipboard_files(&[windows.clone()]), Some((paths.clone(), false)));
+        let effect = ClipEntry { format: 0xc001, name: Some(String::from("Preferred DropEffect")), data: 2u32.to_le_bytes().to_vec() };
+        assert_eq!(clipboard_files(&[windows, effect]), Some((paths.clone(), true)));
+        let mut invalid = alloc::vec![0u8; 20];
+        invalid[0..4].copy_from_slice(&20u32.to_le_bytes());
+        invalid[16..20].copy_from_slice(&1u32.to_le_bytes());
+        for u in "C:\\..\\secret\0\0".encode_utf16() { invalid.extend_from_slice(&u.to_le_bytes()); }
+        let invalid = ClipEntry { format: 15, name: None, data: invalid };
+        assert_eq!(clipboard_files(&[invalid]), None);
+        let mut invalid = alloc::vec![0u8; 20];
+        invalid[0..4].copy_from_slice(&20u32.to_le_bytes());
+        invalid[16..20].copy_from_slice(&1u32.to_le_bytes());
+        for u in "C:\\name:stream\0\0".encode_utf16() { invalid.extend_from_slice(&u.to_le_bytes()); }
+        assert_eq!(clipboard_files(&[ClipEntry { format: 15, name: None, data: invalid }]), None);
+        let invalid = clipboard_files_entry(&[String::from("/tmp/a\\b")], false).unwrap();
+        assert!(clipboard_hdrop(&[invalid]).is_none());
+        assert_eq!(clipboard_files(&[entry.clone()]), Some((paths, true)));
+        let mut broken = entry;
+        broken.data.pop();
+        assert_eq!(clipboard_files(&[broken]), None);
+        assert!(clipboard_files_entry(&[String::from("relative")], false).is_none());
+    }
+
+    #[test]
+    fn unicode_clipboard_text_round_trips_and_is_bounded() {
+        let entry = clipboard_text_entry("Zażółć 🌍");
+        assert_eq!(clipboard_text(&[entry]), Some(String::from("Zażółć 🌍")));
+        let entry = clipboard_text_entry(&"🌍".repeat(MAX_CLIPBOARD_BYTES));
+        assert!(entry.data.len() <= MAX_CLIPBOARD_BYTES);
+        assert!(clipboard_text(&[entry]).unwrap().chars().all(|c| c == '🌍'));
+        let malformed = ClipEntry { format: CLIP_UNICODE_TEXT, name: None, data: vec![1] };
+        assert_eq!(clipboard_text(&[malformed]), None);
+        let ansi = ClipEntry { format: 1, name: None, data: b"test\0ignored".to_vec() };
+        assert_eq!(clipboard_text(&[ansi]).as_deref(), Some("test"));
+        let unicode = clipboard_text_entry("Zażółć");
+        assert_eq!(clipboard_text_format(&[unicode], 1), Some("Zażółć\0".as_bytes().to_vec()));
+        let ansi = ClipEntry { format: 1, name: None, data: b"test\0".to_vec() };
+        assert_eq!(clipboard_text_format(&[ansi], CLIP_UNICODE_TEXT), Some(clipboard_text_entry("test").data));
     }
 
     #[test]

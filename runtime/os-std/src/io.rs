@@ -65,6 +65,124 @@ impl Read for &[u8] {
     }
 }
 
+/// Reading through an internal buffer, line by line.
+pub trait BufRead: Read {
+    /// The buffered bytes; reads more from the source only when the buffer
+    /// is empty.
+    fn fill_buf(&mut self) -> Result<&[u8]>;
+
+    /// Marks `n` bytes returned by [`fill_buf`](BufRead::fill_buf) as used.
+    fn consume(&mut self, n: usize);
+
+    /// Appends data up to and including `byte`, or up to the end of the
+    /// data, to `buf`; returns how many bytes were appended.
+    fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> Result<usize> {
+        let start = buf.len();
+        loop {
+            let available = self.fill_buf()?;
+            if available.is_empty() {
+                return Ok(buf.len() - start);
+            }
+            if let Some(i) = available.iter().position(|&b| b == byte) {
+                buf.extend_from_slice(&available[..=i]);
+                self.consume(i + 1);
+                return Ok(buf.len() - start);
+            }
+            buf.extend_from_slice(available);
+            let n = available.len();
+            self.consume(n);
+        }
+    }
+
+    /// Appends one line (`\n` included) to `line`; returns the byte count.
+    /// Fails with [`ErrorKind::InvalidData`] if the line is not UTF-8.
+    fn read_line(&mut self, line: &mut String) -> Result<usize> {
+        let mut bytes = Vec::new();
+        let n = self.read_until(b'\n', &mut bytes)?;
+        let text = core::str::from_utf8(&bytes).map_err(|_| Error::new(ErrorKind::InvalidData, "stream did not contain valid UTF-8"))?;
+        line.push_str(text);
+        Ok(n)
+    }
+}
+
+impl BufRead for &[u8] {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        Ok(*self)
+    }
+
+    fn consume(&mut self, n: usize) {
+        *self = &self[n.min(self.len())..];
+    }
+}
+
+/// A [`Read`] source with an internal buffer, so small reads and line
+/// reads do not cost one system call per byte.
+pub struct BufReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+impl<R: Read> BufReader<R> {
+    pub fn new(inner: R) -> BufReader<R> {
+        BufReader::with_capacity(8 * 1024, inner)
+    }
+
+    pub fn with_capacity(capacity: usize, inner: R) -> BufReader<R> {
+        BufReader { inner, buf: alloc::vec![0; capacity.max(1)], pos: 0, cap: 0 }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    /// The bytes read ahead but not consumed yet.
+    pub fn buffer(&self) -> &[u8] {
+        &self.buf[self.pos..self.cap]
+    }
+
+    fn fill(&mut self) -> Result<usize> {
+        self.pos = 0;
+        self.cap = 0;
+        let n = self.inner.read(&mut self.buf)?;
+        assert!(n <= self.buf.len(), "Read::read returned more bytes than the buffer");
+        self.cap = n;
+        Ok(n)
+    }
+}
+
+impl<R: Read> Read for BufReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        if self.pos >= self.cap {
+            // Large reads skip the buffer entirely.
+            if out.len() >= self.buf.len() {
+                return self.inner.read(out);
+            }
+            if self.fill()? == 0 {
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.cap - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl<R: Read> BufRead for BufReader<R> {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+        if self.pos >= self.cap {
+            self.fill()?;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.cap);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekFrom {
     Start(u64),
@@ -288,6 +406,64 @@ mod tests {
         assert_eq!(s, ">zażółć");
         let mut bad = &[0xFFu8, 0xFE][..];
         assert_eq!(bad.read_to_string(&mut s).unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+
+    /// A source that returns at most `1` bytes per read, to force refills.
+    struct Dribble<'a> {
+        data: &'a [u8],
+    }
+
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let n = buf.len().min(self.data.len()).min(1);
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn buf_reader_reads_lines_across_refills() {
+        let data = "one\ntwo\n\nzażółć\nlast";
+        let mut r = BufReader::with_capacity(4, Dribble { data: data.as_bytes() });
+        let mut first = String::new();
+        assert_eq!(r.read_line(&mut first).unwrap(), 4);
+        assert_eq!(first, "one\n");
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            lines.push(line);
+        }
+        assert_eq!(lines, ["two\n", "\n", "zażółć\n", "last"]);
+    }
+
+    #[test]
+    fn buf_reader_buffers_small_reads_and_passes_large_ones() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut r = BufReader::with_capacity(16, &data[..]);
+        let mut head = [0u8; 3];
+        r.read_exact(&mut head).unwrap();
+        assert_eq!(head, [0, 1, 2]);
+        assert_eq!(r.buffer(), &data[3..16]);
+        assert_eq!(r.fill_buf().unwrap(), &data[3..16]);
+        r.consume(2);
+        assert_eq!(r.buffer(), &data[5..16]);
+        let mut rest = Vec::new();
+        assert_eq!(r.read_to_end(&mut rest).unwrap(), 9_995);
+        assert_eq!(&rest[..], &data[5..]);
+        let mut r = BufReader::with_capacity(4, &b"ab\nc"[..]);
+        let mut until = Vec::new();
+        assert_eq!(r.read_until(b'\n', &mut until).unwrap(), 3);
+        assert_eq!(until, b"ab\n");
+        assert_eq!(r.buffer(), b"c");
+        let r = BufReader::new(&b"xyz"[..]);
+        assert_eq!(r.into_inner(), b"xyz");
+        let mut r = BufReader::new(Dribble { data: &[0xFF, 0xFE, b'\n'][..] });
+        let mut line = String::new();
+        assert_eq!(r.read_line(&mut line).unwrap_err().kind(), ErrorKind::InvalidData);
     }
 
     #[test]

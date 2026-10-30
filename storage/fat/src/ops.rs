@@ -13,6 +13,8 @@ pub struct Metadata {
     pub size: u32,
     pub attributes: u8,
     pub first_cluster: u32,
+    /// Modification time, seconds since 1970-01-01 UTC (0 if unset).
+    pub mtime: u32,
 }
 
 /// How [`FileSystem::open`] treats missing and existing files.
@@ -70,7 +72,11 @@ impl<D: BlockDevice> FileSystem<D> {
                 Node::Item(_) => return Err(FsError::NotADirectory),
             };
             let found = self.find(dir, part)?.ok_or(FsError::NotFound)?;
-            node = if found.is_dot() && found.first_cluster == 0 { Node::Root } else { Node::Item(found) };
+            let root_parent = found.short == *b"..         " && found.first_cluster == 0;
+            if found.is_dir() && !root_parent && !self.geo.is_valid_cluster(found.first_cluster) {
+                return Err(FsError::Corrupt("directory starts at an invalid cluster"));
+            }
+            node = if root_parent { Node::Root } else { Node::Item(found) };
         }
         Ok(node)
     }
@@ -91,8 +97,8 @@ impl<D: BlockDevice> FileSystem<D> {
 
     pub fn metadata(&mut self, path: &str) -> Result<Metadata> {
         Ok(match self.resolve(path)? {
-            Node::Root => Metadata { is_dir: true, size: 0, attributes: ATTR_DIRECTORY, first_cluster: self.geo.root_cluster },
-            Node::Item(it) => Metadata { is_dir: it.is_dir(), size: it.size, attributes: it.attr, first_cluster: it.first_cluster },
+            Node::Root => Metadata { is_dir: true, size: 0, attributes: ATTR_DIRECTORY, first_cluster: self.geo.root_cluster, mtime: 0 },
+            Node::Item(it) => Metadata { is_dir: it.is_dir(), size: it.size, attributes: it.attr, first_cluster: it.first_cluster, mtime: it.mtime },
         })
     }
 
@@ -225,6 +231,8 @@ impl<D: BlockDevice> FileSystem<D> {
                 // Same entry (e.g. a case change): rewrite the name below.
             } else if existing.is_dir() {
                 return Err(FsError::AlreadyExists);
+            } else if it.is_dir() {
+                return Err(FsError::NotADirectory);
             } else {
                 self.remove_entries(&existing)?;
                 self.free_chain(existing.first_cluster)?;

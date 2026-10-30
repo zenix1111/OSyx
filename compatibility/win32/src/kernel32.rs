@@ -7,6 +7,7 @@
 
 use crate::error::*;
 use crate::objects::{self, Console, EventObj, FileObj, MutexObj, Object, SemaphoreObj, ThreadObj};
+use crate::ini::{GetPrivateProfileStringW, WritePrivateProfileStringW};
 use crate::{loader, mem, path, teb};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -2373,6 +2374,48 @@ extern "win64" fn lstrcmpiW(a: *const u16, b: *const u16) -> i32 {
     }
 }
 
+extern "win64" fn lstrcmpW(a: *const u16, b: *const u16) -> i32 {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        _ => crate::locale::compare_wide(a, b, false) as i32,
+    }
+}
+
+extern "win64" fn lstrcmpiA(a: *const u8, b: *const u8) -> i32 {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        _ => crate::locale::compare_ansi(a, b, true) as i32,
+    }
+}
+
+extern "win64" fn lstrcpyA(dst: *mut u8, src: *const u8) -> *mut u8 {
+    if dst.is_null() || src.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: Windows contract: `src` is NUL-terminated, `dst` holds it.
+    unsafe {
+        let n = core::ffi::CStr::from_ptr(src.cast()).to_bytes_with_nul().len();
+        core::ptr::copy(src, dst, n);
+    }
+    dst
+}
+
+/// `a * b / c` with a 64-bit intermediate, rounded half away from zero;
+/// -1 when `c` is 0 or the result does not fit.
+extern "win64" fn MulDiv(a: i32, b: i32, c: i32) -> i32 {
+    if c == 0 {
+        return -1;
+    }
+    let p = a as i64 * b as i64;
+    let (q, r) = (p / c as i64, p % c as i64);
+    let q = if 2 * r.abs() >= (c as i64).abs() { q + if (p < 0) != (c < 0) { -1 } else { 1 } } else { q };
+    i32::try_from(q).unwrap_or(-1)
+}
+
 // Global memory: only fixed blocks exist (GlobalAlloc refuses
 // GMEM_MOVEABLE), so a handle is the block's address and is never locked.
 
@@ -2889,6 +2932,12 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         OpenFileMappingW,
         OpenFileMappingA,
         lstrcpyW,
+        lstrcpyA,
+        lstrcmpW,
+        GetPrivateProfileStringW,
+        WritePrivateProfileStringW,
+        lstrcmpiA,
+        MulDiv,
         lstrcpynW,
         lstrcatW,
         lstrcmpiW,

@@ -76,6 +76,7 @@ pub const WM_MBUTTONDOWN: u32 = 0x0207;
 pub const WM_MBUTTONUP: u32 = 0x0208;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_CAPTURECHANGED: u32 = 0x0215;
+const WM_OSYX_FILE_DROP: u32 = 0x7fff_ff01;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const WS_CHILD: u32 = 0x4000_0000;
@@ -515,6 +516,7 @@ impl Gui {
             | Event::FocusChanged { window, .. }
             | Event::Key { window, .. }
             | Event::Pointer { window, .. }
+            | Event::FileDrop { window, .. }
             | Event::CloseRequest { window } => self.by_prism.get(window).copied(),
             Event::BufferRelease { surface } | Event::FrameDone { surface, .. } => self.by_prism.get(surface).copied(),
             _ => None,
@@ -557,6 +559,12 @@ impl Gui {
                 } else {
                     self.post(hwnd, WM_KILLFOCUS, 0, 0);
                     self.post(hwnd, WM_ACTIVATE, 0, 0);
+                }
+            }
+            Event::FileDrop { path, x, y, .. } => {
+                if let Some(w) = self.windows.get(&hwnd) {
+                    let token = crate::ole32::queue_file_drop(hwnd, path, w.pos.0 + x, w.pos.1 + y);
+                    if token != 0 { self.post(hwnd, WM_OSYX_FILE_DROP, token, 0); }
                 }
             }
             Event::CloseRequest { .. } => self.post(hwnd, WM_CLOSE, 0, 0),
@@ -746,6 +754,7 @@ impl Gui {
                 Event::Notification { .. } => 10,
                 Event::Error { .. } => 11,
                 Event::ClipboardChanged { .. } => 12,
+                Event::FileDrop { .. } => 5,
             };
             KINDS[k].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             diag(|d| {
@@ -2157,6 +2166,10 @@ extern "win64" fn DispatchMessageA(msg: *const u8) -> i64 {
     }
     if crate::EVENTS.load(core::sync::atomic::Ordering::Relaxed) && m.msg == WM_CHAR {
         os_std::eprintln!("winrun: char hwnd={:#x} c={:#x} ({})", m.hwnd, m.wparam, m.wparam as u8 as char);
+    }
+    if m.msg == WM_OSYX_FILE_DROP {
+        crate::ole32::dispatch_file_drop(m.hwnd, m.wparam);
+        return 0;
     }
     if m.msg == WM_TIMER && m.lparam != 0 {
         // SAFETY: a TIMERPROC passed to SetTimer.
@@ -4612,7 +4625,20 @@ pub(crate) fn register_format(name: &str) -> u32 {
 
 /// The system clipboard in this process's format ids.
 pub(crate) fn clipboard_contents() -> Vec<proto::ClipEntry> {
-    with(|g| g.clipboard.clone())
+    with(|g| {
+        let mut entries = g.clipboard.clone();
+        if !entries.iter().any(|e| e.format == 15) {
+            if let Some(data) = proto::clipboard_hdrop(&entries) {
+                entries.push(proto::ClipEntry { format: 15, name: None, data });
+            }
+        }
+        if !entries.iter().any(|e| e.name.as_deref() == Some("Preferred DropEffect")) {
+            if let Some(data) = proto::clipboard_file_effect(&entries) {
+                entries.push(proto::ClipEntry { format: register_format("Preferred DropEffect"), name: None, data });
+            }
+        }
+        entries
+    })
 }
 
 /// Replaces the system clipboard (data rendered from an OLE data object).
@@ -4688,12 +4714,10 @@ extern "win64" fn GetClipboardData(format: u32) -> u64 {
         if let Some(&h) = g.clipboard_handles.get(&format) {
             return h;
         }
-        let data = g
-            .clipboard_own
-            .iter()
-            .chain(g.clipboard.iter())
-            .find(|e| e.format == format)
-            .map(|e| e.data.clone());
+        let entries: Vec<_> = g.clipboard_own.iter().chain(g.clipboard.iter()).cloned().collect();
+        let data = proto::clipboard_text_format(&entries, format)
+            .or_else(|| (format == 15).then(|| proto::clipboard_hdrop(&entries)).flatten())
+            .or_else(|| (format == register_format("Preferred DropEffect")).then(|| proto::clipboard_file_effect(&entries)).flatten());
         let Some(data) = data else { return 0 };
         let Some(h) = crate::kernel32::heap_alloc(data.len().max(1), true) else {
             return fail(ERROR_NOT_ENOUGH_MEMORY, 0);
@@ -4707,7 +4731,12 @@ extern "win64" fn GetClipboardData(format: u32) -> u64 {
 
 /// The clipboard must be open to ask for its data.
 extern "win64" fn IsClipboardFormatAvailable(format: u32) -> Bool {
-    with(|g| g.clipboard_own.iter().chain(g.clipboard.iter()).any(|e| e.format == format) as Bool)
+    with(|g| {
+        let entries: Vec<_> = g.clipboard_own.iter().chain(g.clipboard.iter()).cloned().collect();
+        (proto::clipboard_text_format(&entries, format).is_some()
+            || (format == 15 && proto::clipboard_hdrop(&entries).is_some())
+            || (format == register_format("Preferred DropEffect") && proto::clipboard_file_effect(&entries).is_some())) as Bool
+    })
 }
 
 extern "win64" fn GetClipboardSequenceNumber() -> u32 {
@@ -4720,6 +4749,14 @@ extern "win64" fn EnumClipboardFormats(next: u32) -> u32 {
         for e in g.clipboard_own.iter().chain(g.clipboard.iter()) {
             if !formats.contains(&e.format) {
                 formats.push(e.format);
+            }
+        }
+        let entries: Vec<_> = g.clipboard_own.iter().chain(g.clipboard.iter()).cloned().collect();
+        for format in [1, proto::CLIP_UNICODE_TEXT, 15, register_format("Preferred DropEffect")] {
+            if !formats.contains(&format) && (proto::clipboard_text_format(&entries, format).is_some()
+                || (format == 15 && proto::clipboard_hdrop(&entries).is_some())
+                || (format == register_format("Preferred DropEffect") && proto::clipboard_file_effect(&entries).is_some())) {
+                formats.push(format);
             }
         }
         if next == 0 {

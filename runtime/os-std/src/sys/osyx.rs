@@ -429,6 +429,10 @@ fn is_large(layout: Layout) -> bool {
 struct UserHeap {
     locked: AtomicBool,
     heap: UnsafeCell<Heap>,
+    /// Used instead of `heap` once `os_sys::set_low_map` is on: its regions
+    /// lie below 4 GiB, where 32-bit (WoW64) code can reach them. Blocks
+    /// of `heap` mapped earlier still go back to `heap`.
+    low: UnsafeCell<Heap>,
 }
 
 // SAFETY: all access to `heap` happens while `locked` is held.
@@ -436,18 +440,24 @@ unsafe impl Sync for UserHeap {}
 
 impl UserHeap {
     fn with<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
+        self.with_heap(os_sys::low_map(), f)
+    }
+
+    fn with_heap<R>(&self, low: bool, f: impl FnOnce(&mut Heap) -> R) -> R {
         while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        let heap = if low { &self.low } else { &self.heap };
         // SAFETY: the lock gives exclusive access.
-        let r = f(unsafe { &mut *self.heap.get() });
+        let r = f(unsafe { &mut *heap.get() });
         self.locked.store(false, Ordering::Release);
         r
     }
 }
 
 #[global_allocator]
-static HEAP: UserHeap = UserHeap { locked: AtomicBool::new(false), heap: UnsafeCell::new(Heap::new()) };
+static HEAP: UserHeap =
+    UserHeap { locked: AtomicBool::new(false), heap: UnsafeCell::new(Heap::new()), low: UnsafeCell::new(Heap::new()) };
 
 // SAFETY: blocks come from `Heap`, which hands out disjoint, aligned ranges
 // of memory the kernel mapped for this process.
@@ -495,8 +505,11 @@ unsafe impl GlobalAlloc for UserHeap {
             return;
         }
         if let Some(p) = core::ptr::NonNull::new(ptr) {
+            // A block below 4 GiB comes from the low heap only once low
+            // mode is on (the normal heap's regions lie far higher).
+            let low = os_sys::low_map() && (ptr as usize) < 1 << 32;
             // SAFETY: forwarded caller contract.
-            self.with(|h| unsafe { h.dealloc(p, layout) });
+            self.with_heap(low, |h| unsafe { h.dealloc(p, layout) });
         }
     }
 }

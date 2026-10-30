@@ -52,9 +52,15 @@ pub fn split_last(path: &str) -> Option<(&str, &str)> {
     Some((parent, name))
 }
 
+/// Lowercase form for case-insensitive name comparison. Unicode lowercase
+/// turns a final capital sigma into `ς`; FAT compares through its upcase
+/// table, where `ς` and `σ` are the same letter, so fold it back to `σ`.
+pub fn fold_case(name: &str) -> String {
+    name.to_lowercase().replace('ς', "σ")
+}
+
 /// Appends `name` to a canonical absolute directory path.
-pub fn join(dir: &str, name: &str) -> String {
-    let mut s = String::with_capacity(dir.len() + 1 + name.len());
+pub fn join(dir: &str, name: &str) -> String {    let mut s = String::with_capacity(dir.len() + 1 + name.len());
     s.push_str(dir);
     if !dir.ends_with('/') {
         s.push('/');
@@ -144,6 +150,13 @@ mod tests {
         assert_eq!(normalize("/home", "../../../..").unwrap(), "/");
         assert_eq!(normalize("/w", ".").unwrap(), "/w");
         assert!(normalize("/", "").is_err());
+    }
+
+    #[test]
+    fn case_folding_handles_final_sigma() {
+        assert_eq!(fold_case("ΟΣ.txt"), fold_case("Ος.txt"));
+        assert_eq!(fold_case("Ż.txt"), "ż.txt");
+        assert_ne!(fold_case("a.txt"), fold_case("b.txt"));
     }
 
     #[test]

@@ -41,5 +41,11 @@ path = "src/bin/timesync.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "wifi-watch"
+path = "src/bin/wifi-watch.rs"
+test = false
+bench = false
+
 [dependencies]
 os-std = { path = "../../runtime/os-std" }
