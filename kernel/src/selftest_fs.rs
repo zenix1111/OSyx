@@ -189,6 +189,11 @@ pub fn links_cwd_perms() -> TestResult {
     ensure!(up.path == "/", ".. after a symlink is physical: got {}", up.path);
     vfs::symlink(&cx, "missing", "/tmp/lk/dangle").map_err(|x| e("dangle", x))?;
     ensure!(vfs::stat(&cx, "/tmp/lk/dangle") == Err(Errno::NotFound) && vfs::lstat(&cx, "/tmp/lk/dangle").is_ok(), "dangling link");
+    let exclusive = OPEN_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE;
+    for link in ["/tmp/lk/rel", "/tmp/lk/dangle"] {
+        ensure!(vfs::open(&cx, link, exclusive, 0o600).err() == Some(Errno::AlreadyExists), "exclusive create over symlink {link}");
+    }
+    ensure!(vfs::stat(&cx, "/tmp/lk/target.txt").map(|s| s.size) == Ok(1), "exclusive create preserved target");
     let in_lk = Lookup { cwd: String::from("/tmp/lk"), ..root() };
     ensure!(vfs::chdir(&in_lk, "../lk/./self").as_deref() == Ok("/tmp/lk"), "chdir canonicalises through links");
     ensure!(vfs::chdir(&in_lk, "target.txt") == Err(Errno::NotADirectory), "chdir to a file");
