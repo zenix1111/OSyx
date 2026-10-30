@@ -16,9 +16,16 @@ permissions:
 jobs:
   codspeed:
     name: Run benchmarks
+    # Only the canonical repository owns the CodSpeed project, and pull
+    # requests from forks get no OIDC token there, so their uploads fail with
+    # 401 and the analysis run has no data. Skip both instead of failing.
+    if: >-
+      github.repository == 'OSyxSoftware/OSyx' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup rust toolchain, cache and cargo-codspeed binary
         uses: moonrepo/setup-rust@v1

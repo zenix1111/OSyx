@@ -22,8 +22,8 @@ UEFI firmware (OVMF)
   where it is the right tool (interrupt stubs, SYSCALL entry, ring
   transitions, fault-tolerant copy routines), via `global_asm!`/`asm!`.
   No C++ yet: no component has needed it (see [cpp-interop.md](cpp-interop.md)).
-- **Stable toolchain, no external crates.** UEFI bindings, ELF parsing,
-  allocators, locks and graphics are all in-tree. Builds use stable Rust.
+- **Stable toolchain.** UEFI bindings, ELF parsing,
+  allocators, locks and graphics are in-tree. Other components use external crates, including rustls. Builds use stable Rust.
 - **Host-testable cores.** Hardware-independent algorithms live in `no_std`
   crates with host unit tests (`boot/elf`, `boot/gfx`, `kernel/mm`,
   `storage/*`, `shared/*`, `runtime/os-std` host back end). Hardware paths are tested by
@@ -62,7 +62,8 @@ UEFI firmware (OVMF)
 | VFS: driver interface, mounts, symlinks, cwd, permissions, uid/gid | Implemented | in-kernel + QEMU user tests |
 | `/dev/random` (ChaCha20 DRBG, virtio-rng / RDRAND seeded) | Implemented | test vectors; QEMU with and without an entropy source |
 | Early boot screen, x2APIC, calibrated LAPIC timer, ACPI PM/HPET references, xHCI firmware handoff | Implemented | QEMU; physical machines still require testing |
-| AHCI, NVMe and physical NIC drivers | Planned | Not tested |
+| AHCI and NVMe storage drivers | Implemented; hardware support varies | Default QEMU suite uses virtio-blk; broader controller coverage is needed |
+| Physical NIC drivers | Implemented; hardware support varies | RTL8139 via `scripts/net-test.ps1 -Nic rtl8139`; selected hardware listed in README |
 | C++23 components | Planned (no current need) | Not tested |
 | PE32+ parser | Implemented (headers, sections, imports, exports, relocations, TLS, exception data) | host: fixtures, malformed, fuzz-style robustness; System32 sweep |
 | PE32+ loader | Implemented initial subset | host linker/image tests and QEMU execution |

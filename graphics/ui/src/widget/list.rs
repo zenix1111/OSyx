@@ -47,6 +47,9 @@ pub struct ListView {
     pub row_height: u32,
     items: Vec<ListItem>,
     selected: Option<usize>,
+    /// Rows marked in addition to the selected one (multi-selection); the
+    /// caller decides when to mark (Ctrl, Shift, a rubber band).
+    marked: Vec<bool>,
     hovered: Option<usize>,
     pub scroll: Scroll,
     /// Row pressed and not yet released (activation needs press + release).
@@ -65,6 +68,7 @@ impl ListView {
             row_height: 30,
             items: Vec::new(),
             selected: None,
+            marked: Vec::new(),
             hovered: None,
             scroll: Scroll::default(),
             pressed: None,
@@ -78,6 +82,8 @@ impl ListView {
     /// Replaces the rows, keeping the selection index if still valid.
     pub fn set_items(&mut self, items: Vec<ListItem>) {
         self.items = items;
+        self.marked.clear();
+        self.marked.resize(self.items.len(), false);
         if self.selected.is_some_and(|s| s >= self.items.len()) {
             self.selected = if self.items.is_empty() { None } else { Some(self.items.len() - 1) };
         }
@@ -87,6 +93,49 @@ impl ListView {
 
     pub fn selected(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The marked rows, in order.
+    pub fn marked(&self) -> Vec<usize> {
+        self.marked.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i).collect()
+    }
+
+    pub fn is_marked(&self, i: usize) -> bool {
+        self.marked.get(i).copied().unwrap_or(false)
+    }
+
+    /// The marked rows, or the selected row if none is marked.
+    pub fn chosen(&self) -> Vec<usize> {
+        let m = self.marked();
+        if m.is_empty() {
+            self.selected.into_iter().collect()
+        } else {
+            m
+        }
+    }
+
+    pub fn toggle_mark(&mut self, i: usize) {
+        if let Some(m) = self.marked.get_mut(i) {
+            *m = !*m;
+        }
+    }
+
+    /// Marks exactly the rows in `rows`.
+    pub fn set_marked(&mut self, rows: &[usize]) {
+        self.marked.iter_mut().for_each(|m| *m = false);
+        for &i in rows {
+            if let Some(m) = self.marked.get_mut(i) {
+                *m = true;
+            }
+        }
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked.iter_mut().for_each(|m| *m = false);
+    }
+
+    pub fn mark_all(&mut self) {
+        self.marked.iter_mut().for_each(|m| *m = true);
     }
 
     pub fn select(&mut self, i: Option<usize>) {
@@ -131,6 +180,17 @@ impl ListView {
         }
         let i = ((y - area.y) as u32 + self.scroll.offset) / self.row_height;
         ((i as usize) < self.items.len()).then_some(i as usize)
+    }
+
+    /// Whether (`x`, `y`) is in the rows area (below the header).
+    pub fn in_body(&self, x: i32, y: i32) -> bool {
+        contains(&self.body(), x, y)
+    }
+
+    /// `y` as a distance from the top of the first row (scrolling included),
+    /// for rubber-band selection; negative above the first row.
+    pub fn content_y(&self, y: i32) -> i32 {
+        y - self.body().y + self.scroll.offset as i32
     }
 
     /// Column cells of a row: (x, width) for each column.
@@ -262,7 +322,7 @@ impl ListView {
         for i in first..(first + visible).min(self.items.len()) {
             let y = area.y + (i as u32 * self.row_height) as i32 - s.offset as i32;
             let row = Rect::new(area.x + 4, y + 1, area.w.saturating_sub(8), self.row_height - 2);
-            if self.selected == Some(i) {
+            if self.is_marked(i) || self.selected == Some(i) {
                 p.rounded(row, t.radius_small, if focused { t.selection } else { osyx_gfx::lerp(t.raised, t.selection, 100) }, 255);
             } else if self.hovered == Some(i) {
                 p.rounded(row, t.radius_small, t.raised, 255);

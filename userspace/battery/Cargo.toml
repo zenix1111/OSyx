@@ -1,0 +1,10 @@
+[package]
+name = "osyx-battery"
+description = "Battery and AC adapter state from ACPI: embedded controller access, AML evaluation and the charge/time model behind batteryd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+osyx-abi = { path = "../../shared/abi" }
+aml = { path = "../../third_party/aml" }

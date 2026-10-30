@@ -1,0 +1,49 @@
+name: PR labels
+
+# Contributors without write access cannot label their own pull requests
+# (GitHub rejects the request). They name the labels in the body instead:
+#
+#   Labels: ci, update
+#
+# This workflow applies them with the repository token. Only the labels
+# AGENTS.md defines are accepted; nothing from the pull request is checked
+# out, so `pull_request_target` here only reads the event payload.
+on:
+  pull_request_target:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  labels:
+    name: Apply the labels named in the body
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Apply labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          labels="$(printf '%s\n' "$BODY" |
+            sed -nE 's/^[[:space:]]*[-*]?[[:space:]]*[*_]{0,2}[Ll]abels[*_]{0,2}:[[:space:]]*(.*)$/\1/p' |
+            head -n1 | tr -d '`')"
+          [ -n "$labels" ] || exit 0
+          printf '%s\n' "$labels" | tr ',' '\n' | while IFS= read -r label; do
+            label="$(printf '%s' "$label" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            [ -n "$label" ] || continue
+            case "$label" in
+              bug|enhancement|documentation|dependencies|ci|security|testing) ;;
+              wifi|network|storage|installer|update|desktop|kernel|drivers) ;;
+              *)
+                echo "::warning::'$label' is not a label contributors may set (see AGENTS.md)"
+                continue
+                ;;
+            esac
+            echo "applying $label"
+            gh pr edit "$NUMBER" --repo "$REPO" --add-label "$label"
+          done

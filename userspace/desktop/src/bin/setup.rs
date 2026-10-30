@@ -529,7 +529,7 @@ impl App for Setup {
 
     fn event(&mut self, ev: Ui, cx: &mut Ctx) -> bool {
         if let Some(d) = &mut self.dialog {
-            match d.event(&ev, &cx.fonts) {
+            match d.event_with_clipboard(&ev, &cx.fonts, &mut cx.clipboard) {
                 Response::Activated(1) => {
                     self.dialog = None;
                     self.begin();
@@ -588,7 +588,7 @@ impl App for Setup {
         let focus = self.focus;
         let focused = cx.focused;
         for (i, f) in self.fields().into_iter().enumerate() {
-            match f.event(&ev, focused && i == focus, &cx.fonts) {
+            match f.event_with_clipboard(&ev, focused && i == focus, &cx.fonts, &mut cx.clipboard) {
                 Response::Submitted => {}
                 r => redraw |= r.needs_redraw(),
             }
