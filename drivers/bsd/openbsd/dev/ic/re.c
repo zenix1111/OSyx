@@ -1529,6 +1529,10 @@ re_tick(void *xsc)
 
 #ifdef __OSYX__
 	/* Record stalled DMA state without flooding the log on quiet links. */
+	if ((sc->rl_flags & RL_FLAG_LINK) == 0) {
+		sc->rl_osyx_diag_ticks = 0;
+		sc->rl_osyx_isr_seen = 0;
+	}
 	if ((sc->rl_flags & RL_FLAG_LINK) != 0 &&
 	    sc->sc_arpcom.ac_if.if_ipackets == 0 &&
 	    sc->rl_osyx_diag_ticks < 30 && ++sc->rl_osyx_diag_ticks % 10 == 0) {
@@ -1545,11 +1549,12 @@ re_tick(void *xsc)
 			txdesc = letoh32(sc->rl_ldata.rl_tx_list[last].rl_cmdstat);
 			RL_TXDESCSYNC(sc, last, BUS_DMASYNC_PREREAD);
 		}
-		printf("%s: DMA diag rxslots %u rxcons %d rxdesc 0x%08x txcons %d txprod %d txdesc 0x%08x cmd 0x%02x rxcfg 0x%08x isr 0x%04x\n",
+		printf("%s: DMA diag rxslots %u rxcons %d rxdesc 0x%08x txcons %d txprod %d txdesc 0x%08x cmd 0x%02x rxcfg 0x%08x isr_seen 0x%04x\n",
 		    sc->sc_dev.dv_xname, if_rxr_inuse(&sc->rl_ldata.rl_rx_ring),
 		    rx, rxdesc, tx, sc->rl_ldata.rl_txq_prodidx, txdesc,
 		    CSR_READ_1(sc, RL_COMMAND), CSR_READ_4(sc, RL_RXCFG),
-		    CSR_READ_2(sc, RL_ISR));
+		    sc->rl_osyx_isr_seen);
+		sc->rl_osyx_isr_seen = 0;
 	}
 #endif
 
@@ -1579,6 +1584,9 @@ re_intr(void *arg)
 	/* If the card has gone away the read returns 0xffff. */
 	if (status == 0xffff)
 		return (0);
+#ifdef __OSYX__
+	sc->rl_osyx_isr_seen |= status;
+#endif
 	if (status)
 		CSR_WRITE_2(sc, RL_ISR, status);
 
