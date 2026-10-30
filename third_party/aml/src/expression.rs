@@ -37,6 +37,18 @@ where
         "ExpressionOpcode",
         choice!(
             def_add(),
+            def_subtract(),
+            def_multiply(),
+            def_divide(),
+            def_mod(),
+            def_or(),
+            def_xor(),
+            def_nand(),
+            def_nor(),
+            def_not(),
+            def_index(),
+            def_deref_of(),
+            def_size_of(),
             def_and(),
             def_buffer(),
             def_concat(),
@@ -49,6 +61,7 @@ where
             def_l_less(),
             def_l_less_equal(),
             def_l_not_equal(),
+            def_l_not(),
             def_l_and(),
             def_l_or(),
             def_mid(),
@@ -638,7 +651,214 @@ pub fn package_element<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
 where
     'c: 'a,
 {
-    choice!(data_ref_object(), name_string().map(|string| Ok(AmlValue::String(string.as_string()))))
+    // OSyx: firmware builds the `_BST` package from locals and arguments
+    // (`Package () { Local0, Local1, ... }`); they are taken by value.
+    choice!(
+        data_ref_object(),
+        crate::misc::local_obj().map_with_context(|n, context| {
+            (Ok(try_with_context!(context, context.local(n)).clone()), context)
+        }),
+        crate::misc::arg_obj().map_with_context(|n, context| {
+            (Ok(try_with_context!(context, context.current_arg(n)).clone()), context)
+        }),
+        name_string().map(|string| Ok(AmlValue::String(string.as_string())))
+    )
+}
+
+/// OSyx: the arithmetic and logic operators of ACPI 19.6 that firmware
+/// battery and EC methods use (the interpreter had Add, And and the shifts).
+macro_rules! binary_operator {
+    ($fn_name:ident, $opcode:expr, $label:literal, |$l:ident, $r:ident| $body:expr) => {
+        fn $fn_name<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+        where
+            'c: 'a,
+        {
+            opcode($opcode)
+                .then(comment_scope(
+                    DebugVerbosity::AllScopes,
+                    $label,
+                    term_arg().then(term_arg()).then(target()).map_with_context(
+                        |((left_arg, right_arg), target), context| {
+                            let $l = try_with_context!(context, left_arg.as_integer(context));
+                            let $r = try_with_context!(context, right_arg.as_integer(context));
+                            let result = AmlValue::Integer($body);
+                            try_with_context!(context, context.store(target, result.clone()));
+                            (Ok(result), context)
+                        },
+                    ),
+                ))
+                .map(|((), result)| Ok(result))
+        }
+    };
+}
+
+binary_operator!(def_subtract, opcode::DEF_SUBTRACT_OP, "DefSubtract", |l, r| l.wrapping_sub(r));
+binary_operator!(def_multiply, opcode::DEF_MULTIPLY_OP, "DefMultiply", |l, r| l.wrapping_mul(r));
+binary_operator!(def_or, opcode::DEF_OR_OP, "DefOr", |l, r| l | r);
+binary_operator!(def_xor, opcode::DEF_XOR_OP, "DefXOr", |l, r| l ^ r);
+binary_operator!(def_nand, opcode::DEF_NAND_OP, "DefNAnd", |l, r| !(l & r));
+binary_operator!(def_nor, opcode::DEF_NOR_OP, "DefNOr", |l, r| !(l | r));
+
+fn def_mod<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefMod := 0x85 Dividend Divisor Target
+     */
+    opcode(opcode::DEF_MOD_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefMod",
+            term_arg().then(term_arg()).then(target()).map_with_context(|((dividend, divisor), target), context| {
+                let dividend = try_with_context!(context, dividend.as_integer(context));
+                let divisor = try_with_context!(context, divisor.as_integer(context));
+                let result = AmlValue::Integer(try_with_context!(
+                    context,
+                    dividend.checked_rem(divisor).ok_or(AmlError::FieldInvalidAccessSize)
+                ));
+                try_with_context!(context, context.store(target, result.clone()));
+                (Ok(result), context)
+            }),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_divide<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefDivide := 0x78 Dividend Divisor Remainder Quotient
+     * The result is the quotient.
+     */
+    opcode(opcode::DEF_DIVIDE_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefDivide",
+            term_arg().then(term_arg()).then(target()).then(target()).map_with_context(
+                |(((dividend, divisor), remainder), quotient), context| {
+                    let dividend = try_with_context!(context, dividend.as_integer(context));
+                    let divisor = try_with_context!(context, divisor.as_integer(context));
+                    if divisor == 0 {
+                        return (Err(Propagate::Err(AmlError::FieldInvalidAccessSize)), context);
+                    }
+                    let q = AmlValue::Integer(dividend / divisor);
+                    try_with_context!(context, context.store(remainder, AmlValue::Integer(dividend % divisor)));
+                    try_with_context!(context, context.store(quotient, q.clone()));
+                    (Ok(q), context)
+                },
+            ),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_not<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefNot := 0x80 Operand Target
+     */
+    opcode(opcode::DEF_NOT_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefNot",
+            term_arg().then(target()).map_with_context(|(operand, target), context| {
+                let operand = try_with_context!(context, operand.as_integer(context));
+                let result = AmlValue::Integer(!operand);
+                try_with_context!(context, context.store(target, result.clone()));
+                (Ok(result), context)
+            }),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_l_not<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefLNot := 0x92 Operand (tried after LNotEqual, LGreaterEqual and LLessEqual)
+     */
+    opcode(opcode::DEF_L_NOT_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefLNot",
+            term_arg().map_with_context(|operand, context| {
+                let operand = try_with_context!(context, operand.as_bool());
+                (Ok(AmlValue::Boolean(!operand)), context)
+            }),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_size_of<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefSizeOf := 0x87 SuperName
+     */
+    opcode(opcode::DEF_SIZE_OF_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefSizeOf",
+            super_name().map_with_context(|target, context| {
+                let value = try_with_context!(context, context.read_target(&target)).clone();
+                let size = match value {
+                    AmlValue::Buffer(b) => b.lock().len(),
+                    AmlValue::String(s) => s.len(),
+                    AmlValue::Package(p) => p.len(),
+                    _ => return (Err(Propagate::Err(AmlError::FieldInvalidAccessSize)), context),
+                };
+                (Ok(AmlValue::Integer(size as u64)), context)
+            }),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_index<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefIndex := 0x88 BuffPkgStrObj IndexValue Target
+     * The element is returned by value (not as a reference).
+     */
+    opcode(opcode::DEF_INDEX_OP)
+        .then(comment_scope(
+            DebugVerbosity::AllScopes,
+            "DefIndex",
+            term_arg().then(term_arg()).then(target()).map_with_context(|((object, position), target), context| {
+                let position = try_with_context!(context, position.as_integer(context)) as usize;
+                let element = match object {
+                    AmlValue::Package(items) => items.get(position).cloned(),
+                    AmlValue::Buffer(b) => b.lock().get(position).map(|&byte| AmlValue::Integer(byte as u64)),
+                    AmlValue::String(s) => s.as_bytes().get(position).map(|&byte| AmlValue::Integer(byte as u64)),
+                    _ => None,
+                };
+                let Some(element) = element else {
+                    return (Err(Propagate::Err(AmlError::FieldInvalidAccessSize)), context);
+                };
+                try_with_context!(context, context.store(target, element.clone()));
+                (Ok(element), context)
+            }),
+        ))
+        .map(|((), result)| Ok(result))
+}
+
+fn def_deref_of<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>
+where
+    'c: 'a,
+{
+    /*
+     * DefDerefOf := 0x83 ObjReference
+     * `Index` already yields the element itself, so there is nothing to follow.
+     */
+    opcode(opcode::DEF_DEREF_OF_OP)
+        .then(comment_scope(DebugVerbosity::AllScopes, "DefDerefOf", term_arg()))
+        .map(|((), value)| Ok(value))
 }
 
 fn def_shift_left<'a, 'c>() -> impl Parser<'a, 'c, AmlValue>

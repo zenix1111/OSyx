@@ -18,6 +18,9 @@ pub enum Target {
     Debug,
     Arg(ArgNum),
     Local(LocalNum),
+    /// OSyx: element `.1` of the package or buffer that `.0` names
+    /// (`Store(x, Index(PKG, 2))`, how firmware fills the `_BST` package).
+    Index(alloc::boxed::Box<Target>, usize),
 }
 
 pub fn target<'a, 'c>() -> impl Parser<'a, 'c, Target>
@@ -46,8 +49,26 @@ where
     comment_scope(
         DebugVerbosity::AllScopes,
         "SuperName",
-        choice!(debug_obj().map(|()| Ok(Target::Debug)), simple_name()),
+        choice!(debug_obj().map(|()| Ok(Target::Debug)), index_target(), simple_name()),
     )
+}
+
+/// OSyx: `DefIndex` in a target position, as `Index(Object, Position, Null)`.
+fn index_target<'a, 'c>() -> impl Parser<'a, 'c, Target>
+where
+    'c: 'a,
+{
+    crate::opcode::opcode(crate::opcode::DEF_INDEX_OP)
+        .then(simple_name())
+        .then(crate::term_object::term_arg())
+        .then(null_name())
+        .map_with_context(|((((), object), position), _null), context| {
+            let position = match position.as_integer(context) {
+                Ok(p) => p,
+                Err(e) => return (Err(crate::parser::Propagate::Err(e)), context),
+            } as usize;
+            (Ok(Target::Index(alloc::boxed::Box::new(object), position)), context)
+        })
 }
 
 pub fn simple_name<'a, 'c>() -> impl Parser<'a, 'c, Target>

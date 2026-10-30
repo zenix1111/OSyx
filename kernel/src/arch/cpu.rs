@@ -2,6 +2,16 @@
 
 use core::arch::asm;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+/// Size of an XSAVE area with x87, SSE and AVX enabled (legacy 512 bytes,
+/// 64-byte header, 256 bytes of YMM upper halves), 64-byte aligned.
+pub const FPU_AREA_SIZE: usize = 832;
+
+const FPU_FXSAVE: u8 = 1;
+const FPU_XSAVE: u8 = 2;
+static FPU_MODE: [AtomicU8; crate::smp::MAX_CPUS] = [const { AtomicU8::new(0) }; crate::smp::MAX_CPUS];
+static FPU_MASK: [AtomicU64; crate::smp::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
 
 /// # Safety
 /// Port I/O can reconfigure hardware; callers must own the device.
@@ -66,12 +76,14 @@ pub unsafe fn wrmsr(msr: u32, v: u64) {
 }
 
 /// Enables SSE for user code: CR0.EM = 0, CR0.MP = 1, CR4.OSFXSR and
-/// CR4.OSXMMEXCPT = 1. The kernel itself is compiled soft-float and never
-/// touches x87/SSE state except through `fxsave`/`fxrstor` on context switch.
+/// CR4.OSXMMEXCPT = 1. When the CPU supports it, XSAVE/AVX is enabled as well
+/// (CR4.OSXSAVE, XCR0). The kernel itself is compiled soft-float and never
+/// touches x87/SSE/AVX state except through [`fpu_save`]/[`fpu_restore`] on
+/// context switch.
 ///
 /// # Safety
-/// Must run once during early boot.
-pub unsafe fn enable_sse() {
+/// Must run once per CPU during early boot, before user code runs there.
+pub unsafe fn enable_sse(cpu: usize) {
     asm!(
         "mov {t}, cr0",
         "and {t}, ~4",
@@ -83,9 +95,116 @@ pub unsafe fn enable_sse() {
         t = out(reg) _,
         options(nostack)
     );
+    let mut mode = FPU_FXSAVE;
+    let mut mask = 0;
+    let (max_leaf, ..) = cpuid(0, 0);
+    let (_, _, ecx1, _) = cpuid(1, 0);
+    // XSAVE needs CPUID.1:ECX.XSAVE and a leaf 0xD listing x87 and SSE
+    // support. AVX additionally needs CPUID.1:ECX.AVX and XCR0 bit 2.
+    if max_leaf >= 0xD && ecx1 & (1 << 26) != 0 {
+        let (supported, ..) = cpuid(0xD, 0);
+        if supported & 0x3 == 0x3 {
+            asm!(
+                "mov {t}, cr4",
+                "or {t}, 0x40000",
+                "mov cr4, {t}",
+                t = out(reg) _,
+                options(nostack)
+            );
+            let mut xcr0 = 0x3u64;
+            if ecx1 & (1 << 28) != 0 && supported & 0x4 != 0 {
+                xcr0 |= 0x4;
+            }
+            xsetbv(0, xcr0);
+            let (_, area, ..) = cpuid(0xD, 0);
+            if area as usize > FPU_AREA_SIZE {
+                // Only x87+SSE fit: disable AVX rather than read past the
+                // per-thread area.
+                xcr0 = 0x3;
+                xsetbv(0, xcr0);
+            }
+            mode = FPU_XSAVE;
+            mask = xcr0;
+        }
+    }
+    if cpu < crate::smp::MAX_CPUS {
+        FPU_MODE[cpu].store(mode, Ordering::Release);
+        FPU_MASK[cpu].store(mask, Ordering::Release);
+    }
 }
 
-/// Saves the x87/SSE state into a 512-byte, 16-byte aligned area.
+unsafe fn xsetbv(index: u32, value: u64) {
+    asm!(
+        "xsetbv",
+        in("ecx") index,
+        in("eax") value as u32,
+        in("edx") (value >> 32) as u32,
+        options(nostack, preserves_flags)
+    );
+}
+
+/// XCR0 of this CPU, or 0 when it uses FXSAVE only.
+pub fn fpu_mask() -> u64 {
+    let cpu = crate::smp::index();
+    if cpu < crate::smp::MAX_CPUS {
+        FPU_MASK[cpu].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// True when this CPU saved state with XSAVE (as opposed to FXSAVE).
+pub fn fpu_uses_xsave() -> bool {
+    let cpu = crate::smp::index();
+    cpu < crate::smp::MAX_CPUS && FPU_MODE[cpu].load(Ordering::Acquire) == FPU_XSAVE
+}
+
+/// True when AVX state (YMM upper halves) is enabled on this CPU.
+pub fn fpu_has_avx() -> bool {
+    fpu_mask() & 0x4 != 0
+}
+
+/// Saves x87/SSE (and AVX when enabled) state into a 64-byte aligned,
+/// [`FPU_AREA_SIZE`]-byte area. Uses FXSAVE when XSAVE is unavailable.
+///
+/// # Safety
+/// `area` must be valid for [`FPU_AREA_SIZE`] bytes of writes and 64-byte
+/// aligned; SSE must be enabled.
+pub unsafe fn fpu_save(area: *mut u8) {
+    if fpu_uses_xsave() {
+        let mask = fpu_mask();
+        asm!(
+            "xsave64 [{}]",
+            in(reg) area,
+            in("eax") mask as u32,
+            in("edx") (mask >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    } else {
+        fxsave(area);
+    }
+}
+
+/// Loads state saved by [`fpu_save`] (or a valid initial image).
+///
+/// # Safety
+/// `area` must hold a valid XSAVE/FXSAVE image and be 64-byte aligned.
+pub unsafe fn fpu_restore(area: *const u8) {
+    if fpu_uses_xsave() {
+        let mask = fpu_mask();
+        asm!(
+            "xrstor64 [{}]",
+            in(reg) area,
+            in("eax") mask as u32,
+            in("edx") (mask >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    } else {
+        fxrstor(area);
+    }
+}
+
+/// Saves the legacy x87/SSE region only into a 512-byte, 16-byte aligned area.
 ///
 /// # Safety
 /// `area` must be valid for 512 bytes of writes and 16-byte aligned; SSE must
@@ -94,7 +213,8 @@ pub unsafe fn fxsave(area: *mut u8) {
     asm!("fxsave64 [{}]", in(reg) area, options(nostack, preserves_flags));
 }
 
-/// Loads x87/SSE state saved by [`fxsave`] (or a valid initial image).
+/// Loads legacy x87/SSE state saved by [`fxsave`] (or a valid initial image).
+/// The XSAVE header is not consulted, so YMM upper halves are left unchanged.
 ///
 /// # Safety
 /// `area` must hold a valid FXSAVE image, 16-byte aligned.

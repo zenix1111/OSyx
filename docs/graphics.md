@@ -131,6 +131,29 @@ on the root file system, search, Enter), the desktop context menu,
 notification bubbles (from any client, the clock, crashed applications) and
 the restart / shut down confirmation (kernel `power`).
 
+### Files
+
+Several files at once: Ctrl+click marks a row, Shift+click or Shift+arrows a
+range, a rubber band over empty space the rows it touches, Ctrl+A all. Copy
+(Ctrl+C), Cut (Ctrl+X), Paste (Ctrl+V; a name that exists becomes
+`name (copy).ext`), Delete (Trash), dragging, Pack (Ctrl+P: one uncompressed
+`.tar`) and Extract here (Ctrl+E) work on the whole selection. Extraction
+reads tar, tar.gz/tgz, zip (stored and deflated, CRC checked), 7z and single
+.gz files into a folder named after the archive; paths that would leave it
+are refused and a failed extraction leaves no folder behind.
+
+A double click opens a file with the program the user chose for its
+extension, else with an installed application that lists it, else by Files
+itself: text and source in the viewer, images and web pages in the default
+browser, archives are extracted. Audio, video and PDF need an application:
+an application says so with `Handles=mp4,mkv,video` in its `.app` file
+(extensions or the kinds `text source html image audio video pdf archive`).
+The right-click menu has "Open with" for every program that can open the
+file (the hex viewer always can) and "Always open .ext with ...", which is
+saved in `~/.config/osyx/openwith.conf` (`mp4=/opt/player`). The logic is in
+`userspace/filekit` (host-tested); the file operations in
+`userspace/desktop/src/fileops.rs`.
+
 AXIS is a first, small version of the shell: built-in commands on
 `os_std::fs` (`ls cat cd mkdir rm mv cp stat ps kill mounts free uptime …`),
 Python-style `name = expr` and `print(...)`, `$name` expansion, and every
@@ -192,7 +215,7 @@ own launcher entries. They draw through the same PRISM compositor.
   the toolkit apps redraw whole windows).
 * Popups and notifications are square (no per-pixel alpha in the toolkit
   yet; the protocol supports ARGB buffers).
-* HID: boot-protocol keyboards only; no hubs (devices on root ports only);
+* HID: boot-protocol keyboards; xHCI hubs are supported;
   no isochronous or bulk endpoints; no USB 3 streams.
 * No IOMMU support (none is assumed); DMA buffers are kernel pages.
 * AXIS is minimal (see above); the terminal is a line-mode terminal.

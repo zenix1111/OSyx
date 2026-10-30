@@ -373,10 +373,8 @@ extern "win64" fn StringFromIID(g: *const u8, out: *mut u64) -> u32 {
 
 // ---- drag and drop, the OLE clipboard -------------------------------------------------------
 //
-// Drop targets are registered per window. OSyx has no drag sources between
-// windows, so nothing is ever dropped on them, and a drag this process
-// starts ends at once as cancelled. The OLE clipboard holds the data object
-// last set in this process.
+// Drop targets are registered per window. Native file drops are delivered
+// on the target window thread. Win32-origin drags are not implemented yet.
 
 const DRAGDROP_E_NOTREGISTERED: u32 = 0x8004_0100;
 const DRAGDROP_E_ALREADYREGISTERED: u32 = 0x8004_0101;
@@ -445,6 +443,54 @@ extern "win64" fn DoDragDrop(data: u64, source: u64, _ok: u32, effect: *mut u32)
     // SAFETY: the caller's DWORD.
     unsafe { *effect = 0 }; // DROPEFFECT_NONE
     DRAGDROP_S_CANCEL
+}
+
+/// Drops are dispatched on the window's message thread, outside user32's lock.
+static FILE_DROPS: Mutex<BTreeMap<u64, (u64, String, i32, i32)>> = Mutex::new(BTreeMap::new());
+static NEXT_FILE_DROP: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn queue_file_drop(hwnd: u64, path: String, x: i32, y: i32) -> u64 {
+    let mut drops = FILE_DROPS.lock().unwrap();
+    if drops.len() >= 32 { return 0; }
+    let token = NEXT_FILE_DROP.fetch_add(1, Ordering::Relaxed) as u64;
+    drops.insert(token, (hwnd, path, x, y));
+    token
+}
+
+pub(crate) fn dispatch_file_drop(hwnd: u64, token: u64) {
+    let Some((owner, path, x, y)) = FILE_DROPS.lock().unwrap().remove(&token) else { return };
+    if owner != hwnd { return; }
+    let target = {
+        let targets = DROP_TARGETS.lock().unwrap();
+        let Some(&target) = targets.get(&hwnd) else { return };
+        com_call(target, 1);
+        target
+    };
+    // DROPFILES with a double-NUL-terminated UTF-16 Windows path.
+    let mut bytes = alloc::vec![0u8; 20];
+    bytes[0..4].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+    for unit in crate::path::to_windows(&path).encode_utf16().chain([0, 0]) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let data = make_data_object(alloc::vec![proto::ClipEntry { format: CF_HDROP, name: None, data: bytes }]);
+    let point = (x as u32 as u64) | ((y as u32 as u64) << 32);
+    let mut effect = 1u32; // DROPEFFECT_COPY: the source retains its file.
+    // SAFETY: a registered IDropTarget and our live IDataObject, invoked
+    // on the window's thread after releasing the user32 lock. POINTL is 8 bytes.
+    unsafe {
+        let vtbl = *(target as *const *const u64);
+        let enter: extern "win64" fn(u64, u64, u32, u64, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(3));
+        let leave: extern "win64" fn(u64) -> u32 = core::mem::transmute(*vtbl.add(5));
+        let drop_: extern "win64" fn(u64, u64, u32, u64, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(6));
+        if enter(target, data, 0, point, &mut effect) == S_OK && effect != 0 {
+            drop_(target, data, 0, point, &mut effect);
+        } else {
+            leave(target);
+        }
+    }
+    DataRelease(data);
+    com_call(target, 2);
 }
 
 /// The data object's formats are rendered to bytes now: other processes get
