@@ -150,15 +150,19 @@ impl Manifest {
             let mut f = line.splitn(5, ' ');
             match f.next() {
                 Some("version") => {
+                    if version.is_some() { return Err(bad()); }
                     let v = f.next().ok_or_else(bad)?;
+                    if f.next().is_some() { return Err(bad()); }
                     if v.split('.').any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) || part.parse::<u64>().is_err()) {
                         return Err(bad());
                     }
                     version = Some(v.to_string());
                 }
                 Some("payload") => {
+                    if payload.is_some() { return Err(bad()); }
                     let sha = f.next().and_then(parse_hex::<32>).ok_or_else(bad)?;
                     let size = f.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+                    if f.next().is_some() { return Err(bad()); }
                     payload = Some((sha, size));
                 }
                 Some("file") => {
@@ -283,6 +287,16 @@ mod tests {
             malformed.version = version.to_string();
             assert!(Manifest::parse(&malformed.to_text()).is_err(), "{version}");
         }
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_and_extra_header_fields() {
+        let manifest = Manifest { version: "1.2".to_string(), payload_size: 0, payload_sha256: [0; 32], files: vec![] }.to_text();
+        assert!(Manifest::parse(&manifest.replace("version 1.2\n", "version 1.2\nversion 1.3\n")).is_err());
+        let payload = format!("payload {} 0", hex(&[0; 32]));
+        assert!(Manifest::parse(&manifest.replace(&payload, &format!("{payload}\n{payload}"))).is_err());
+        assert!(Manifest::parse(&manifest.replace("version 1.2", "version 1.2 extra")).is_err());
+        assert!(Manifest::parse(&manifest.replace(&payload, &format!("{payload} extra"))).is_err());
     }
 
     #[test]
