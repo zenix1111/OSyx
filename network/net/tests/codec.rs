@@ -328,13 +328,102 @@ fn dhcp_client_walks_through_the_lease_states() {
     let renew = dhcp::Message::parse(&tx.payload).unwrap();
     let (_, ev) = c.input(&offer(dhcp::ACK, renew.xid), lease.t1 + 5);
     assert!(matches!(ev, Some(dhcp::Event::Renewed(_))));
+    // A renewal ACK may omit yiaddr and network options; retain the lease.
+    let renewed = c.lease().unwrap().clone();
+    let (tx, _) = c.poll(renewed.t1);
+    let xid = dhcp::Message::parse(&tx.unwrap().payload).unwrap().xid;
+    let mut minimal = offer(dhcp::ACK, xid);
+    minimal[16..20].fill(0);
+    // Keep just message type, server ID and lease.
+    minimal.truncate(240);
+    minimal.extend_from_slice(&[53, 1, dhcp::ACK, 54, 4]);
+    minimal.extend_from_slice(&server.0);
+    minimal.extend_from_slice(&[51, 4, 0, 0, 0, 120, 255]);
+    let (_, event) = c.input(&minimal, renewed.t1 + 1);
+    let Some(dhcp::Event::Renewed(updated)) = event else { panic!("renewal failed: {event:?}") };
+    assert_eq!((updated.addr, updated.prefix, updated.router, updated.dns),
+        (renewed.addr, renewed.prefix, renewed.router, renewed.dns));
     // Without answers the lease runs out.
     let l = c.lease().unwrap().clone();
     let (tx, _) = c.poll(l.t2);
     assert_eq!(tx.unwrap().dst, Ipv4Addr::BROADCAST, "rebinding broadcasts");
+    assert!(c.next_deadline().unwrap() > l.t2, "rebinding must not spin on the elapsed T2");
     let (_, ev) = c.poll(l.expires());
     assert_eq!(ev, Some(dhcp::Event::Lost));
     assert!(c.lease().is_none());
+}
+
+#[test]
+fn dhcp_ignores_replies_from_unselected_server() {
+    let mac = MacAddr([0x52, 0x54, 0, 0, 0, 9]);
+    let mut client = dhcp::Client::new(mac, 7, "osyx");
+    let xid = dhcp::Message::parse(&client.poll(0).0.unwrap().payload).unwrap().xid;
+    let selected = Ipv4Addr::new(10, 0, 2, 2);
+    let other = Ipv4Addr::new(10, 0, 2, 3);
+    let address = Ipv4Addr::new(10, 0, 2, 15);
+    let reply = |kind, xid, server, addr| dhcp::build_reply(kind, xid, mac, addr, server, Ipv4Addr::new(255, 255, 255, 0), server, server, 120);
+    client.input(&reply(dhcp::OFFER, xid, selected, address), 10);
+    for bad in [reply(dhcp::ACK, xid, other, address), reply(dhcp::NAK, xid, other, address), reply(dhcp::ACK, xid, selected, other)] {
+        assert_eq!(client.input(&bad, 20), (None, None));
+        assert_eq!(client.phase(), dhcp::Phase::Requesting);
+    }
+    let (_, event) = client.input(&reply(dhcp::ACK, xid, selected, address), 21);
+    let Some(dhcp::Event::Bound(lease)) = event else { panic!("expected selected server ACK") };
+    let renew = dhcp::Message::parse(&client.poll(lease.t1).0.unwrap().payload).unwrap();
+    assert_eq!(client.input(&reply(dhcp::NAK, renew.xid, other, address), lease.t1 + 1), (None, None));
+    assert_eq!(client.input(&reply(dhcp::ACK, renew.xid, selected, other), lease.t1 + 1), (None, None));
+    let mut wrong_ciaddr = reply(dhcp::ACK, renew.xid, selected, address);
+    wrong_ciaddr[12..16].copy_from_slice(&other.0);
+    assert_eq!(client.input(&wrong_ciaddr, lease.t1 + 1), (None, None));
+    assert_eq!(client.phase(), dhcp::Phase::Renewing);
+    let rebind = dhcp::Message::parse(&client.poll(lease.t2).0.unwrap().payload).unwrap();
+    assert_eq!(client.input(&reply(dhcp::ACK, rebind.xid, other, Ipv4Addr::BROADCAST), lease.t2 + 1), (None, None));
+    let (_, event) = client.input(&reply(dhcp::ACK, rebind.xid, other, address), lease.t2 + 1);
+    assert!(matches!(event, Some(dhcp::Event::Renewed(_))));
+}
+
+#[test]
+fn dhcp_accepts_replies_without_server_identifier() {
+    let mac = MacAddr([0x52, 0x54, 0, 0, 0, 9]);
+    let server = Ipv4Addr::new(10, 0, 2, 2);
+    let address = Ipv4Addr::new(10, 0, 2, 15);
+    for kind in [dhcp::ACK, dhcp::NAK] {
+        let mut client = dhcp::Client::new(mac, 7, "osyx");
+        let xid = dhcp::Message::parse(&client.poll(0).0.unwrap().payload).unwrap().xid;
+        let reply = |kind| dhcp::build_reply(kind, xid, mac, address, server, Ipv4Addr::new(255, 255, 255, 0), server, server, 120);
+        client.input(&reply(dhcp::OFFER), 10);
+        let mut reply = reply(kind);
+        reply.drain(243..249);
+        assert_eq!(dhcp::Message::parse(&reply).unwrap().server_id, None);
+        let (_, event) = client.input(&reply, 20);
+        if kind == dhcp::ACK {
+            assert!(matches!(event, Some(dhcp::Event::Bound(_))));
+        } else {
+            assert_eq!((event, client.phase()), (None, dhcp::Phase::Init));
+        }
+    }
+}
+
+#[test]
+fn dhcp_uses_ordered_lease_timers() {
+    let mac = MacAddr([0x52, 0x54, 0, 0, 0, 9]);
+    let server = Ipv4Addr::new(10, 0, 2, 2);
+    let address = Ipv4Addr::new(10, 0, 2, 15);
+    for (t1, t2, expected) in [(110, None, (60, 105)), (100, Some(90), (60, 105)), (0, Some(90), (60, 105)), (30, Some(90), (30, 90))] {
+        let mut client = dhcp::Client::new(mac, 7, "osyx");
+        let xid = dhcp::Message::parse(&client.poll(0).0.unwrap().payload).unwrap().xid;
+        let reply = |kind| dhcp::build_reply(kind, xid, mac, address, server, Ipv4Addr::new(255, 255, 255, 0), server, server, 120);
+        client.input(&reply(dhcp::OFFER), 10);
+        let mut ack = reply(dhcp::ACK);
+        ack.pop();
+        ack.extend_from_slice(&[58, 4]);
+        ack.extend_from_slice(&(t1 as u32).to_be_bytes());
+        if let Some(t2) = t2 { ack.extend_from_slice(&[59, 4]); ack.extend_from_slice(&(t2 as u32).to_be_bytes()); }
+        ack.push(255);
+        let (_, event) = client.input(&ack, 20);
+        let Some(dhcp::Event::Bound(lease)) = event else { panic!("expected lease") };
+        assert_eq!((lease.t1, lease.t2), (20 + expected.0 * 1000, 20 + expected.1 * 1000));
+    }
 }
 
 fn dns_response(id: u16, name: &str, answers: &[(&str, u16, &[u8])], rcode: u8, tc: bool) -> Vec<u8> {
@@ -421,6 +510,11 @@ fn dns_rejects_malformed_and_spoofed_responses() {
     // A record with a wrong data length.
     let short = dns_response(7, "example.com", &[("example.com", dns::TYPE_A, &[1, 2, 3])], 0, false);
     assert_eq!(dns::parse_response(&short, 7, "example.com", dns::TYPE_A), Err(dns::DnsError::Truncated));
+    let target = encode_name("edge.example.net");
+    let mut cname = dns_response(7, "example.com", &[("example.com", dns::TYPE_CNAME, &target)], 0, false);
+    let rdata = dns::build_query(7, "example.com", dns::TYPE_A).len() + encode_name("example.com").len() + 10;
+    cname[rdata - 2..rdata].copy_from_slice(&1u16.to_be_bytes());
+    assert_eq!(dns::parse_response(&cname, 7, "example.com", dns::TYPE_A), Err(dns::DnsError::Truncated));
     // CNAME loops are detected.
     let (x, y) = (encode_name("b.test"), encode_name("a.test"));
     let looped = dns_response(3, "a.test", &[("a.test", dns::TYPE_CNAME, &x), ("b.test", dns::TYPE_CNAME, &y)], 0, false);

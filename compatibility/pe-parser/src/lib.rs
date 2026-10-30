@@ -90,6 +90,7 @@ const DOS_HEADER_SIZE: usize = 64;
 const COFF_HEADER_SIZE: usize = 20;
 /// Fixed part of the PE32+ optional header (before the data directories).
 const OPT64_FIXED_SIZE: usize = 112;
+const OPT32_FIXED_SIZE: usize = 96;
 const SECTION_HEADER_SIZE: usize = 40;
 /// Longest name (DLL, function, forwarder) the parser accepts. MSVC
 /// decorated C++ names reach several hundred bytes (seen: 699 in a Windows
@@ -344,6 +345,21 @@ impl<'a> PeFile<'a> {
     /// Validates the DOS header, PE headers, data directory bounds and the
     /// section table.
     pub fn parse(data: &'a [u8]) -> Result<PeFile<'a>> {
+        Self::parse_inner(data, false)
+    }
+
+    /// Like [`PeFile::parse`], but also accepts a 32-bit PE32 image (see
+    /// [`PeFile::is_pe32`]); its addresses and sizes are widened to 64 bits.
+    pub fn parse_any(data: &'a [u8]) -> Result<PeFile<'a>> {
+        Self::parse_inner(data, true)
+    }
+
+    /// Whether this is a 32-bit PE32 image (optional header magic 0x10B).
+    pub fn is_pe32(&self) -> bool {
+        self.opt.magic == PE32_MAGIC
+    }
+
+    fn parse_inner(data: &'a [u8], allow_pe32: bool) -> Result<PeFile<'a>> {
         if data.len() < DOS_HEADER_SIZE {
             return Err(PeError::Truncated { what: "DOS header" });
         }
@@ -370,15 +386,50 @@ impl<'a> PeFile<'a> {
         };
         let o = c + COFF_HEADER_SIZE;
         let magic = u16_at(data, o, "optional header")?;
-        if magic != PE32PLUS_MAGIC {
+        let pe32 = magic == PE32_MAGIC;
+        if magic != PE32PLUS_MAGIC && !(pe32 && allow_pe32) {
             return Err(PeError::NotPe32Plus { magic });
         }
+        let fixed = if pe32 { OPT32_FIXED_SIZE } else { OPT64_FIXED_SIZE };
         let opt_size = coff.size_of_optional_header as usize;
-        if opt_size < OPT64_FIXED_SIZE {
+        if opt_size < fixed {
             return Err(PeError::BadOptionalHeaderSize(coff.size_of_optional_header));
         }
         bytes(data, o, opt_size, "optional header")?;
-        let opt = OptionalHeader {
+        let opt = if pe32 {
+            OptionalHeader {
+                magic,
+                major_linker_version: data[o + 2],
+                minor_linker_version: data[o + 3],
+                size_of_code: u32_at(data, o + 4, "optional header")?,
+                size_of_initialized_data: u32_at(data, o + 8, "optional header")?,
+                size_of_uninitialized_data: u32_at(data, o + 12, "optional header")?,
+                address_of_entry_point: u32_at(data, o + 16, "optional header")?,
+                base_of_code: u32_at(data, o + 20, "optional header")?,
+                image_base: u32_at(data, o + 28, "optional header")? as u64,
+                section_alignment: u32_at(data, o + 32, "optional header")?,
+                file_alignment: u32_at(data, o + 36, "optional header")?,
+                major_operating_system_version: u16_at(data, o + 40, "optional header")?,
+                minor_operating_system_version: u16_at(data, o + 42, "optional header")?,
+                major_image_version: u16_at(data, o + 44, "optional header")?,
+                minor_image_version: u16_at(data, o + 46, "optional header")?,
+                major_subsystem_version: u16_at(data, o + 48, "optional header")?,
+                minor_subsystem_version: u16_at(data, o + 50, "optional header")?,
+                win32_version_value: u32_at(data, o + 52, "optional header")?,
+                size_of_image: u32_at(data, o + 56, "optional header")?,
+                size_of_headers: u32_at(data, o + 60, "optional header")?,
+                check_sum: u32_at(data, o + 64, "optional header")?,
+                subsystem: u16_at(data, o + 68, "optional header")?,
+                dll_characteristics: u16_at(data, o + 70, "optional header")?,
+                size_of_stack_reserve: u32_at(data, o + 72, "optional header")? as u64,
+                size_of_stack_commit: u32_at(data, o + 76, "optional header")? as u64,
+                size_of_heap_reserve: u32_at(data, o + 80, "optional header")? as u64,
+                size_of_heap_commit: u32_at(data, o + 84, "optional header")? as u64,
+                loader_flags: u32_at(data, o + 88, "optional header")?,
+                number_of_rva_and_sizes: u32_at(data, o + 92, "optional header")?,
+            }
+        } else {
+        OptionalHeader {
             magic,
             major_linker_version: data[o + 2],
             minor_linker_version: data[o + 3],
@@ -408,17 +459,18 @@ impl<'a> PeFile<'a> {
             size_of_heap_commit: u64_at(data, o + 96, "optional header")?,
             loader_flags: u32_at(data, o + 104, "optional header")?,
             number_of_rva_and_sizes: u32_at(data, o + 108, "optional header")?,
+        }
         };
         let ndirs = opt.number_of_rva_and_sizes;
         if ndirs > 16 {
             return Err(PeError::TooManyDataDirectories(ndirs));
         }
-        if OPT64_FIXED_SIZE + ndirs as usize * 8 > opt_size {
+        if fixed + ndirs as usize * 8 > opt_size {
             return Err(PeError::BadOptionalHeaderSize(coff.size_of_optional_header));
         }
         let mut dirs = [DataDirectory::default(); 16];
         for (i, d) in dirs.iter_mut().enumerate().take(ndirs as usize) {
-            let at = o + OPT64_FIXED_SIZE + i * 8;
+            let at = o + fixed + i * 8;
             *d = DataDirectory {
                 virtual_address: u32_at(data, at, "data directories")?,
                 size: u32_at(data, at + 4, "data directories")?,

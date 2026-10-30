@@ -1,7 +1,8 @@
 //! Threads and the preemptive round-robin scheduler (SMP, one current/idle thread per CPU).
 //!
 //! * Every thread has its own 64 KiB kernel stack (the boot thread keeps the
-//!   loader's stack), a saved stack pointer and a 512-byte FXSAVE area.
+//!   loader's stack), a saved stack pointer and a 64-byte aligned XSAVE area
+//!   (832 bytes: x87, SSE and AVX YMM upper halves; FXSAVE fallback).
 //! * [`schedule`] picks the next ready thread and calls `osyx_switch`, which
 //!   saves the callee-saved registers and RFLAGS on the old stack and resumes
 //!   the new one. Caller-saved registers are already saved by whoever called
@@ -10,7 +11,8 @@
 //!   running thread has used its time slice and another thread is ready,
 //!   switches from inside the interrupt handler. The interrupted thread later
 //!   resumes inside that handler and returns with `iretq`.
-//! * x87/SSE state is switched eagerly (`fxsave`/`fxrstor` on every switch).
+//! * x87/SSE/AVX state is switched eagerly (`xsave`/`xrstor`, or
+//!   `fxsave`/`fxrstor` when XSAVE is unavailable, on every switch).
 //! * CR3, TSS.RSP0 and the SYSCALL kernel stack follow the incoming thread.
 //! * A thread that exits cannot free the stack it runs on; the next thread
 //!   frees it right after the switch ([`after_switch`]).
@@ -47,17 +49,19 @@ pub enum State {
     Dead,
 }
 
-/// FXSAVE image (x87 + SSE registers, MXCSR).
-#[repr(C, align(16))]
-pub struct FpuState([u8; 512]);
+/// XSAVE image (x87 + SSE + AVX when enabled), 64-byte aligned.
+#[repr(C, align(64))]
+pub struct FpuState([u8; cpu::FPU_AREA_SIZE]);
 
 impl FpuState {
     /// The state after `fninit` + default MXCSR: all exceptions masked,
-    /// round to nearest.
+    /// round to nearest. XSTATE_BV marks x87 and SSE as initialized; AVX
+    /// upper halves are left in their initial (zero) state.
     fn initial() -> Box<FpuState> {
-        let mut s = Box::new(FpuState([0; 512]));
+        let mut s = Box::new(FpuState([0; cpu::FPU_AREA_SIZE]));
         s.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes()); // FCW
         s.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes()); // MXCSR
+        s.0[512..520].copy_from_slice(&0x3u64.to_le_bytes()); // XSTATE_BV
         s
     }
 }
@@ -82,6 +86,10 @@ pub struct Thread {
     fs_base: u64,
     /// GS base (the Windows runtime's TEB pointer), switched likewise.
     gs_base: u64,
+    /// Base of the 32-bit FS data descriptor: where compatibility-mode code
+    /// finds its TEB (`fs:[0x18]`). Installed in this CPU's GDT with the
+    /// thread; 0 for threads that never run 32-bit code.
+    fs32_base: u64,
     /// Set when the owning process is exiting: the thread ends at its next
     /// safe point (return to user mode or an interrupted blocking call).
     kill_pending: bool,
@@ -271,6 +279,7 @@ fn new_thread(tid: Tid, name: &str, pid: u64, root: u64, entry: Entry, a: u64, b
         slice: TIME_SLICE_TICKS,
         fs_base,
         gs_base: 0,
+        fs32_base: 0,
         kill_pending: false,
         wake_pending: false,
         leaving: false,
@@ -305,6 +314,7 @@ pub fn init() {
         slice: TIME_SLICE_TICKS,
         fs_base: 0,
         gs_base: 0,
+        fs32_base: 0,
         kill_pending: false,
         wake_pending: false,
         leaving: false,
@@ -350,7 +360,7 @@ pub fn init_secondary(top: u64) {
         tid,name:alloc::format!("idle/{index}"),pid:0,state:State::Running,rsp:0,
         root:paging::kernel_root(),_kstack:Vec::new(),kstack_top:top,
         fpu:FpuState::initial(),wake_at:None,joiners:Vec::new(),slice:TIME_SLICE_TICKS,
-        fs_base:0,gs_base:0,kill_pending:false,wake_pending:false,leaving:false,bkl:false,cpu_ticks:0,affinity:u64::MAX,last_cpu:index,priority:NORMAL,boost:0,inherited:0,queued_at:0,low_rsp:top,stack_warned:false,
+        fs_base:0,gs_base:0,fs32_base:0,kill_pending:false,wake_pending:false,leaving:false,bkl:false,cpu_ticks:0,affinity:u64::MAX,last_cpu:index,priority:NORMAL,boost:0,inherited:0,queued_at:0,low_rsp:top,stack_warned:false,
     });
     s.threads.insert(tid,t);s.current[index]=tid;s.idle[index]=tid;
     crate::smp::set_current(tid, 0);
@@ -538,7 +548,8 @@ impl Scheduler {
             return None;
         }
         crate::smp::set_current(nt.tid, nt.pid);
-        let (new_rsp, new_root, new_top, new_fs, new_gs) = (nt.rsp, nt.root, nt.kstack_top, nt.fs_base, nt.gs_base);
+        let (new_rsp, new_root, new_top, new_fs, new_gs, new_fs32) =
+            (nt.rsp, nt.root, nt.kstack_top, nt.fs_base, nt.gs_base, nt.fs32_base);
         let new_fpu: *const FpuState = &*nt.fpu;
         let old = self.threads.get_mut(&cur).expect("current thread exists");
         // From here until `after_switch` the outgoing context is neither
@@ -565,10 +576,23 @@ impl Scheduler {
         // FS is userspace TLS. The inactive GS base holds the thread's
         // Windows TEB while the active kernel GS stays CPU-local.
         unsafe {
-            old.fs_base = cpu::rdmsr(IA32_FS_BASE);
+            // With a 32-bit FS descriptor installed, FS holds that descriptor's
+            // base, so it is not the outgoing thread's 64-bit TLS base. Every
+            // change of the 64-bit base goes through `set_current_fs_base`,
+            // which already updated the field.
+            if old.fs32_base == 0 {
+                old.fs_base = cpu::rdmsr(IA32_FS_BASE);
+            }
             cpu::wrmsr(IA32_FS_BASE, new_fs);
             old.gs_base = cpu::rdmsr(IA32_GS_BASE);
             cpu::wrmsr(IA32_GS_BASE, new_gs);
+            // 32-bit code reads its TEB through the FS descriptor, not the
+            // MSR. The descriptor lives in this CPU's GDT, so it is installed
+            // for the incoming thread on every switch, after the FS MSR is
+            // written: for a non-zero base the descriptor load replaces the
+            // hidden FS base with the 32-bit TEB. Interrupts are off under the
+            // scheduler lock.
+            gdt::set_fs32_base(new_fs32);
         }
         let old_rsp: *mut u64 = &mut old.rsp;
         let old_fpu: *mut FpuState = &mut *old.fpu;
@@ -606,8 +630,8 @@ pub fn schedule() {
         // SAFETY: the pointers refer to boxed fields of threads that stay
         // alive across the switch (a dead thread is reaped only after it).
         unsafe {
-            cpu::fxsave(old_fpu as *mut u8);
-            cpu::fxrstor(new_fpu as *const u8);
+            cpu::fpu_save(old_fpu as *mut u8);
+            cpu::fpu_restore(new_fpu as *const u8);
             osyx_switch(old_rsp, new_rsp);
         }
         after_switch();
@@ -922,13 +946,46 @@ pub fn set_current_fs_base(value: u64) {
     unsafe { cpu::wrmsr(IA32_FS_BASE, value) };
 }
 
-/// Loads the initial x87/SSE state into the CPU for the current thread
+/// Sets the FS base that 32-bit compatibility-mode code of the current thread
+/// sees (`fs:[0x18]`) and installs it in this CPU's GDT.
+///
+/// A non-zero `value` also loads FS from the descriptor, which replaces the
+/// single hidden FS base (there is one such register, aliased by
+/// `IA32_FS_BASE`): from then on 64-bit code of the same thread re-establishes
+/// its TLS with [`set_current_fs_base`]. Clearing the base puts the thread's
+/// 64-bit FS base back. The value is stored on the thread and reinstalled by
+/// [`Scheduler::pick_next`] whenever the thread runs again, so it follows the
+/// thread across CPUs.
+pub fn current_fs32_base() -> u64 {
+    let g = SCHED.lock();
+    let s = g.as_ref().expect("scheduler not initialised");
+    s.threads.get(&s.current[crate::smp::index()]).map_or(0, |t| t.fs32_base)
+}
+
+pub fn set_current_fs32_base(value: u64) {
+    let mut g = SCHED.lock();
+    let s = g.as_mut().expect("scheduler not initialised");
+    let t = s.threads.get_mut(&s.current[crate::smp::index()]).expect("current thread exists");
+    t.fs32_base = value;
+    // SAFETY: the scheduler lock keeps interrupts off; the GDT is this CPU's.
+    unsafe {
+        gdt::set_fs32_base(value);
+        if value == 0 {
+            // Installing a base replaced the hidden FS base, so clearing it
+            // has to restore the 64-bit one (the thread's field is current:
+            // only `set_current_fs_base` changes it).
+            cpu::wrmsr(IA32_FS_BASE, t.fs_base);
+        }
+    }
+}
+
+/// Loads the initial x87/SSE/AVX state into the CPU for the current thread
 /// (`execve`: nothing of the old program's registers survives). The saved
 /// copy is refreshed from the CPU at the next switch.
 pub fn reset_current_fpu() {
     let init = FpuState::initial();
-    // SAFETY: a valid, 16-byte aligned FXSAVE image.
-    unsafe { cpu::fxrstor(&*init as *const FpuState as *const u8) };
+    // SAFETY: a valid, 64-byte aligned XSAVE image.
+    unsafe { cpu::fpu_restore(&*init as *const FpuState as *const u8) };
 }
 
 pub fn rename_current(name: &str) {

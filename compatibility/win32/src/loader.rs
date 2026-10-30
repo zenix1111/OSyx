@@ -12,7 +12,7 @@
 //! mapping happen under it, notifications (DllMain, TLS callbacks) after.
 
 use crate::error::*;
-use crate::{mem, path, teb};
+use crate::{mem, path, teb, wow64};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -24,7 +24,7 @@ use os_std::sync::Mutex;
 use os_std::time::Instant;
 use osyx_pe::PeFile;
 use osyx_pe_loader::apiset::{Schema, SchemaBuilder};
-use osyx_pe_loader::image::Protection;
+use osyx_pe_loader::image::{self, Protection};
 use osyx_pe_loader::link::{normalize, BuiltinModule, Host, Kind, LinkError, Linker, PeMapping, Source, Symbol};
 
 pub const DLL_PROCESS_DETACH: u32 = 0;
@@ -368,6 +368,10 @@ struct WinHost {
     starts: Vec<(u64, Instant)>,
     /// OSyx paths of the DLL files loaded, by module name.
     paths: BTreeMap<String, String>,
+    /// The 32-bit bridge, which turns 64-bit addresses into stubs that
+    /// 32-bit code can call. None when it could not be created: PE32+
+    /// programs then run as before, and a PE32 import fails to bind.
+    bridge: Option<wow64::Bridge>,
 }
 
 struct FileView {
@@ -409,6 +413,27 @@ fn map_pe(p: &str) -> Result<Option<FileView>, LinkError> {
 }
 
 impl WinHost {
+    /// The host for `winrun`. `bridge` is the 32-bit bridge when the caller
+    /// has one; it is only used by PE32 images.
+    fn new(search: Vec<String>, bridge: Option<wow64::Bridge>) -> WinHost {
+        WinHost {
+            builtins: builtins(),
+            search,
+            explicit: None,
+            images: Vec::new(),
+            starts: Vec::new(),
+            paths: BTreeMap::new(),
+            bridge,
+        }
+    }
+
+    /// Records a successful reservation and returns its writable mapping.
+    fn adopt(&mut self, base: u64, size: u64) -> (u64, WritableImage) {
+        self.images.push(Image { base, size });
+        self.starts.push((base, Instant::now()));
+        (base, WritableImage { base, size: size as usize })
+    }
+
     /// The file a PE module was loaded from, opened again to identify it to
     /// the kernel's shared image cache.
     fn image_file(&self, name: &str) -> Option<os_std::fs::File> {
@@ -468,6 +493,52 @@ impl Host for WinHost {
         self.images.push(Image { base, size });
         self.starts.push((base, Instant::now()));
         Ok((base, WritableImage { base, size: size as usize }))
+    }
+
+    /// A 32-bit image must lie entirely below `max` (4 GiB): its code can
+    /// address nothing above that. The preferred base is tried first; a
+    /// fallback allocation is kept only when it fits, and released
+    /// otherwise, because the linker would reject it and leak the pages.
+    fn reserve_below(
+        &mut self,
+        size: u64,
+        preferred: u64,
+        fixed: bool,
+        max: u64,
+    ) -> Result<(u64, Self::Image), LinkError> {
+        let fits = |base: u64| base.checked_add(size).is_some_and(|end| end <= max);
+        if fixed {
+            // No relocations: only the linked base is acceptable.
+            if !fits(preferred) {
+                return Err(LinkError::NoMemory);
+            }
+            let base = mem::alloc_fixed(preferred, size as usize, mem::Prot::ReadWrite).ok_or(LinkError::NoMemory)?;
+            return Ok(self.adopt(base, size));
+        }
+        if preferred != 0 && fits(preferred) {
+            if let Some(base) = mem::alloc_fixed(preferred, size as usize, mem::Prot::ReadWrite) {
+                if fits(base) {
+                    return Ok(self.adopt(base, size));
+                }
+                mem::free_pages(base, size as usize);
+            }
+        }
+        let base = mem::alloc_pages(size as usize, mem::Prot::ReadWrite).ok_or(LinkError::NoMemory)?;
+        if !fits(base) {
+            mem::free_pages(base, size as usize);
+            return Err(LinkError::NoMemory);
+        }
+        Ok(self.adopt(base, size))
+    }
+
+    fn import_thunk(&mut self, symbol: Option<&str>, _ordinal: u16, address: u64, pe32: bool) -> u64 {
+        // PE32+ slots hold the resolved address itself.
+        if !pe32 {
+            return address;
+        }
+        // A by-ordinal import has no name to bridge; report it as unbound.
+        let (Some(symbol), Some(bridge)) = (symbol, self.bridge.as_mut()) else { return 0 };
+        bridge.import(symbol, address).map_or(0, u64::from)
     }
 
     fn commit(&mut self, base: u64, _image: Self::Image, prot: &[Protection]) -> Result<(), LinkError> {
@@ -794,14 +865,12 @@ pub fn start(exe_path: &str, command_line: &str, environment: &[String]) -> Resu
     let cwd = os_std::env::current_dir().map(|p| p.as_str().to_string()).unwrap_or_else(|_| String::from("/"));
     let schema_bytes: &'static [u8] = Vec::leak(schema());
     let schema = Schema::parse(schema_bytes).map_err(|e| alloc::format!("API set schema: {e:?}"))?;
-    let host = WinHost {
-        builtins: builtins(),
-        search: alloc::vec![exe_dir.clone(), cwd.clone()],
-        explicit: None,
-        images: Vec::new(),
-        starts: Vec::new(),
-        paths: BTreeMap::new(),
-    };
+    let host = WinHost::new(
+        alloc::vec![exe_dir.clone(), cwd.clone()],
+        // Built here so a PE32 module loaded at run time can bind imports;
+        // a PE32+ program runs as before when the bridge is unavailable.
+        wow64::Bridge::new().ok(),
+    );
     let mut linker = Linker::new(host, Some(schema));
     // Known before loading so the image can be shared with other processes.
     linker.host.paths.insert(normalize(&exe_name), String::from(exe_path));
@@ -839,6 +908,72 @@ pub fn start(exe_path: &str, command_line: &str, environment: &[String]) -> Resu
         return Err(String::from("a DLL failed to initialise (DllMain returned FALSE)"));
     }
     Ok(Started { entry, stack_top, stack_limit: stack, peb: teb::peb() })
+}
+
+/// Loads and runs a 32-bit (PE32) program. Its image and everything it
+/// imports stay below 4 GiB; `winrun` itself is linked at 0x4000_0000 for
+/// the same reason, so 32-bit code can reach every built-in's bridge stub.
+///
+/// `args` is the program's argument vector as typed, the program first;
+/// `cmd` and `env` are its Windows command line and environment.
+pub fn run_pe32(bytes: Vec<u8>, args: &[String], cmd: &str, env: &[String]) -> Result<(), String> {
+    // The image's TLS directory is not set up here: a 32-bit image reads its
+    // TLS array through the 32-bit TEB, which belongs to the bridge. This
+    // path maps, relocates and binds imports, then enters compatibility mode.
+    let cwd = os_std::env::current_dir().map(|p| p.as_str().to_string()).unwrap_or_else(|_| String::from("/"));
+    let program = args.first().cloned().unwrap_or_else(|| String::from("program.exe"));
+    let osyx = if program.starts_with('/') {
+        program.clone()
+    } else {
+        path::to_osyx(&program, &cwd).unwrap_or(program.clone())
+    };
+    let name = osyx.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("program.exe").to_string();
+    let dir = osyx.rsplit_once('/').map_or_else(
+        || String::from("/"),
+        |(d, _)| if d.is_empty() { String::from("/") } else { String::from(d) },
+    );
+    let schema_bytes: &'static [u8] = Vec::leak(schema());
+    let schema = Schema::parse(schema_bytes).map_err(|e| alloc::format!("API set schema: {e:?}"))?;
+    let bridge = wow64::Bridge::new().map_err(|e| alloc::format!("32-bit bridge: {e}"))?;
+    let mut linker = Linker::new(WinHost::new(alloc::vec![dir, cwd.clone()], Some(bridge)), Some(schema));
+    // Known before loading so the image can be shared with other processes.
+    linker.host.paths.insert(normalize(&name), osyx.clone());
+    let exe = linker.load_executable(&name, bytes).map_err(|e| alloc::format!("cannot load {name}: {e}"))?;
+    linker.host.paths.insert(linker.modules[exe].name.clone(), osyx.clone());
+    let entry = linker.modules[exe].entry();
+    if entry == 0 {
+        return Err(alloc::format!("{name} has no entry point"));
+    }
+    if entry >= image::ADDRESS_LIMIT32 {
+        return Err(alloc::format!("{name}: entry {entry:#x} is not addressable by 32-bit code"));
+    }
+    // Built-in modules have no DllMain, so the computed order is recorded
+    // only: there is no 32-bit DllMain delivery on this path yet.
+    let order = linker.init_order(exe);
+    if crate::VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
+        os_std::eprintln!("winrun: 32-bit program {name} entry {entry:#x}, {} modules", order.len());
+    }
+    let Some(mut bridge) = linker.host.bridge.take() else {
+        return Err(String::from("the 32-bit bridge is unavailable"));
+    };
+    // The 64-bit side (the bridge, the built-in DLLs and the exception
+    // handler) still runs as a Windows thread: it needs a PEB and a TEB in
+    // GS. Both describe the 32-bit stack, which is the one Windows code
+    // here runs on (the bridge enters on its own dispatch stack).
+    let base = linker.modules[exe].base;
+    let (limit, top) = bridge.stack();
+    teb::create_peb(&teb::ProcessInfo {
+        image_base: base,
+        image_path: &path::to_windows(&osyx),
+        command_line: cmd,
+        current_dir: &path::to_windows(&cwd),
+        environment: env,
+        heap: crate::kernel32::process_heap(),
+    });
+    let main_teb = teb::create_teb(top, limit, crate::kernel32::pid(), os_sys::gettid());
+    teb::install(main_teb);
+    crate::kernel32::EXE_STACK_RESERVE.store((top - limit) as usize, core::sync::atomic::Ordering::Relaxed);
+    bridge.enter(entry as u32)
 }
 
 /// Modules loaded, for the start-up log: (name, base, built-in, relocations, imports).

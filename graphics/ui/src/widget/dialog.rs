@@ -109,6 +109,14 @@ impl Dialog {
     }
 
     pub fn event(&mut self, ev: &Event, fonts: &Fonts) -> Response {
+        self.event_inner(ev, fonts, None)
+    }
+
+    pub fn event_with_clipboard(&mut self, ev: &Event, fonts: &Fonts, clipboard: &mut crate::Clipboard) -> Response {
+        self.event_inner(ev, fonts, Some(clipboard))
+    }
+
+    fn event_inner(&mut self, ev: &Event, fonts: &Fonts, clipboard: Option<&mut crate::Clipboard>) -> Response {
         let has_input = usize::from(self.input.is_some());
         if let Event::Key(k) = ev {
             if k.down && k.key == key::TAB {
@@ -127,7 +135,10 @@ impl Dialog {
         }
         let mut redraw = false;
         if let Some(f) = &mut self.input {
-            let r = f.event(ev, self.focus == 0, fonts);
+            let r = match clipboard {
+                Some(clipboard) => f.event_with_clipboard(ev, self.focus == 0, fonts, clipboard),
+                None => f.event(ev, self.focus == 0, fonts),
+            };
             if matches!(ev, Event::PointerDown { x, y, .. } if contains(&f.rect, *x, *y)) {
                 self.focus = 0;
             }

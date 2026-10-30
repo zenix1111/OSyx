@@ -14,7 +14,8 @@
 //! Without a usable root partition a small tmpfs becomes `/` so the rest
 //! of the tree still works (and the log says so); the boot modules from
 //! `\EFI\OSYX\BIN` become its `/bin`. Other FAT32/ext4 volumes are mounted
-//! below `/mnt/<device>`.
+//! below `/mnt/<device>`; removable media (USB sticks) go to
+//! `/media/<label>` instead, see `media`.
 
 use crate::block::{self, BlockDev};
 use crate::vfs::{self, devfs::DevFs, tmpfs::TmpfsVolume, Filesystem, Lookup};
@@ -36,12 +37,16 @@ pub struct Summary {
     pub mounts: usize,
 }
 
-fn probe_fs(disk: &Arc<dyn BlockDev>) -> Option<&'static str> {
+pub(crate) fn probe_fs(disk: &Arc<dyn BlockDev>) -> Option<&'static str> {
     let mut s = [0u8; block::SECTOR_SIZE * 4];
     block::read(&**disk, 0, &mut s).ok()?;
     // ext2/3/4: superblock at byte 1024, magic 0xEF53 at offset 56.
     if s[1024 + 56] == 0x53 && s[1024 + 57] == 0xEF {
         return Some("ext4");
+    }
+    // exFAT: file system name in the boot sector.
+    if &s[3..11] == b"EXFAT   " && s[510] == 0x55 && s[511] == 0xAA {
+        return Some("exfat");
     }
     // FAT32: boot signature and "FAT32   " file system type string.
     if s[510] == 0x55 && s[511] == 0xAA && &s[82..90] == b"FAT32   " {
@@ -55,10 +60,10 @@ fn probe_fs(disk: &Arc<dyn BlockDev>) -> Option<&'static str> {
 pub fn mount_hotplugged(disk: &str) {
     let candidates: Vec<Arc<dyn BlockDev>> = block::devices()
         .into_iter()
-        .filter(|d| d.name().starts_with(disk))
+        .filter(|d| d.name() == disk || d.parent_name() == Some(disk))
         .filter(|d| {
             // A partitioned disk itself holds no file system.
-            d.partition().is_some() || !block::devices().iter().any(|p| p.partition().is_some() && p.name().starts_with(d.name()))
+            d.partition().is_some() || !block::devices().iter().any(|p| p.parent_name() == Some(d.name()))
         })
         .collect();
     for d in candidates {
@@ -240,8 +245,13 @@ pub fn mount_all(boot: &BootData) -> Summary {
     // Remaining recognisable volumes go to /mnt/<device>.
     for d in disks {
         let name = String::from(d.name());
+        // USB sticks and other removable disks belong to the media manager
+        // (`/media/<label>`, eject), below.
+        if d.removable() {
+            continue;
+        }
         let covered = used.iter().any(|u| *u == name || u.starts_with(&name) || name.starts_with(u.as_str()));
-        let is_partitioned_disk = d.partition().is_none() && block::devices().iter().any(|p| p.partition().is_some() && p.name().starts_with(&name));
+        let is_partitioned_disk = d.partition().is_none() && block::devices().iter().any(|p| p.parent_name() == Some(name.as_str()));
         if covered || is_partitioned_disk {
             continue;
         }
@@ -255,5 +265,7 @@ pub fn mount_all(boot: &BootData) -> Summary {
             }
         }
     }
+    crate::media::init();
+    crate::media::attach_boot_media();
     Summary { root, mounts: vfs::mounts().len() }
 }

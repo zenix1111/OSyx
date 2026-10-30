@@ -63,11 +63,28 @@ fn checks(path: &str) -> Result<(), Errno> {
     }
     raw::ftruncate(fd, 0)?;
     raw::close(fd)?;
+    // A read-only view of a fresh backing reads its pages on the first
+    // touch, not when the section is mapped.
+    let mut content = [0u8; 8192];
+    content[7] = 0x5A;
+    content[4096 + 9] = 0x6B;
+    fs::write(path, content).map_err(|_| Errno::Io)?;
+    let lazy_fd = raw::open(path, raw::OPEN_READ, 0)?;
+    let lazy_section = raw::filemap_create(lazy_fd, 0, false)?;
+    let lazy = raw::filemap_map(lazy_section, 4096, 4096, false)?;
+    let lazy_ok = unsafe { lazy.add(9).read() == 0x6B };
+    raw::close(lazy_section)?;
+    raw::close(lazy_fd)?;
+    unsafe {
+        raw::unmap(lazy, 4096)?;
+    }
     let _ = fs::remove_file(path);
-    if rights && shared && persisted && zero {
+    if rights && shared && persisted && zero && lazy_ok {
         Ok(())
     } else {
-        println!("filemap: rights={rights} shared={shared} persisted={persisted} fresh={zero}");
+        println!(
+            "filemap: rights={rights} shared={shared} persisted={persisted} fresh={zero} lazy={lazy_ok}"
+        );
         Err(Errno::Io)
     }
 }
