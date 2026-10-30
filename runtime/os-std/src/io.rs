@@ -6,6 +6,7 @@ use crate::sys;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub trait Read {
     /// Reads some bytes into `buf`, returning how many (0 = end of data).
@@ -139,10 +140,27 @@ pub enum Stream {
     Stderr,
 }
 
+/// Handles that standard input and output go to. A shell points them at a
+/// file or pipe end while it runs a built-in command with redirections.
+static STDIN_HANDLE: AtomicU64 = AtomicU64::new(osyx_abi::STDIN);
+static STDOUT_HANDLE: AtomicU64 = AtomicU64::new(osyx_abi::STDOUT);
+
+/// Sends standard output (`print!`, `println!`) to `handle`, a file or pipe
+/// end of this process; `None` restores the real standard output.
+pub fn redirect_stdout(handle: Option<u64>) {
+    STDOUT_HANDLE.store(handle.unwrap_or(osyx_abi::STDOUT), Ordering::Relaxed);
+}
+
+/// Reads standard input from `handle`, a file or pipe end of this process;
+/// `None` restores the real standard input.
+pub fn redirect_stdin(handle: Option<u64>) {
+    STDIN_HANDLE.store(handle.unwrap_or(osyx_abi::STDIN), Ordering::Relaxed);
+}
+
 impl Stream {
     fn fd(self) -> u64 {
         match self {
-            Stream::Stdout => osyx_abi::STDOUT,
+            Stream::Stdout => STDOUT_HANDLE.load(Ordering::Relaxed),
             Stream::Stderr => osyx_abi::STDERR,
         }
     }
@@ -159,7 +177,10 @@ pub fn stdin() -> Stdin {
 impl Read for Stdin {
     /// Blocks until input arrives; 0 at end of input.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        sys::read_stdin(buf)
+        match STDIN_HANDLE.load(Ordering::Relaxed) {
+            osyx_abi::STDIN => sys::read_stdin(buf),
+            handle => sys::read_handle(handle, buf),
+        }
     }
 }
 

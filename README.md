@@ -9,6 +9,9 @@
 Its own UEFI boot manager, kernel, file systems, network stack, compositor
 and desktop, and a compatibility layer that runs Windows PE32+ programs.
 
+**Status:** under active development and not abandoned — see
+[STATUS.md](STATUS.md) for what is being worked on.
+
 ![OSyx desktop](docs/screenshots/desktop.jpg)
 
 </div>
@@ -124,6 +127,18 @@ Third-party parts keep their own licences: the OpenBSD and NetBSD sources in
 `drivers/bsd` (ISC and BSD, notices in each file), Intel device firmware in
 `drivers/bsd/firmware` (`LICENCE.iwlwifi_firmware`, `LICENCE.ibt_firmware`),
 the bundled fonts (SIL OFL) and the Rust crates from crates.io.
+
+## Support
+
+OSyx is developed in spare time and has no company behind it. If you find it
+useful and want to help it continue, you can support the work through:
+
+- [GitHub Sponsors](https://github.com/sponsors/v3nn7)
+- [Ko-fi](https://ko-fi.com/v3nn7)
+
+Sponsoring is entirely optional. It does not buy placement in the roadmap —
+the best way to influence the project is still a good bug report or a pull
+request.
 
 ## Contributing
 

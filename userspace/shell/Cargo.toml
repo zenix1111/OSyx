@@ -1,0 +1,6 @@
+[package]
+name = "osyx-shell"
+description = "Command-line parsing for AXIS, the OSyx shell: pipelines and redirections"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

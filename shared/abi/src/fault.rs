@@ -19,7 +19,7 @@ pub const R13: usize = 13;
 pub const R14: usize = 14;
 pub const R15: usize = 15;
 
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct Context {
     pub gpr: [u64; 16],
@@ -29,13 +29,25 @@ pub struct Context {
     pub error: u64,
     pub address: u64,
     pub reserved: u64,
-    /// FXSAVE64 image: x87/SSE, not AVX extended state.
-    pub fx: [u8; 512],
+    /// Padding so `fx` is 64-byte aligned for XSAVE/XRSTOR.
+    pub _pad: [u8; 16],
+    /// XSAVE64 image: x87, SSE and AVX state (XSTATE_BV, YMM upper halves).
+    pub fx: [u8; 832],
 }
 impl Default for Context {
     fn default() -> Self {
-        Self { gpr: [0; 16], rip: 0, rflags: 0, vector: 0, error: 0, address: 0, reserved: 0, fx: [0; 512] }
+        Self {
+            gpr: [0; 16],
+            rip: 0,
+            rflags: 0,
+            vector: 0,
+            error: 0,
+            address: 0,
+            reserved: 0,
+            _pad: [0; 16],
+            fx: [0; 832],
+        }
     }
 }
-const _: () = assert!(core::mem::size_of::<Context>() == 688);
-const _: () = assert!(core::mem::offset_of!(Context, fx) == 176);
+const _: () = assert!(core::mem::size_of::<Context>() == 1024);
+const _: () = assert!(core::mem::offset_of!(Context, fx) == 192);

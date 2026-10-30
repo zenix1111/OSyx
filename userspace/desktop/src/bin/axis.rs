@@ -14,8 +14,11 @@
 //! ```
 //!
 //! Programs inherit the shell's standard streams, so their output appears
-//! in the terminal. Not implemented yet: pipelines, redirection, blocks
-//! (`if` / `for`), job control.
+//! in the terminal. `<`, `>` and `>>` redirect standard input/output of a
+//! command (built-ins included) and `|` connects programs into a pipeline
+//! (one built-in per pipeline). `if cond { ... } else { ... }` and
+//! `for name in words { ... }` group lines; `cond` is an expression with
+//! `== != < > <= >=`. Not implemented yet: job control.
 
 #![no_std]
 #![no_main]
@@ -25,7 +28,9 @@ use os_std::os::raw::HANDLE_NONE;
 use os_std::prelude::*;
 use os_std::process::{Command, ExitStatus};
 use os_std::time::Instant;
-use os_std::{env, io, os, system};
+use os_std::{env, io, ipc, os, system};
+use osyx_shell::block::{self, Stmt};
+use osyx_shell::{parse, Stage};
 
 os_std::entry!(main);
 
@@ -43,12 +48,17 @@ fn main() -> i32 {
     if let Some(script) = args.get(1) {
         return match fs::read_to_string(script) {
             Ok(text) => {
-                for line in text.lines() {
-                    if sh.line(line).is_break() {
-                        break;
+                let lines: Vec<&str> = text.lines().collect();
+                match block::parse_script(&lines) {
+                    Ok(stmts) => {
+                        sh.run(&stmts);
+                        sh.last
+                    }
+                    Err(e) => {
+                        eprintln!("axis: {script}: {e}");
+                        2
                     }
                 }
-                sh.last
             }
             Err(e) => {
                 eprintln!("axis: {script}: {e}");
@@ -61,26 +71,56 @@ fn main() -> i32 {
     let mut buf = [0u8; 512];
     loop {
         prompt();
-        // Read one line (stdin is a pipe: data arrives in chunks).
-        let line = loop {
-            if let Some(nl) = pending.iter().position(|&b| b == b'\n') {
-                let rest = pending.split_off(nl + 1);
-                let line = String::from_utf8_lossy(&pending[..nl]).into_owned();
-                pending = rest;
-                break Some(line);
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            let Some(line) = read_line(&mut pending, &mut buf) else { return sh.last };
+            let line = String::from(line.trim_end_matches('\r'));
+            if !line.trim().is_empty() {
+                sh.history.push(line.clone());
             }
-            match io::Read::read(&mut io::stdin(), &mut buf) {
-                Ok(0) | Err(_) => break None,
-                Ok(n) => pending.extend_from_slice(&buf[..n]),
+            lines.push(line);
+            let block_lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let d = match block::depth(&block_lines) {
+                Ok(d) => d,
+                Err(e) => {
+                    sh.fail(&e);
+                    break;
+                }
+            };
+            if d > 0 {
+                print!("... ");
+                let _ = io::Write::flush(&mut io::stdout());
+                continue;
             }
-        };
-        let Some(line) = line else { return sh.last };
-        let line = line.trim_end_matches('\r');
-        if !line.trim().is_empty() {
-            sh.history.push(String::from(line));
+            if d < 0 {
+                sh.fail("unexpected `}`");
+                break;
+            }
+            match block::parse_script(&block_lines) {
+                Ok(stmts) => {
+                    if sh.run(&stmts).is_break() {
+                        return sh.last;
+                    }
+                }
+                Err(e) => sh.fail(&e),
+            }
+            break;
         }
-        if sh.line(line).is_break() {
-            return sh.last;
+    }
+}
+
+/// One line from standard input (it arrives in chunks); `None` at end.
+fn read_line(pending: &mut Vec<u8>, buf: &mut [u8]) -> Option<String> {
+    loop {
+        if let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+            let rest = pending.split_off(nl + 1);
+            let line = String::from_utf8_lossy(&pending[..nl]).into_owned();
+            *pending = rest;
+            return Some(line);
+        }
+        match io::Read::read(&mut io::stdin(), buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => pending.extend_from_slice(&buf[..n]),
         }
     }
 }
@@ -127,6 +167,46 @@ impl Value {
 }
 
 impl Shell {
+    /// Runs parsed statements: commands, `if` and `for` blocks.
+    fn run(&mut self, stmts: &[Stmt]) -> Flow {
+        for st in stmts {
+            let flow = match st {
+                Stmt::Command(line) => self.line(line),
+                Stmt::If { cond, then, alt } => match self.expr(cond) {
+                    Ok(v) if truthy(&v) => self.run(then),
+                    Ok(_) => self.run(alt),
+                    Err(e) => {
+                        self.fail(&e);
+                        Flow::Continue
+                    }
+                },
+                Stmt::For { name, words, body } => self.run_for(name, words, body),
+            };
+            if flow.is_break() {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
+    fn run_for(&mut self, name: &str, words: &str, body: &[Stmt]) -> Flow {
+        let items = match self.words(words) {
+            Ok(items) => items,
+            Err(e) => {
+                self.fail(&e);
+                return Flow::Continue;
+            }
+        };
+        for item in items {
+            self.vars.insert(String::from(name), item);
+            let flow = self.run(body);
+            if flow.is_break() {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
     fn line(&mut self, line: &str) -> Flow {
         let line = strip_comment(line).trim();
         if line.is_empty() {
@@ -153,19 +233,19 @@ impl Shell {
             }
             return Flow::Continue;
         }
-        let words = match self.words(line) {
-            Ok(w) => w,
+        let stages = match parse(line) {
+            Ok(s) => s,
             Err(e) => {
                 self.fail(&e);
                 return Flow::Continue;
             }
         };
-        let Some((cmd, args)) = words.split_first() else { return Flow::Continue };
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.last = match self.builtin(cmd, &args) {
-            Some(Ok(code)) => code,
-            Some(Err(Exit)) => return Flow::Exit,
-            None => self.external(cmd, &args),
+        if stages.is_empty() {
+            return Flow::Continue;
+        }
+        self.last = match self.pipeline(&stages) {
+            Ok(code) => code,
+            Err(Exit) => return Flow::Exit,
         };
         Flow::Continue
     }
@@ -181,14 +261,30 @@ impl Shell {
         split_top_level(s, ',').iter().filter(|p| !p.trim().is_empty()).map(|p| self.expr(p)).collect()
     }
 
-    /// `term (+|-|*) term ...`, left to right; `+` concatenates when either
-    /// side is a string.
+    /// A comparison of two sums, or just a sum. Comparisons yield `Int(0)`
+    /// or `Int(1)`.
     fn expr(&self, s: &str) -> Result<Value, String> {
         let toks = tokenize_expr(s)?;
-        let mut it = toks.into_iter();
-        let mut acc = self.term(it.next().ok_or("empty expression")?)?;
+        match toks.iter().position(|t| is_cmp(t)) {
+            Some(i) => {
+                if toks[i + 1..].iter().any(|t| is_cmp(t)) {
+                    return Err(String::from("only one comparison per expression"));
+                }
+                let l = self.sum(&toks[..i])?;
+                let r = self.sum(&toks[i + 1..])?;
+                compare(&toks[i], &l, &r).map(|b| Value::Int(b as i64))
+            }
+            None => self.sum(&toks),
+        }
+    }
+
+    /// `term (+|-|*) term ...`, left to right; `+` concatenates when either
+    /// side is a string.
+    fn sum(&self, toks: &[String]) -> Result<Value, String> {
+        let mut it = toks.iter();
+        let mut acc = self.term(it.next().ok_or("empty expression")?.clone())?;
         while let Some(op) = it.next() {
-            let rhs = self.term(it.next().ok_or("operator without a right-hand side")?)?;
+            let rhs = self.term(it.next().ok_or("operator without a right-hand side")?.clone())?;
             acc = match (op.as_str(), acc, rhs) {
                 ("+", Value::Int(a), Value::Int(b)) => Value::Int(a.checked_add(b).ok_or("integer overflow")?),
                 ("-", Value::Int(a), Value::Int(b)) => Value::Int(a.checked_sub(b).ok_or("integer overflow")?),
@@ -203,6 +299,12 @@ impl Shell {
     fn term(&self, t: String) -> Result<Value, String> {
         if let Some(s) = t.strip_prefix('\u{1}') {
             return Ok(Value::Str(String::from(s)));
+        }
+        if let Some(name) = t.strip_prefix('$') {
+            if name == "?" {
+                return Ok(Value::Int(self.last as i64));
+            }
+            return self.term(String::from(name));
         }
         if let Ok(i) = t.parse::<i64>() {
             return Ok(Value::Int(i));
@@ -293,6 +395,8 @@ impl Shell {
                 println!("  volume [0-100|mute|unmute], beep [HZ [MS]], play FILE.wav: sound");
                 println!("  dmesg [WORD]: kernel log (only lines containing WORD), e.g. `dmesg iwm`");
                 println!("Statements: name = expr   print(expr, ...)   $name in commands, $? = last status");
+                println!("Blocks: if a == b {{ ... }} else {{ ... }}   for x in a b {{ ... }}");
+                println!("Redirection: cmd < in, cmd > out, cmd >> out; pipelines: cmd | cmd | ...");
                 println!("Network: ping HOST, net list|info|configure, dns lookup NAME, netstat [-a|-s], nc");
                 println!("Other words run programs from /bin, /usr/bin and /system/bin.");
                 Ok(0)
@@ -399,13 +503,15 @@ impl Shell {
         }))
     }
 
+    fn program(&self, cmd: &str) -> Option<String> {
+        if cmd.contains('/') {
+            return Some(String::from(cmd));
+        }
+        SEARCH.iter().map(|d| format!("{d}/{cmd}")).find(|p| fs::metadata(p).is_ok_and(|m| m.is_file()))
+    }
+
     fn external(&mut self, cmd: &str, args: &[&str]) -> i32 {
-        let path = if cmd.contains('/') {
-            Some(String::from(cmd))
-        } else {
-            SEARCH.iter().map(|d| format!("{d}/{cmd}")).find(|p| fs::metadata(p).is_ok_and(|m| m.is_file()))
-        };
-        let Some(path) = path else {
+        let Some(path) = self.program(cmd) else {
             eprintln!("axis: {cmd}: command not found (try `help`)");
             return 127;
         };
@@ -423,6 +529,290 @@ impl Shell {
             }
         }
     }
+
+    // ---- pipelines and redirections -------------------------------------------
+
+    /// Runs a parsed line: one command with redirections, or a pipeline.
+    fn pipeline(&mut self, stages: &[Stage]) -> Result<i32, Exit> {
+        let mut cmds = Vec::with_capacity(stages.len());
+        for st in stages {
+            match self.words(&st.command) {
+                Ok(w) if !w.is_empty() => cmds.push(w),
+                Ok(_) => {
+                    self.fail("missing command");
+                    return Ok(2);
+                }
+                Err(e) => {
+                    self.fail(&e);
+                    return Ok(2);
+                }
+            }
+        }
+        if stages.len() == 1 {
+            return self.command(&stages[0], &cmds[0]);
+        }
+        let builtins = cmds.iter().filter(|w| is_builtin(&w[0])).count();
+        if builtins > 1 {
+            self.fail("only one built-in command per pipeline");
+            return Ok(2);
+        }
+        self.pipe(stages, &cmds)
+    }
+
+    /// Expands a redirection target to its single path word.
+    fn target(&self, raw: &str) -> Result<String, String> {
+        let mut words = self.words(raw)?;
+        if words.len() != 1 {
+            return Err(String::from("redirection target must be a single word"));
+        }
+        Ok(words.pop().unwrap())
+    }
+
+    fn input(&self, st: &Stage) -> Result<Option<File>, String> {
+        match &st.stdin {
+            None => Ok(None),
+            Some(raw) => {
+                let path = self.target(raw)?;
+                File::open(&path).map(Some).map_err(|e| format!("{path}: {e}"))
+            }
+        }
+    }
+
+    fn output(&self, st: &Stage) -> Result<Option<File>, String> {
+        match &st.stdout {
+            Some(r) => {
+                let path = self.target(&r.path)?;
+                let f = if r.append {
+                    File::options().write(true).append(true).create(true).open(&path)
+                } else {
+                    File::create(&path)
+                };
+                f.map(Some).map_err(|e| format!("{path}: {e}"))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One command of a line, with its redirections.
+    fn command(&mut self, st: &Stage, words: &[String]) -> Result<i32, Exit> {
+        let cmd = words[0].as_str();
+        let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+        let input = match self.input(st) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fail(&e);
+                return Ok(2);
+            }
+        };
+        let output = match self.output(st) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fail(&e);
+                return Ok(2);
+            }
+        };
+        if is_builtin(cmd) {
+            // Built-ins read and print through `os_std::io`, so a temporary
+            // redirect gives them the same file the programs would get.
+            io::redirect_stdin(input.as_ref().map(File::handle));
+            io::redirect_stdout(output.as_ref().map(File::handle));
+            let r = self.builtin(cmd, &args);
+            io::redirect_stdin(None);
+            io::redirect_stdout(None);
+            return match r {
+                Some(Ok(code)) => Ok(code),
+                Some(Err(Exit)) => Err(Exit),
+                None => Ok(127),
+            };
+        }
+        let Some(path) = self.program(cmd) else {
+            eprintln!("axis: {cmd}: command not found (try `help`)");
+            return Ok(127);
+        };
+        if input.is_none() && output.is_none() {
+            return Ok(self.external(cmd, &args));
+        }
+        let mut c = Command::new(&path);
+        c.arg0(cmd).args(&args);
+        let stdio = [input.as_ref().map_or(osyx_abi::STDIN, File::handle), output.as_ref().map_or(osyx_abi::STDOUT, File::handle), osyx_abi::STDERR];
+        match c.spawn_stdio(stdio).and_then(|ch| ch.wait()) {
+            Ok(st) => Ok(report(cmd, st)),
+            Err(e) => {
+                eprintln!("axis: {cmd}: {e}");
+                Ok(126)
+            }
+        }
+    }
+
+    /// Every stage after the first reads the previous stage's pipe. At most
+    /// one stage is a built-in: it runs in the shell process after the
+    /// programs around it have started, so waiting for output never deadlocks.
+    fn pipe(&mut self, stages: &[Stage], cmds: &[Vec<String>]) -> Result<i32, Exit> {
+        let mut inputs = Vec::with_capacity(stages.len());
+        let mut outputs = Vec::with_capacity(stages.len());
+        for st in stages {
+            match (self.input(st), self.output(st)) {
+                (Ok(i), Ok(o)) => {
+                    inputs.push(i);
+                    outputs.push(o);
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    self.fail(&e);
+                    return Ok(2);
+                }
+            }
+        }
+        let mut paths = Vec::with_capacity(stages.len());
+        let mut builtin = None;
+        for (i, words) in cmds.iter().enumerate() {
+            if is_builtin(&words[0]) {
+                builtin = Some(i);
+                paths.push(String::new());
+                continue;
+            }
+            let Some(p) = self.program(&words[0]) else {
+                eprintln!("axis: {}: command not found (try `help`)", words[0]);
+                return Ok(127);
+            };
+            paths.push(p);
+        }
+        let mut links = Vec::with_capacity(stages.len() - 1);
+        for _ in 1..stages.len() {
+            match ipc::pipe() {
+                Ok((r, w)) => links.push((Some(r), Some(w))),
+                Err(e) => {
+                    self.fail(&format!("pipe: {e}"));
+                    return Ok(2);
+                }
+            }
+        }
+        let mut spawned = Vec::with_capacity(stages.len());
+        for (i, words) in cmds.iter().enumerate() {
+            if Some(i) == builtin {
+                continue;
+            }
+            let stdin = match inputs[i].as_ref() {
+                Some(f) => f.handle(),
+                None if i > 0 => links[i - 1].0.as_ref().map_or(osyx_abi::STDIN, |r| r.handle()),
+                None => osyx_abi::STDIN,
+            };
+            let stdout = match outputs[i].as_ref() {
+                Some(f) => f.handle(),
+                None if i + 1 < cmds.len() => links[i].1.as_ref().map_or(osyx_abi::STDOUT, |w| w.handle()),
+                None => osyx_abi::STDOUT,
+            };
+            let mut c = Command::new(&paths[i]);
+            c.arg0(&words[0]).args(&words[1..]);
+            match c.spawn_stdio([stdin, stdout, osyx_abi::STDERR]) {
+                Ok(ch) => spawned.push((i, ch)),
+                Err(e) => {
+                    eprintln!("axis: {}: {e}", words[0]);
+                    drop(links);
+                    drop(inputs);
+                    drop(outputs);
+                    for (_, ch) in spawned {
+                        let _ = ch.wait();
+                    }
+                    return Ok(126);
+                }
+            }
+        }
+        let mut statuses = Vec::new();
+        statuses.resize(stages.len(), 0);
+        let mut leave = false;
+        if let Some(i) = builtin {
+            // Keep only the pipe ends the built-in itself uses; every other
+            // copy is closed here so the programs see end of data.
+            for (j, (r, w)) in links.iter_mut().enumerate() {
+                if !(inputs[i].is_none() && j + 1 == i) {
+                    *r = None;
+                }
+                if !(outputs[i].is_none() && j == i) {
+                    *w = None;
+                }
+            }
+            let stdin = match inputs[i].as_ref() {
+                Some(f) => f.handle(),
+                None if i > 0 => links[i - 1].0.as_ref().map_or(osyx_abi::STDIN, |r| r.handle()),
+                None => osyx_abi::STDIN,
+            };
+            let stdout = match outputs[i].as_ref() {
+                Some(f) => f.handle(),
+                None if i + 1 < cmds.len() => links[i].1.as_ref().map_or(osyx_abi::STDOUT, |w| w.handle()),
+                None => osyx_abi::STDOUT,
+            };
+            io::redirect_stdin(Some(stdin));
+            io::redirect_stdout(Some(stdout));
+            let args: Vec<&str> = cmds[i][1..].iter().map(String::as_str).collect();
+            match self.builtin(&cmds[i][0], &args) {
+                Some(Ok(code)) => statuses[i] = code,
+                Some(Err(Exit)) => {
+                    leave = true;
+                    statuses[i] = self.last;
+                }
+                None => statuses[i] = 127,
+            }
+            io::redirect_stdin(None);
+            io::redirect_stdout(None);
+        }
+        // Our copies of the pipe ends would keep readers waiting for end of
+        // data; the children hold their own.
+        drop(links);
+        drop(inputs);
+        drop(outputs);
+        for (i, ch) in spawned {
+            statuses[i] = match ch.wait() {
+                Ok(st) => report(&cmds[i][0], st),
+                Err(e) => {
+                    eprintln!("axis: {}: {e}", cmds[i][0]);
+                    126
+                }
+            };
+        }
+        if leave {
+            return Err(Exit);
+        }
+        Ok(statuses.pop().unwrap_or(0))
+    }
+}
+
+/// Commands AXIS answers itself instead of running a program.
+fn is_builtin(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "exit"
+            | "help"
+            | "pwd"
+            | "cd"
+            | "echo"
+            | "ls"
+            | "cat"
+            | "mkdir"
+            | "rmdir"
+            | "rm"
+            | "touch"
+            | "mv"
+            | "cp"
+            | "stat"
+            | "ps"
+            | "kill"
+            | "mounts"
+            | "df"
+            | "devices"
+            | "lsdev"
+            | "wifi"
+            | "volume"
+            | "dmesg"
+            | "beep"
+            | "play"
+            | "free"
+            | "uptime"
+            | "uname"
+            | "whoami"
+            | "env"
+            | "history"
+            | "clear"
+    )
 }
 
 struct Exit;
@@ -515,6 +905,18 @@ fn mode_string(mode: u32, dir: bool) -> String {
 }
 
 fn cmd_cat(args: &[&str]) -> os_std::error::Result<i32> {
+    if args.is_empty() {
+        let mut input = io::stdin();
+        let mut output = io::stdout();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = io::Read::read(&mut input, &mut buf)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            io::Write::write_all(&mut output, &buf[..n])?;
+        }
+    }
     each(args, |a| {
         let data = fs::read(a)?;
         let text = String::from_utf8_lossy(&data);
@@ -852,14 +1254,19 @@ fn tokenize_expr(s: &str) -> Result<Vec<String>, String> {
                 }
                 out.push(lit);
             }
-            '+' | '-' | '*' if !out.is_empty() && !is_op(out.last()) => {
+            '+' | '-' | '*' | '=' | '!' | '<' | '>' if !out.is_empty() && !is_op(out.last()) => {
                 chars.next();
-                out.push(String::from(c));
+                let mut op = String::from(c);
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    op.push('=');
+                }
+                out.push(op);
             }
             _ => {
                 let mut t = String::new();
                 while let Some(&ch) = chars.peek() {
-                    if ch == ' ' || ((ch == '+' || ch == '*' || ch == '-') && !t.is_empty()) {
+                    if ch == ' ' || (matches!(ch, '+' | '*' | '-' | '=' | '!' | '<' | '>') && !t.is_empty()) {
                         break;
                     }
                     t.push(ch);
@@ -873,5 +1280,33 @@ fn tokenize_expr(s: &str) -> Result<Vec<String>, String> {
 }
 
 fn is_op(t: Option<&String>) -> bool {
-    t.is_some_and(|t| t == "+" || t == "-" || t == "*")
+    t.is_some_and(|t| matches!(t.as_str(), "+" | "-" | "*" | "==" | "!=" | "<" | ">" | "<=" | ">="))
+}
+
+fn is_cmp(t: &str) -> bool {
+    matches!(t, "==" | "!=" | "<" | ">" | "<=" | ">=")
+}
+
+fn compare(op: &str, l: &Value, r: &Value) -> Result<bool, String> {
+    use core::cmp::Ordering;
+    let ord = match (l, r) {
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (a, b) => a.text().cmp(&b.text()),
+    };
+    Ok(match op {
+        "==" => ord == Ordering::Equal,
+        "!=" => ord != Ordering::Equal,
+        "<" => ord == Ordering::Less,
+        ">" => ord == Ordering::Greater,
+        "<=" => ord != Ordering::Greater,
+        ">=" => ord != Ordering::Less,
+        _ => return Err(format!("unknown operator {op:?}")),
+    })
+}
+
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Int(i) => *i != 0,
+        Value::Str(s) => !s.is_empty(),
+    }
 }

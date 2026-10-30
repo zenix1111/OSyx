@@ -1,5 +1,6 @@
-//! OSyx PE32+ loader core: API set schema, image layout and relocation,
-//! import binding with forwarders, and module initialisation order.
+//! OSyx PE loader core (PE32 and PE32+): API set schema, image layout and
+//! relocation, import binding with forwarders, and module initialisation
+//! order.
 //!
 //! `no_std` + `alloc` and free of system calls: the Windows runtime
 //! (`userspace/win32`) supplies a [`link::Host`] that maps memory and opens

@@ -47,6 +47,10 @@ pub const USER_HOME: &str = "/home/user";
 const PASSWORD_ROUNDS: u32 = 100_000;
 /// Copy buffer for file contents.
 const CHUNK: usize = 256 * 1024;
+/// Maximum command-line size accepted by the UEFI loader.
+const CMDLINE_MAX: usize = 4096;
+const LOADER: &str = "EFI/BOOT/BOOTX64.EFI";
+const LOADER_TEMP: &str = "EFI/BOOT/OSYX.TMP";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -86,18 +90,23 @@ impl Disk for Vec<u8> {
         self.len() as u64 / SECTOR
     }
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> core::result::Result<(), String> {
-        let at = (lba * SECTOR) as usize;
-        buf.copy_from_slice(self.get(at..at + buf.len()).ok_or("read past the end")?);
+        let range = disk_range(lba, buf.len()).ok_or("read past the end")?;
+        buf.copy_from_slice(self.get(range).ok_or("read past the end")?);
         Ok(())
     }
     fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), String> {
-        let at = (lba * SECTOR) as usize;
-        self.get_mut(at..at + buf.len()).ok_or("write past the end")?.copy_from_slice(buf);
+        let range = disk_range(lba, buf.len()).ok_or("write past the end")?;
+        self.get_mut(range).ok_or("write past the end")?.copy_from_slice(buf);
         Ok(())
     }
     fn flush(&mut self) -> core::result::Result<(), String> {
         Ok(())
     }
+}
+
+fn disk_range(lba: u64, len: usize) -> Option<core::ops::Range<usize>> {
+    let start = usize::try_from(lba.checked_mul(SECTOR)?).ok()?;
+    Some(start..start.checked_add(len)?)
 }
 
 /// A partition of a [`Disk`] seen as a device of its own.
@@ -113,7 +122,9 @@ impl<'a, D: Disk> Window<'a, D> {
     }
 
     fn check(&self, lba: u64, len: usize) -> bool {
-        lba.checked_add(len as u64 / SECTOR).is_some_and(|end| end <= self.sectors)
+        len.is_multiple_of(SECTOR as usize)
+            && self.first.checked_add(self.sectors).is_some_and(|end| end <= self.disk.sectors())
+            && lba.checked_add(len as u64 / SECTOR).is_some_and(|end| end <= self.sectors)
     }
 }
 
@@ -183,10 +194,10 @@ pub struct Plan {
 
 impl Plan {
     pub fn esp_mib(&self) -> u64 {
-        self.esp_sectors * SECTOR / MIB
+        self.esp_sectors / ALIGN
     }
     pub fn root_mib(&self) -> u64 {
-        self.root_sectors * SECTOR / MIB
+        self.root_sectors / ALIGN
     }
 }
 
@@ -205,18 +216,19 @@ pub fn plan(disk_sectors: u64, layout: Layout) -> Result<Plan> {
         return Err(Error::Invalid(format!("the system partition needs at least {MIN_ROOT_MIB} MiB")));
     }
     let esp_first = ALIGN;
-    let esp_sectors = esp_mib * MIB / SECTOR;
-    let root_first = esp_first + esp_sectors;
+    let too_large = || Error::Invalid("partition size is too large".into());
+    let esp_sectors = esp_mib.checked_mul(ALIGN).ok_or_else(too_large)?;
+    let root_first = esp_first.checked_add(esp_sectors).ok_or_else(too_large)?;
     let room = usable_end.saturating_sub(root_first) / ALIGN * ALIGN;
-    let root_sectors = if root_mib == 0 { room } else { root_mib * MIB / SECTOR };
+    let root_sectors = if root_mib == 0 { room } else { root_mib.checked_mul(ALIGN).ok_or_else(too_large)? };
     if root_sectors > room {
         return Err(Error::Invalid(format!(
             "the partitions need {} MiB but the disk has {} MiB",
-            esp_mib + root_mib + 2,
-            disk_sectors * SECTOR / MIB
+            esp_mib.saturating_add(root_mib).saturating_add(2),
+            disk_sectors / ALIGN
         )));
     }
-    if root_sectors * SECTOR < MIN_ROOT_MIB * MIB {
+    if root_sectors < MIN_ROOT_MIB * ALIGN {
         return Err(Error::Invalid(format!("the disk is too small: OSyx needs at least {MIN_DISK_MIB} MiB")));
     }
     Ok(Plan { disk_sectors, esp_first, esp_sectors, root_first, root_sectors })
@@ -306,6 +318,9 @@ pub fn validate(c: &Config) -> core::result::Result<(), String> {
     }
     if c.password.as_ref().is_some_and(|p| p.chars().count() < 4) {
         return Err("The password must have at least 4 characters (or none).".into());
+    }
+    if c.cmdline.len() > CMDLINE_MAX {
+        return Err("The kernel command line must not exceed 4096 bytes.".into());
     }
     Ok(())
 }
@@ -410,14 +425,47 @@ pub fn install<D: Disk, S: Source, P: Progress>(disk: &mut D, plan: &Plan, sourc
     if plan.disk_sectors != disk.sectors() {
         return Err(Error::Invalid("the plan was made for a different disk size".into()));
     }
+    let invalid_plan = || Error::Invalid("invalid partition plan".into());
+    let esp_end = plan.esp_first.checked_add(plan.esp_sectors).ok_or_else(invalid_plan)?;
+    let root_end = plan.root_first.checked_add(plan.root_sectors).ok_or_else(invalid_plan)?;
+    let usable_end = disk.sectors().checked_sub(33).ok_or_else(invalid_plan)?;
+    if plan.esp_first < ALIGN || plan.esp_sectors < MIN_ESP_MIB * ALIGN
+        || plan.root_sectors < MIN_ROOT_MIB * ALIGN || plan.root_first < esp_end || root_end > usable_end
+    {
+        return Err(invalid_plan());
+    }
+    let parts = [
+        NewPartition { type_guid: osyx_part::TYPE_ESP, unique_guid: guid(&config.seed, 1), first_lba: plan.esp_first, sectors: plan.esp_sectors, name: "EFI system partition" },
+        NewPartition { type_guid: osyx_part::TYPE_ROOT_X86_64, unique_guid: guid(&config.seed, 2), first_lba: plan.root_first, sectors: plan.root_sectors, name: "OSyx" },
+    ];
+    let table = osyx_part::build(disk.sectors(), guid(&config.seed, 0), &parts).map_err(|e| Error::Invalid(format!("partition table: {e:?}")))?;
     CLOCK.store(config.time, Ordering::Relaxed);
     // Fail before touching the disk if the boot files are missing.
     let boot = source.boot_files().map_err(Error::Source)?;
-    for need in ["EFI/BOOT/BOOTX64.EFI", "EFI/OSYX/KERNEL.ELF"] {
-        if !boot.iter().any(|(p, _)| p == need) {
-            return Err(Error::Source(format!("{need} is missing")));
+    for (index, (path, _)) in boot.iter().enumerate() {
+        if path.contains('\\') || path.chars().any(char::is_control)
+            || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(Error::Source(format!("invalid boot file path: {path}")));
+        }
+        if boot[..index].iter().any(|(other, _)| other.to_lowercase() == path.to_lowercase()) {
+            return Err(Error::Source(format!("duplicate boot file path: {path}")));
         }
     }
+    if boot.iter().filter(|(p, _)| p.eq_ignore_ascii_case(LOADER)).count() != 1
+        || boot.iter().any(|(p, _)| p.eq_ignore_ascii_case(LOADER_TEMP) || (p.eq_ignore_ascii_case(LOADER) && p != LOADER))
+    {
+        return Err(Error::Source("boot files contain a reserved loader path".into()));
+    }
+    for need in ["EFI/BOOT/BOOTX64.EFI", "EFI/OSYX/KERNEL.ELF"] {
+        if !boot.iter().any(|(p, data)| p == need && !data.is_empty()) {
+            return Err(Error::Source(format!("{need} is missing or empty")));
+        }
+    }
+    if config.cmdline.is_empty() && boot.iter().any(|(path, data)| path.eq_ignore_ascii_case("EFI/OSYX/CMDLINE.TXT") && data.len() > CMDLINE_MAX) {
+        return Err(Error::Source("the boot command line exceeds 4096 bytes".into()));
+    }
+    let total = estimate(source, "/", config).map_err(Error::Source)?.max(1);
 
     progress.stage(Stage::Partitioning, 0.0);
     // Wipe the first MiB of each partition so stale signatures never show
@@ -426,11 +474,6 @@ pub fn install<D: Disk, S: Source, P: Progress>(disk: &mut D, plan: &Plan, sourc
     for first in [plan.esp_first, plan.root_first] {
         disk.write(first, &zero).map_err(Error::Io)?;
     }
-    let parts = [
-        NewPartition { type_guid: osyx_part::TYPE_ESP, unique_guid: guid(&config.seed, 1), first_lba: plan.esp_first, sectors: plan.esp_sectors, name: "EFI system partition" },
-        NewPartition { type_guid: osyx_part::TYPE_ROOT_X86_64, unique_guid: guid(&config.seed, 2), first_lba: plan.root_first, sectors: plan.root_sectors, name: "OSyx" },
-    ];
-    let table = osyx_part::build(disk.sectors(), guid(&config.seed, 0), &parts).map_err(|e| Error::Invalid(format!("partition table: {e:?}")))?;
     for (lba, data) in table {
         disk.write(lba, &data).map_err(Error::Io)?;
     }
@@ -464,7 +507,6 @@ pub fn install<D: Disk, S: Source, P: Progress>(disk: &mut D, plan: &Plan, sourc
             return Err(Error::Io(format!("the new root is not writable: {why}")));
         }
         progress.stage(Stage::Copying, 0.06);
-        let total = estimate(source, "/", config).map_err(Error::Source)?.max(1);
         progress.log(&format!("copying {} MiB of system files", total / MIB));
         let mut copy = Copy { fs: &mut fs, source, config, report: &mut report, total, progress, buf: vec![0u8; CHUNK] };
         copy.dir("/", ROOT_INO)?;
@@ -482,17 +524,24 @@ pub fn install<D: Disk, S: Source, P: Progress>(disk: &mut D, plan: &Plan, sourc
     ));
 
     progress.stage(Stage::BootFiles, 0.94);
+    let mut expected_boot = Vec::new();
+    let mut boot_hashes = Vec::new();
     {
         let mut esp = osyx_fat::FileSystem::mount(Window::new(disk, plan.esp_first, plan.esp_sectors)).map_err(|e| fat_err("mounting the ESP", e))?;
         let mut files = boot;
         if !config.cmdline.is_empty() {
-            files.retain(|(p, _)| p != "EFI/OSYX/CMDLINE.TXT");
+            files.retain(|(p, _)| !p.eq_ignore_ascii_case("EFI/OSYX/CMDLINE.TXT"));
             files.push(("EFI/OSYX/CMDLINE.TXT".to_string(), config.cmdline.as_bytes().to_vec()));
         }
-        // The loader itself goes last: only a complete ESP is bootable.
+        // Keep the loader under a temporary name until verification succeeds.
         files.sort_by_key(|(p, _)| p == "EFI/BOOT/BOOTX64.EFI");
         for (path, data) in &files {
-            fat_write(&mut esp, path, data)?;
+            let written_path = if path == LOADER { LOADER_TEMP } else { path.as_str() };
+            fat_write(&mut esp, written_path, data)?;
+            expected_boot.push((written_path.to_string(), data.len() as u64));
+            let mut hash = osyx_crypto::Sha256::new();
+            hash.update(data);
+            boot_hashes.push((written_path.to_string(), hash.finish()));
             progress.log(&format!("ESP: {path} ({} bytes)", data.len()));
         }
         esp.unmount().map_err(|e| fat_err("unmounting the ESP", e))?;
@@ -500,14 +549,17 @@ pub fn install<D: Disk, S: Source, P: Progress>(disk: &mut D, plan: &Plan, sourc
     disk.flush().map_err(Error::Io)?;
 
     progress.stage(Stage::Verifying, 0.97);
-    verify(disk, plan, config, &files_expected(source)?)?;
+    verify(disk, plan, config, &expected_boot)?;
+    {
+        let mut esp = osyx_fat::FileSystem::mount(Window::new(disk, plan.esp_first, plan.esp_sectors)).map_err(|e| fat_err("ESP", e))?;
+        verify_boot_contents(&mut esp, &boot_hashes)?;
+        esp.rename(LOADER_TEMP, LOADER).map_err(|e| fat_err("publishing the boot loader", e))?;
+        esp.unmount().map_err(|e| fat_err("unmounting the ESP", e))?;
+    }
+    disk.flush().map_err(Error::Io)?;
     progress.log("verification passed");
     progress.stage(Stage::Done, 1.0);
     Ok(report)
-}
-
-fn files_expected<S: Source>(source: &mut S) -> Result<Vec<(String, u64)>> {
-    Ok(source.boot_files().map_err(Error::Source)?.into_iter().map(|(p, d)| (p, d.len() as u64)).collect())
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -520,17 +572,18 @@ fn skipped(path: &str, config: &Config) -> bool {
 
 /// Bytes of file data below `path` that will be copied.
 fn estimate<S: Source>(source: &mut S, path: &str, config: &Config) -> core::result::Result<u64, String> {
-    let mut sum = 0;
+    let mut sum = 0u64;
     for e in source.list(path)? {
         let p = join(path, &e.name);
         if EMPTY_DIRS.contains(&p.as_str()) || skipped(&p, config) {
             continue;
         }
-        match e.kind {
-            Kind::File => sum += e.size,
-            Kind::Dir => sum += estimate(source, &p, config)?,
-            Kind::Symlink(_) => {}
-        }
+        let size = match e.kind {
+            Kind::File => e.size,
+            Kind::Dir => estimate(source, &p, config)?,
+            Kind::Symlink(_) => 0,
+        };
+        sum = sum.checked_add(size).ok_or_else(|| format!("{path}: source size overflow"))?;
     }
     Ok(sum)
 }
@@ -571,6 +624,9 @@ impl<D: osyx_ext4::BlockDevice, S: Source, P: Progress> Copy<'_, D, S, P> {
                     let mut at = 0u64;
                     loop {
                         let n = self.source.read(&p, at, &mut self.buf).map_err(|x| Error::Source(format!("{p}: {x}")))?;
+                        if n > self.buf.len() {
+                            return Err(Error::Source(format!("{p}: read returned more bytes than the buffer")));
+                        }
                         if n == 0 {
                             break;
                         }
@@ -592,7 +648,7 @@ impl<D: osyx_ext4::BlockDevice, S: Source, P: Progress> Copy<'_, D, S, P> {
                         }
                     }
                     if at != e.size {
-                        self.progress.log(&format!("note: {p} changed size while copying ({} -> {at})", e.size));
+                        return Err(Error::Source(format!("{p} changed size while copying ({} -> {at})", e.size)));
                     }
                     self.report.files += 1;
                 }
@@ -683,7 +739,7 @@ fn fat_write<D: osyx_fat::BlockDevice>(fs: &mut osyx_fat::FileSystem<D>, path: &
     }
     let full = format!("/{path}");
     let mut f = fs
-        .open(&full, osyx_fat::OpenOptions { create: true, create_new: false, truncate: true })
+        .open(&full, osyx_fat::OpenOptions { create: true, create_new: true, truncate: false })
         .map_err(|e| fat_err(&full, e))?;
     let mut done = 0;
     while done < data.len() {
@@ -692,6 +748,26 @@ fn fat_write<D: osyx_fat::BlockDevice>(fs: &mut osyx_fat::FileSystem<D>, path: &
             return Err(Error::Io(format!("{full}: short write")));
         }
         done += n;
+    }
+    Ok(())
+}
+
+fn verify_boot_contents<D: osyx_fat::BlockDevice>(fs: &mut osyx_fat::FileSystem<D>, expected: &[(String, [u8; 32])]) -> Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    for (path, digest) in expected {
+        let mut file = fs.open(&format!("/{path}"), osyx_fat::OpenOptions::default())
+            .map_err(|e| Error::Verify(format!("ESP {path}: {e:?}")))?;
+        let mut hash = osyx_crypto::Sha256::new();
+        let mut offset = 0u64;
+        loop {
+            let n = fs.read(&mut file, offset, &mut buf).map_err(|e| Error::Verify(format!("ESP {path}: {e:?}")))?;
+            if n == 0 { break; }
+            hash.update(&buf[..n]);
+            offset += n as u64;
+        }
+        if hash.finish() != *digest {
+            return Err(Error::Verify(format!("ESP {path}: contents differ from source")));
+        }
     }
     Ok(())
 }
@@ -717,9 +793,6 @@ pub fn verify<D: Disk>(disk: &mut D, plan: &Plan, config: &Config, boot: &[(Stri
     {
         let mut fs = osyx_fat::FileSystem::mount(Window::new(disk, plan.esp_first, plan.esp_sectors)).map_err(|e| fat_err("ESP", e))?;
         for (path, size) in boot {
-            if path == "EFI/OSYX/CMDLINE.TXT" && !config.cmdline.is_empty() {
-                continue;
-            }
             let m = fs.metadata(&format!("/{path}")).map_err(|e| Error::Verify(format!("ESP {path}: {e:?}")))?;
             if m.size as u64 != *size {
                 return Err(Error::Verify(format!("ESP {path}: {} bytes instead of {size}", m.size)));
@@ -739,4 +812,37 @@ pub fn verify<D: Disk>(disk: &mut D, plan: &Plan, config: &Config, boot: &[(Stri
         return Err(Error::Verify("/etc/hostname has the wrong contents".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    #[test]
+    fn boot_write_refuses_short_name_alias() {
+        let mut image = vec![0; 64 * 1024 * 1024];
+        osyx_fat::format(&mut image, "TEST", 1).unwrap();
+        let mut fs = osyx_fat::FileSystem::mount(image).unwrap();
+        fat_write(&mut fs, "EFI/long filename.txt", b"original").unwrap();
+        assert!(fat_write(&mut fs, "EFI/LONGFI~1.TXT", b"replacement").is_err());
+        let mut file = fs.open("/EFI/long filename.txt", osyx_fat::OpenOptions::default()).unwrap();
+        let mut data = [0; 8];
+        assert_eq!(fs.read(&mut file, 0, &mut data).unwrap(), 8);
+        assert_eq!(&data, b"original");
+    }
+
+    #[test]
+    fn boot_verification_detects_same_size_corruption() {
+        let mut image = vec![0; 64 * 1024 * 1024];
+        osyx_fat::format(&mut image, "TEST", 1).unwrap();
+        let mut fs = osyx_fat::FileSystem::mount(image).unwrap();
+        fat_write(&mut fs, "EFI/test.bin", b"original").unwrap();
+        let mut hash = osyx_crypto::Sha256::new();
+        hash.update(b"original");
+        let expected = vec![(String::from("EFI/test.bin"), hash.finish())];
+        verify_boot_contents(&mut fs, &expected).unwrap();
+        let mut file = fs.open("/EFI/test.bin", osyx_fat::OpenOptions::default()).unwrap();
+        fs.write(&mut file, 0, b"altered!").unwrap();
+        assert!(matches!(verify_boot_contents(&mut fs, &expected), Err(Error::Verify(_))));
+    }
 }

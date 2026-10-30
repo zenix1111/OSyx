@@ -27,6 +27,10 @@ pub fn read_stdin(buf: &mut [u8]) -> Result<usize> {
     std::io::stdin().read(buf).map_err(|_| Error::new(ErrorKind::Other, "host read failed"))
 }
 
+pub fn read_handle(_handle: u64, buf: &mut [u8]) -> Result<usize> {
+    read_stdin(buf)
+}
+
 pub fn exit(code: i32) -> ! {
     std::process::exit(code)
 }

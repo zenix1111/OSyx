@@ -13,8 +13,9 @@
 //!   [`FsError::Corrupt`], never a panic or an endless loop.
 //!
 //! Single-threaded: callers serialise access (the kernel wraps a volume in a
-//! sleeping mutex). There is no clock yet, so timestamps are left at the FAT
-//! epoch (1980-01-01).
+//! sleeping mutex). The driver has no clock; callers set the time with
+//! [`FileSystem::set_time`] and entries carry a DOS date and time (2-second
+//! resolution, UTC).
 
 #![no_std]
 
@@ -185,16 +186,76 @@ pub struct FileSystem<D: BlockDevice> {
     pub(crate) free_count: u32,
     next_free: u32,
     fsinfo_dirty: bool,
+    fat_generation: u64,
+    /// Current time in seconds since 1970-01-01 UTC, clamped to the DOS
+    /// range; 0 means "not set" and keeps entries at the FAT epoch.
+    pub(crate) now: u32,
+}
+
+/// 1980-01-01 00:00:00 UTC, the earliest DOS timestamp.
+const DOS_EPOCH_SECS: i64 = 315_532_800;
+/// 2107-12-31 23:59:58 UTC, the latest.
+const DOS_LAST_SECS: i64 = 4_354_819_198;
+
+/// Days from 1970-01-01 to a civil date (proleptic Gregorian).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// DOS (date, time) for a Unix time.
+pub(crate) fn dos_date_time(secs: u32) -> (u16, u16) {
+    let secs = (secs as i64).clamp(DOS_EPOCH_SECS, DOS_LAST_SECS);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let date = (((y - 1980) as u16) << 9) | ((m as u16) << 5) | d as u16;
+    let time = ((rem / 3600) as u16) << 11 | ((rem % 3600 / 60) as u16) << 5 | (rem % 60 / 2) as u16;
+    (date, time)
+}
+
+/// Unix time for a DOS (date, time); 0 when the date is unset or invalid.
+pub(crate) fn dos_to_unix(date: u16, time: u16) -> u32 {
+    let (y, m, d) = ((date >> 9) as i64 + 1980, ((date >> 5) & 0xF) as i64, (date & 0x1F) as i64);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return 0;
+    }
+    let secs = days_from_civil(y, m, d) * 86_400 + (time >> 11) as i64 * 3600 + ((time >> 5) & 0x3F) as i64 * 60 + (time & 0x1F) as i64 * 2;
+    if secs < DOS_EPOCH_SECS { 0 } else { secs as u32 }
 }
 
 impl<D: BlockDevice> FileSystem<D> {
+    /// Sets the time stamped on created and modified entries (seconds since
+    /// 1970-01-01 UTC; anything before 1980 is clamped).
+    pub fn set_time(&mut self, unix_secs: i64) {
+        self.now = unix_secs.clamp(DOS_EPOCH_SECS, DOS_LAST_SECS) as u32;
+    }
+
+    /// (date, time) written to entries touched now.
+    pub(crate) fn timestamp(&self) -> (u16, u16) {
+        if self.now == 0 { (1 << 5 | 1, 0) } else { dos_date_time(self.now) }
+    }
+
     /// Mounts the FAT32 volume on `dev` (no partition table: the volume
     /// starts at sector 0).
     pub fn mount(mut dev: D) -> Result<Self> {
         let mut bs = [0u8; SECTOR_SIZE];
         dev.read_sectors(0, &mut bs)?;
         let geo = parse_bpb(&bs, dev.sector_count())?;
-        let mut fs = FileSystem { dev, geo, fat_cache: Vec::new(), free_count: 0, next_free: 2, fsinfo_dirty: false };
+        let mut fs = FileSystem { dev, geo, fat_cache: Vec::new(), free_count: 0, next_free: 2, fsinfo_dirty: false, fat_generation: 0, now: 0 };
         let mut have_info = false;
         if geo.fsinfo_sector != 0 && geo.fsinfo_sector != 0xFFFF && geo.fsinfo_sector < geo.reserved_sectors {
             let mut info = [0u8; SECTOR_SIZE];
@@ -218,6 +279,11 @@ impl<D: BlockDevice> FileSystem<D> {
             fs.free_count = fs.count_free()?;
             fs.fsinfo_dirty = true;
         }
+        // A label set by an operating system lives in the root directory;
+        // an unreadable root directory only costs the label.
+        if let Ok(Some(label)) = fs.root_dir_label() {
+            fs.geo.label = label;
+        }
         Ok(fs)
     }
 
@@ -225,7 +291,8 @@ impl<D: BlockDevice> FileSystem<D> {
         &self.geo
     }
 
-    /// Volume label from the boot sector (trailing spaces removed).
+    /// Volume label: the root directory's label entry if there is one, else
+    /// the boot sector's (trailing spaces removed).
     pub fn label(&self) -> &str {
         let l = &self.geo.label;
         let end = l.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |i| i + 1);
@@ -332,6 +399,7 @@ impl<D: BlockDevice> FileSystem<D> {
         let new = (old & !FAT_MASK) | (value & FAT_MASK);
         s.data[off..off + 4].copy_from_slice(&new.to_le_bytes());
         s.dirty = true;
+        self.fat_generation = self.fat_generation.saturating_add(1);
         Ok(())
     }
 
