@@ -1,9 +1,9 @@
 # Windows compatibility integration test.
 #
-# Boots OSyx with `init win,<tcp>,<udp>`: init runs the PE32+ test programs
-# of compatibility/win32/tests under /bin/winrun (minimal, hello, fileio,
-# threads + windll.dll, winsock against the host echo servers of
-# scripts/net-host.py, and the Win32 GUI program inside a PRISM session).
+# Boots OSyx with `init win,<tcp>,<udp>`: init runs the PE32+ and PE32 test
+# programs of compatibility/win32/tests under /bin/winrun (minimal, hello,
+# hello32, fileio, threads + windll.dll, winsock against the host echo servers
+# of scripts/net-host.py, and the Win32 GUI program inside a PRISM session).
 # Each program prints its own "ok"/"FAIL" lines and a summary; init checks
 # the exit codes. Evidence comes from the serial log.
 param(
@@ -63,6 +63,9 @@ $t = Read-Shared $log
 foreach ($m in [regex]::Matches($t, '\[winrun:\d+\]\s+(ok|FAIL)\s+(.+)')) {
     Record ("win32: " + $m.Groups[2].Value.Trim()) ($m.Groups[1].Value -eq 'ok') ''
 }
+# hello32.exe prints no per-program summary (no C runtime, no check helpers),
+# so its evidence is the marker line and the exit code check in win_checks.
+Record 'hello32.exe printed the 32-bit marker' ($t -match 'hello32: 32-bit code ran') ''
 foreach ($p in 'hello', 'fileio', 'threads', 'winsock', 'wsock32', 'wsaext', 'k32ansi', 'k32xul', 'advapi', 'newdlls', 'pipes', 'gdi2', 'gui', 'sysadmin', 'version', 'synch', 'prio', 'security', 'exceptions', 'mapping', 'runtime', 'seh', 'platform', 'shell', 'winmm', 'sandbox', 'ole2', 'msgwait', 'dwm', 'keyboard', 'input', 'shlpath', 'secattr', 'childproc', 'imageshare', 'dwrite', 'interop', 'ucrt', 'crt2', 'crt3', 'crt4') {
     $s = [regex]::Match($t, "\[winrun:\d+\] ${p}: (\d+) passed, (\d+) failed")
     Record "$p.exe summary" ($s.Success -and $s.Groups[2].Value -eq '0') $s.Value

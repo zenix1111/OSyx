@@ -121,6 +121,59 @@ pub trait SectorReader {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), GptError>;
 }
 
+/// One primary entry of a classic MBR partition table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MbrEntry {
+    /// 1-based slot (1..=4).
+    pub number: u32,
+    /// The partition type byte (0x07 NTFS/exFAT, 0x0B/0x0C FAT32, 0x83 Linux).
+    pub kind: u8,
+    pub bootable: bool,
+    pub first_lba: u64,
+    pub sectors: u64,
+}
+
+/// Reads the primary entries of an MBR in sector 0. Empty slots, extended
+/// containers (0x05, 0x0F, 0x85), the GPT protective entry (0xEE) and
+/// entries outside the disk are left out. `NotGpt` means "no MBR boot
+/// signature": the sector may hold a file system directly.
+///
+/// A FAT boot sector carries the same 0x55AA signature, so a sector that
+/// looks like a volume boot record (jump instruction and a plausible
+/// bytes-per-sector value) is not taken for a partition table.
+pub fn parse_mbr<R: SectorReader>(r: &mut R) -> Result<Vec<MbrEntry>, GptError> {
+    let mut s = [0u8; SECTOR];
+    r.read(0, &mut s)?;
+    if s[510] != 0x55 || s[511] != 0xAA {
+        return Err(GptError::NotGpt);
+    }
+    let bytes_per_sector = u16::from_le_bytes([s[11], s[12]]);
+    let jump = s[0] == 0xEB || s[0] == 0xE9;
+    let exfat = &s[3..11] == b"EXFAT   ";
+    if exfat || (jump && matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) && s[13].is_power_of_two()) {
+        return Err(GptError::NotGpt);
+    }
+    let disk = r.sectors();
+    let mut out: Vec<MbrEntry> = Vec::new();
+    for i in 0..4 {
+        let e = &s[446 + i * 16..446 + (i + 1) * 16];
+        let kind = e[4];
+        if kind == 0 || matches!(kind, 0x05 | 0x0F | 0x85 | 0xEE) || (e[0] != 0 && e[0] != 0x80) {
+            continue;
+        }
+        let first_lba = le32(e, 8) as u64;
+        let sectors = le32(e, 12) as u64;
+        if sectors == 0 || first_lba == 0 || first_lba.checked_add(sectors).is_none_or(|end| end > disk) {
+            continue;
+        }
+        if out.iter().any(|o| first_lba < o.first_lba + o.sectors && o.first_lba < first_lba + sectors) {
+            continue;
+        }
+        out.push(MbrEntry { number: i as u32 + 1, kind, bootable: e[0] == 0x80, first_lba, sectors });
+    }
+    Ok(out)
+}
+
 static CRC_TABLE: [u32; 256] = {
     let mut t = [0u32; 256];
     let mut i = 0;
@@ -180,12 +233,12 @@ fn read_header<R: SectorReader>(r: &mut R, lba: u64) -> Result<Table, GptError> 
     if esize < ENTRY_SIZE || !esize.is_multiple_of(8) || esize > SECTOR * 8 || count == 0 || count > MAX_ENTRIES {
         return Err(GptError::Corrupt("bad partition entry geometry"));
     }
-    if first < 2 || last >= disk || first > last {
+    if first < 2 || last >= disk - 1 || first > last {
         return Err(GptError::Corrupt("usable range outside the disk"));
     }
     let bytes = count as usize * esize;
     let array_sectors = bytes.div_ceil(SECTOR) as u64;
-    if entries_lba < 2 || entries_lba.checked_add(array_sectors).is_none_or(|e| e > disk) {
+    if entries_lba < 2 || entries_lba.checked_add(array_sectors).is_none_or(|e| e > disk - 1) {
         return Err(GptError::Corrupt("partition array outside the disk"));
     }
     // The array must not overlap the usable area.
@@ -240,7 +293,6 @@ pub fn parse<R: SectorReader>(r: &mut R) -> Result<Table, GptError> {
     }
     match read_header(r, 1) {
         Ok(t) => Ok(t),
-        Err(GptError::Io) => Err(GptError::Io),
         Err(primary) => {
             let backup = r.sectors() - 1;
             match read_header(r, backup) {
@@ -274,11 +326,19 @@ pub fn build(disk_sectors: u64, disk_guid: Guid, parts: &[NewPartition<'_>]) -> 
         return Err(GptError::Corrupt("disk too small"));
     }
     let mut array = vec![0u8; ENTRY_COUNT * ENTRY_SIZE];
+    let mut ranges = Vec::with_capacity(parts.len());
     for (i, p) in parts.iter().enumerate() {
-        let end = p.first_lba + p.sectors - 1;
-        if p.sectors == 0 || p.first_lba < first || end > last {
+        if p.type_guid.is_zero() {
+            return Err(GptError::Corrupt("partition type is zero"));
+        }
+        let end = p.sectors.checked_sub(1).and_then(|n| p.first_lba.checked_add(n)).ok_or(GptError::Corrupt("partition outside the usable range"))?;
+        if p.first_lba < first || end > last {
             return Err(GptError::Corrupt("partition outside the usable range"));
         }
+        if ranges.iter().any(|&(start, stop)| p.first_lba <= stop && start <= end) {
+            return Err(GptError::Corrupt("partitions overlap"));
+        }
+        ranges.push((p.first_lba, end));
         let e = &mut array[i * ENTRY_SIZE..(i + 1) * ENTRY_SIZE];
         e[0..16].copy_from_slice(&p.type_guid.0);
         e[16..32].copy_from_slice(&p.unique_guid.0);

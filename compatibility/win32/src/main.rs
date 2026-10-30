@@ -1,4 +1,4 @@
-//! `winrun` — runs Windows x64 (PE32+) programs on OSyx.
+//! `winrun` — runs Windows x64 (PE32+) and 32-bit (PE32) programs on OSyx.
 //!
 //! `winrun [-v] program.exe [arguments...]` loads the program and the DLLs
 //! it needs through the OSyx PE loader (`osyx-pe-loader`), with OSyx's own
@@ -7,6 +7,10 @@
 //! a Windows-sized stack, runs DLL initialisation and calls the entry
 //! point. The program's exit code is winrun's exit code. A fault in the
 //! program ends only this process.
+//!
+//! A PE32 program is mapped below 4 GiB and entered in compatibility mode
+//! through the 32-bit bridge; winrun itself is linked at 0x4000_0000 so all
+//! of its code stays addressable by 32-bit code.
 
 #![no_std]
 #![no_main]
@@ -80,10 +84,12 @@ mod inherit;
 mod propsys;
 mod pipes;
 mod ws2_32;
+mod wow64;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use os_std::prelude::*;
+use osyx_pe::PeFile;
 
 /// `-v`: the module summary, every thread as it starts, and the loader's
 /// diagnostics. Set once in `main` before anything else runs.
@@ -233,6 +239,23 @@ fn main() -> i32 {
     kernel32::init_process(&exe, &cmd, env);
     winsta::clear_markers();
     exceptions::install();
+    // A 32-bit image cannot start through the PE32+ path: it is linked at
+    // 0x400000, must stay below 4 GiB and is entered in compatibility mode
+    // through the bridge. Read the file to tell the widths apart; the PE32+
+    // path below reads it again exactly as before.
+    if let Ok(bytes) = os_std::fs::read(&exe) {
+        if PeFile::parse_any(&bytes).is_ok_and(|pe| pe.is_pe32()) {
+            let mut args = args.clone();
+            if let Some(a) = args.first_mut() {
+                *a = exe.clone();
+            }
+            if let Err(e) = loader::run_pe32(bytes, &args, &cmd, &env_strings) {
+                eprintln!("winrun: {e}");
+                return 126;
+            }
+            return 0;
+        }
+    }
     let started = match loader::start(&exe, &cmd, &env_strings) {
         Ok(s) => s,
         Err(e) => {

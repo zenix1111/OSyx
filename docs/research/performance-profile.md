@@ -53,17 +53,19 @@ Earlier runs on an already used profile (no crash) reached the title after
 
 ## Still open (from the profile)
 
-* One process table lock still guards handle lookups (channel and wait
-  syscalls, 3 s), mappings and page faults; `smp::enter_kernel` (entry lock)
-  rose to 4.3 s once the browser ran faster.
-* `omni.ja` (177 MiB) is read completely when mapped (about 1.5 s); demand
-  paging would read only what is touched.
-* virtio-blk keeps one request in flight.
-* Software WebRender copies the frame twice (`memcpy` in `winrun` and
+* The process table lock no longer guards handle lookups: they live in
+  their own table (`HANDLES`). Mappings and page faults still share `TABLE`,
+  and `smp::enter_kernel` (entry lock) rose to 4.3 s once the browser ran
+  faster.
+* `omni.ja` (177 MiB) is no longer read when mapped: a read-only section
+  loads 256 KiB runs on first touch. virtio-blk still keeps one request in
+  flight, so the run is a synchronous disk read.
+* PRISM already renders and presents only damaged rectangles. The remaining
+  full-frame copies are in the Win32 path (`memcpy` in `winrun` and
   `vcruntime140`, 5-6 s over 40 s); prism recomposes about 27 frames/s while
   the page animates.
-* No GPU acceleration: Gecko runs software WebRender (`gfx.webrender.software`)
-  because OSyx has no Direct3D/OpenGL driver; VirtIO-GPU is used as a 2D
-  scan-out only.
+* No GPU acceleration beyond XSAVE/AVX state: Gecko runs software WebRender
+  (`gfx.webrender.software`) because OSyx has no Direct3D/OpenGL driver;
+  VirtIO-GPU is used as a 2D scan-out only.
 * The Gecko sandbox is still disabled (`MOZ_DISABLE_*` switches in
   `userspace/apps/src/bin/init.rs`).

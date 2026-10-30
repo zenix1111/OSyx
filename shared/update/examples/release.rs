@@ -22,7 +22,12 @@ const SETUP_ESP: &str = "system/share/osyx-setup/esp/";
 const SETUP_DIR: &str = "system/share/osyx-setup/";
 
 fn octal(field: &[u8]) -> Result<u64, String> {
-    let s: String = field.iter().take_while(|&&b| b != 0 && b != b' ').map(|&b| b as char).collect();
+    let start = field.iter().position(|&b| b != b' ').unwrap_or(field.len());
+    let end = field[start..].iter().position(|&b| b == 0 || b == b' ').map_or(field.len(), |i| start + i);
+    if field[end..].iter().any(|&b| b != 0 && b != b' ') {
+        return Err(String::from("bad octal field padding"));
+    }
+    let s: String = field[start..end].iter().map(|&b| b as char).collect();
     let s = s.trim();
     if s.is_empty() {
         return Ok(0);
@@ -30,8 +35,9 @@ fn octal(field: &[u8]) -> Result<u64, String> {
     u64::from_str_radix(s, 8).map_err(|_| format!("bad octal field {s:?}"))
 }
 
-fn text(field: &[u8]) -> String {
-    String::from_utf8_lossy(&field[..field.iter().position(|&b| b == 0).unwrap_or(field.len())]).into_owned()
+fn text(field: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(&field[..field.iter().position(|&b| b == 0).unwrap_or(field.len())])
+        .map_err(|_| String::from("archive path is not UTF-8"))
 }
 
 /// Regular files of a ustar archive: (path without "./", mode, data).
@@ -43,9 +49,14 @@ fn tar_files(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
         if h.iter().all(|&b| b == 0) {
             break;
         }
-        let mut name = text(&h[0..100]);
+        let checksum = octal(&h[148..156])?;
+        let actual: u64 = h.iter().enumerate().map(|(i, &b)| if (148..156).contains(&i) { 32 } else { b as u64 }).sum();
+        if checksum != actual {
+            return Err(String::from("archive header checksum mismatch"));
+        }
+        let mut name = text(&h[0..100])?.to_string();
         if &h[257..262] == b"ustar" {
-            let prefix = text(&h[345..500]);
+            let prefix = text(&h[345..500])?;
             if !prefix.is_empty() {
                 name = format!("{prefix}/{name}");
             }
@@ -63,7 +74,13 @@ fn tar_files(data: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
         } else if kind != b'5' && kind != b'2' {
             return Err(format!("{name}: unsupported archive entry type {:?} (use --format=ustar)", kind as char));
         }
-        at = body + size.div_ceil(512) * 512;
+        at = body.checked_add(size.div_ceil(512).checked_mul(512).ok_or("archive size overflow")?).ok_or("archive size overflow")?;
+        if at > data.len() {
+            return Err(format!("{name}: archive padding truncated"));
+        }
+    }
+    if at < data.len() && data.len() - at < 512 {
+        return Err(String::from("archive header truncated"));
     }
     Ok(out)
 }
@@ -158,5 +175,71 @@ fn main() {
     if let Err(e) = r {
         eprintln!("release: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_checksum(header: &mut [u8]) {
+        header[148..156].fill(b' ');
+        let sum: u64 = header[..512].iter().map(|&b| b as u64).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    }
+
+    #[test]
+    fn octal_rejects_non_padding_after_terminator() {
+        assert_eq!(octal(b"  0017\0 ").unwrap(), 15);
+        assert_eq!(octal(b"        ").unwrap(), 0);
+        assert!(octal(b"1 7\0").is_err());
+        assert!(octal(b"1\0x ").is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_header_and_padding() {
+        assert!(tar_files(&[1; 100]).is_err());
+        let mut archive = vec![0; 513];
+        archive[..4].copy_from_slice(b"test");
+        archive[124..126].copy_from_slice(b"1\0");
+        set_checksum(&mut archive);
+        assert!(tar_files(&archive).is_err());
+        archive.resize(1024, 0);
+        assert_eq!(tar_files(&archive).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_corrupted_header() {
+        let mut archive = vec![0; 512];
+        archive[..4].copy_from_slice(b"test");
+        set_checksum(&mut archive);
+        assert!(tar_files(&archive).is_ok());
+        archive[0] ^= 1;
+        assert!(tar_files(&archive).is_err());
+    }
+
+    #[test]
+    fn rejects_non_utf8_path() {
+        let mut archive = vec![0; 512];
+        archive[0] = 0xff;
+        set_checksum(&mut archive);
+        assert!(tar_files(&archive).is_err());
+    }
+
+    #[test]
+    fn reads_generated_ustar_archive() {
+        let dir = std::env::temp_dir();
+        let name = format!("osyx-ustar-test-{}", std::process::id());
+        let path = dir.join(&name);
+        std::fs::write(&path, b"test data").unwrap();
+        let executable = if Path::new("C:/msys64/usr/bin/tar.exe").exists() { "C:/msys64/usr/bin/tar.exe" } else { "tar" };
+        let result = std::process::Command::new(executable).arg("--format=ustar").args(["-cf", "-", "-C"]).arg(&dir).arg(&name).output();
+        std::fs::remove_file(&path).unwrap();
+        let output = result.expect("tar must be available for archive interoperability testing");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let files = tar_files(&output.stdout).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, name);
+        assert_eq!(files[0].2, b"test data");
     }
 }

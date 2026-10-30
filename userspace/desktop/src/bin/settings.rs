@@ -32,6 +32,39 @@ use prism_client::WindowSpec;
 os_std::entry!(main);
 
 const SIDEBAR: u32 = 240;
+/// Written by the update daemon (root) and read here.
+const UPDATE_STATUS: &str = "/run/update.status";
+/// Where Settings asks the daemon (`osyx-update --daemon`, root) for a check
+/// (`check`) or an installation (`install`); the daemon removes it.
+const UPDATE_REQUEST: &str = "/etc/osyx/update.request";
+
+/// State of the system update service: (state, version, detail).
+fn update_state() -> (String, String, String) {
+    let text = fs::read_to_string(UPDATE_STATUS).unwrap_or_default();
+    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k).map(|v| String::from(v.trim()))).unwrap_or_default();
+    (field("state "), field("version "), field("detail "))
+}
+
+/// What to tell the user about the update service.
+fn update_text() -> String {
+    if fs::metadata("/etc/osyx/installed").is_err() {
+        return String::from("Updates are only available on an installed system");
+    }
+    if fs::metadata("/etc/osyx/update.conf").is_err() {
+        return String::from("Updates are not configured (no /etc/osyx/update.conf)");
+    }
+    let (state, version, detail) = update_state();
+    match state.as_str() {
+        "checking" => String::from("Checking for updates..."),
+        "up-to-date" => String::from("OSyx is up to date"),
+        "available" => format!("Version {version} is available"),
+        "downloading" => format!("Downloading {version} {detail}"),
+        "installing" => format!("Installing {version}..."),
+        "installed" => format!("{version} is installed: restart to finish"),
+        "failed" => format!("Failed: {detail}"),
+        _ => String::from("Not checked yet (the service checks once a day)"),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -92,6 +125,8 @@ struct Settings {
     addr: TextField,
     gateway: TextField,
     apply_net: Button,
+    check_update: Button,
+    install_update: Button,
     status: String,
     focus: usize,
 }
@@ -185,6 +220,8 @@ impl App for Settings {
         self.addr.rect = Rect::new(c.x + 160, c.y + 262, 220, 34);
         self.gateway.rect = Rect::new(c.x + 160, c.y + 306, 220, 34);
         self.apply_net.rect = Rect::new(c.x + 390, c.y + 306, 120, 34);
+        self.check_update.rect = Rect::new(c.x + 16, c.y + 419, 180, 34);
+        self.install_update.rect = Rect::new(c.x + 206, c.y + 419, 160, 34);
     }
 
     fn event(&mut self, ev: Ui, cx: &mut Ctx) -> bool {
@@ -253,8 +290,10 @@ impl App for Settings {
         let mut redraw = false;
         match self.section {
             Section::General => {
-                redraw |= self.hostname.event(&ev, cx.focused && self.focus == 0, &cx.fonts).needs_redraw();
-                if self.save_host.event(&ev, cx.focused) == Response::Submitted {
+                let typed = self.hostname.event_with_clipboard(&ev, cx.focused && self.focus == 0, &cx.fonts, &mut cx.clipboard);
+                redraw |= typed.needs_redraw();
+                let activated = matches!(self.save_host.event(&ev, cx.focused), Response::Activated(_));
+                if activated || typed == Response::Submitted {
                     let h = self.hostname.text().trim().to_string();
                     self.status =
                         if h.is_empty() || h.len() > 63 || !h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -265,10 +304,32 @@ impl App for Settings {
                     redraw = true;
                 }
             }
+            Section::About => {
+                let can_ask = fs::metadata("/etc/osyx/installed").is_ok();
+                let available = update_state().0 == "available";
+                if matches!(self.check_update.event(&ev, cx.focused), Response::Activated(_)) {
+                    self.status = if !can_ask {
+                        String::from("Updates are only available on an installed system")
+                    } else {
+                        match fs::write(UPDATE_REQUEST, "check\n") {
+                            Ok(()) => String::from("Checking for updates..."),
+                            Err(e) => format!("Cannot ask the update service: {e}"),
+                        }
+                    };
+                    redraw = true;
+                }
+                if available && matches!(self.install_update.event(&ev, cx.focused), Response::Activated(_)) {
+                    self.status = match fs::write(UPDATE_REQUEST, "install\n") {
+                        Ok(()) => String::from("Installing the update: the status above follows the download"),
+                        Err(e) => format!("Cannot ask the update service: {e}"),
+                    };
+                    redraw = true;
+                }
+            }
             Section::Network => {
-                redraw |= self.addr.event(&ev, cx.focused && self.focus == 1, &cx.fonts).needs_redraw();
-                redraw |= self.gateway.event(&ev, cx.focused && self.focus == 2, &cx.fonts).needs_redraw();
-                if self.dhcp.event(&ev, cx.focused) == Response::Submitted {
+                redraw |= self.addr.event_with_clipboard(&ev, cx.focused && self.focus == 1, &cx.fonts, &mut cx.clipboard).needs_redraw();
+                redraw |= self.gateway.event_with_clipboard(&ev, cx.focused && self.focus == 2, &cx.fonts, &mut cx.clipboard).needs_redraw();
+                if matches!(self.dhcp.event(&ev, cx.focused), Response::Activated(_)) {
                     self.status = match self.configure_network(true) {
                         Ok(()) => String::from("DHCP requested"),
                         Err(e) => format!("Cannot switch to DHCP: {e}"),
@@ -276,7 +337,7 @@ impl App for Settings {
                     redraw = true;
                 }
                 let _ = self.static_btn.event(&ev, cx.focused);
-                if self.apply_net.event(&ev, cx.focused) == Response::Submitted {
+                if matches!(self.apply_net.event(&ev, cx.focused), Response::Activated(_)) {
                     self.status = match self.configure_network(false) {
                         Ok(()) => format!("Static address {} applied", self.addr.text()),
                         Err(e) => format!("Cannot apply the static address: {e}"),
@@ -503,6 +564,12 @@ impl App for Settings {
                 for (i, (k, v)) in rows.iter().enumerate() {
                     Self::row(p, Rect::new(g.x, g.y + i as i32 * 40, g.w, 40), k, v);
                 }
+                let u = Self::group(p, Rect::new(c.x, c.y + 350, c.w, 26 + 2 * 40), "System update");
+                Self::row(p, Rect::new(u.x, u.y, u.w, 40), "Status", &update_text());
+                self.check_update.draw(p, cx.focused);
+                if update_state().0 == "available" {
+                    self.install_update.draw(p, cx.focused);
+                }
             }
         }
         if !self.status.is_empty() {
@@ -543,6 +610,8 @@ fn main() -> i32 {
             &Settings::net_iface().map_or(String::from("0.0.0.0"), |i| format!("{}", os_std::net::Ipv4Addr(i.gateway))),
         ),
         apply_net: Button::new(4, "Apply", ButtonStyle::Primary),
+        check_update: Button::new(5, "Check for updates", ButtonStyle::Secondary),
+        install_update: Button::new(6, "Install update", ButtonStyle::Primary),
         status: String::new(),
         focus: 0,
     };
