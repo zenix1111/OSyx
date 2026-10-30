@@ -335,6 +335,7 @@ pub struct Compositor {
     hover: Option<(WindowId, Part)>,
     pointer_in: Option<WindowId>,
     grab: Option<Grab>,
+    file_drag: Option<(WindowId, String, i32, i32)>,
     modifiers: u32,
     damage: Damage,
     ghosts: Vec<Ghost>,
@@ -382,6 +383,7 @@ impl Compositor {
             hover: None,
             pointer_in: None,
             grab: None,
+            file_drag: None,
             modifiers: 0,
             damage: Damage::new(),
             ghosts: Vec::new(),
@@ -503,6 +505,7 @@ impl Compositor {
         for w in wins {
             self.destroy_window(w, true);
         }
+        if self.file_drag.as_ref().is_some_and(|(id, _, _, _)| !self.windows.contains_key(id)) { self.file_drag = None; }
         self.clients.remove(&c);
         self.outbox.retain(|(to, _)| *to != c);
         if let Some(Grab::Content { win } | Grab::Move { win, .. } | Grab::Resize { win, .. } | Grab::Button { win, .. }) = self.grab {
@@ -761,6 +764,14 @@ impl Compositor {
                 self.window_action(id, action);
                 Ok(())
             }
+            Request::FileDrag { window, path } => {
+                let id = self.local_window(c, window)?;
+                if matches!(self.grab, Some(Grab::Content { win }) if win == id)
+                    && self.buttons & 1 != 0 && path.starts_with('/') && !path.contains('\0') && !path.is_empty() {
+                    self.file_drag = Some((id, path, self.ptr_x, self.ptr_y));
+                }
+                Ok(())
+            }
             Request::ClipboardSet { entries } => {
                 self.clipboard = entries;
                 self.clipboard_seq += 1;
@@ -956,6 +967,7 @@ impl Compositor {
                 }
             }
         }
+        if self.file_drag.as_ref().is_some_and(|(source, _, _, _)| *source == id) { self.file_drag = None; }
         if self.pointer_in == Some(id) {
             self.pointer_in = None;
         }
@@ -1517,6 +1529,20 @@ impl Compositor {
             self.buttons &= !bit;
         }
         if !pressed {
+            if button == 1 {
+                if let Some((source, path, x, y)) = self.file_drag.take() {
+                    if (self.ptr_x - x).abs().max((self.ptr_y - y).abs()) > 5 {
+                        if let Some((id, Part::Content)) = self.top_window_at(self.ptr_x, self.ptr_y) {
+                            if id != source {
+                                if let Some(w) = self.windows.get(&id) {
+                                    let (client, window, x, y) = (w.client, w.local, self.ptr_x - w.rect.x, self.ptr_y - w.rect.y);
+                                    self.send(client, Event::FileDrop { window, x, y, path });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             match self.grab {
                 Some(Grab::Content { win }) => {
                     if self.windows.contains_key(&win) {

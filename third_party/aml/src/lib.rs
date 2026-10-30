@@ -299,6 +299,10 @@ impl AmlContext {
             Target::Debug => todo!(),
             Target::Arg(arg) => self.current_arg(*arg),
             Target::Local(local) => self.local(*local),
+            Target::Index(object, position) => match self.read_target(object)? {
+                AmlValue::Package(items) => items.get(*position).ok_or(AmlError::FieldInvalidAccessSize),
+                _ => Err(AmlError::FieldInvalidAccessSize),
+            },
         }
     }
 
@@ -379,6 +383,31 @@ impl AmlContext {
                  */
                 self.method_context.as_mut().unwrap().locals[local_num as usize] = Some(value.clone());
                 Ok(value)
+            }
+
+            Target::Index(object, position) => {
+                // Only packages hold elements that can be replaced.
+                let container: &mut AmlValue = match *object {
+                    Target::Name(ref path) => {
+                        let (_, handle) = self.namespace.search(path, &self.current_scope)?;
+                        self.namespace.get_mut(handle)?
+                    }
+                    Target::Local(local_num) => {
+                        let ctx = self.method_context.as_mut().ok_or(AmlError::NotExecutingControlMethod)?;
+                        ctx.locals[local_num as usize].as_mut().ok_or(AmlError::InvalidLocalAccess(local_num))?
+                    }
+                    _ => return Err(AmlError::FieldInvalidAccessSize),
+                };
+                match container {
+                    AmlValue::Package(items) => match items.get_mut(position) {
+                        Some(slot) => {
+                            *slot = value.clone();
+                            Ok(value)
+                        }
+                        None => Err(AmlError::FieldInvalidAccessSize),
+                    },
+                    _ => Err(AmlError::FieldInvalidAccessSize),
+                }
             }
 
             Target::Null => Ok(value),

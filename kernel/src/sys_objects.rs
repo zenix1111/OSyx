@@ -315,7 +315,7 @@ pub fn filemap_create(file: u64, size: u64, writable: u64) -> Result<u64, Errno>
 pub fn filemap_map(handle: u64, offset: u64, len: u64, writable: u64) -> Result<u64, Errno> {
     if writable > 1 { return Err(Errno::InvalidArgument); }
     let Object::FileMap(section) = process::get_object(handle)? else { return Err(Errno::BadHandle) };
-    section.map(offset, len, writable != 0)
+    crate::filemap::Section::map(&section, offset, len, writable != 0)
 }
 
 /// The shared-image key of `file` at `[addr, addr + len)` for the caller.

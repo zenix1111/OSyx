@@ -1,0 +1,9 @@
+[package]
+name = "osyx-font"
+description = "Shared font outline support for OSyx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ttf-parser = { version = "0.25.1", default-features = false, features = ["no-std-float", "variable-fonts"] }

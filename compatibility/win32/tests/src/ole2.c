@@ -3,6 +3,7 @@
 #include <objbase.h>
 #define COBJMACROS
 #include <ole2.h>
+#include <shellapi.h>
 _Static_assert(sizeof(HRESULT)==4 && sizeof(APTTYPE)==4 && sizeof(APTTYPEQUALIFIER)==4,"COM apartment ABI");
 
 static int is_sta(void) {
@@ -114,6 +115,25 @@ static void drag_drop(void) {
     DestroyWindow(w);
 }
 
+static void file_drop_data(void) {
+    const WCHAR path[] = L"C:\\Users\\user\\photo.png";
+    struct DropHeader { DWORD offset; LONG x, y; BOOL nonclient, wide; };
+    SIZE_T bytes = sizeof(struct DropHeader) + sizeof(path) + sizeof(WCHAR);
+    HDROP drop = (HDROP)GlobalAlloc(GMEM_FIXED | GMEM_ZEROINIT, bytes);
+    check("allocate file drop", drop != NULL);
+    if (!drop) return;
+    struct DropHeader *header = (struct DropHeader *)drop;
+    header->offset = sizeof(struct DropHeader);
+    header->wide = TRUE;
+    memcpy((BYTE *)drop + sizeof(struct DropHeader), path, sizeof(path));
+    WCHAR out[128];
+    check_eq("file drop count", DragQueryFileW(drop, 0xffffffff, NULL, 0), 1);
+    check_eq("file drop path length", DragQueryFileW(drop, 0, NULL, 0), (sizeof(path) / sizeof(WCHAR)) - 1);
+    check("file drop path", DragQueryFileW(drop, 0, out, 128) == (sizeof(path) / sizeof(WCHAR)) - 1 && mem_eq(out, path, sizeof(path)));
+    check_eq("file drop truncation", DragQueryFileW(drop, 0, out, 4), 3);
+    GlobalFree((HGLOBAL)drop);
+}
+
 static void mta_usage(void) {
     CO_MTA_USAGE_COOKIE c=0;
     check_eq("CoIncrementMTAUsage",CoIncrementMTAUsage(&c),S_OK);
@@ -128,6 +148,7 @@ void __stdcall start(void) {
     ole_apartments();
     guid_strings();
     drag_drop();
+    file_drop_data();
     mta_usage();
     finish("ole2");
 }

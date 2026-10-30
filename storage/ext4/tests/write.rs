@@ -2,7 +2,7 @@
 //! independent implementation) when WSL with e2fsprogs is available, and
 //! with the driver's own consistency check.
 
-use osyx_ext4::{BlockDevice, Error, Ext4, MountOptions, NewKind, ROOT_INO};
+use osyx_ext4::{format, BlockDevice, Error, Ext4, FormatOptions, MountOptions, NewKind, ROOT_INO};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -263,6 +263,52 @@ fn fragmented_file_gets_an_extent_tree() {
     let mut fs = ro(img.clone());
     assert_eq!(&fs.inode(a).unwrap().block[6..8], &[0, 0]);
     e2fsck("collapsed", &img);
+}
+
+#[test]
+fn very_fragmented_file_gets_a_depth_two_tree() {
+    let mut img = vec![0u8; 64 * 1024 * 1024];
+    format(&mut img, &FormatOptions { label: "FRAG", uuid: [0x2a; 16], time: 1_761_200_000 }).unwrap();
+    let mut fs = rw(img);
+    let ino = fs.create(ROOT_INO, "frag", NewKind::File, 0o644, 0, 0).unwrap();
+    let mut expect = Vec::new();
+    // A one-block file between every block of `frag`: 2000 single-block
+    // extents need six 4 KiB leaves, one level past the inode root.
+    for i in 0..2_000u64 {
+        let data = pattern(4096, i as usize);
+        fs.write(ino, i * 4096, &data).unwrap();
+        expect.extend_from_slice(&data);
+        let pad = fs.create(ROOT_INO, &format!("pad-{i}"), NewKind::File, 0o644, 0, 0).unwrap();
+        fs.write(pad, 0, &[i as u8]).unwrap();
+    }
+    fs.check().unwrap();
+    let img = fs.unmount().unwrap();
+    let mut fs = ro(img.clone());
+    assert_eq!(&fs.inode(ino).unwrap().block[6..8], &[2, 0], "extent tree depth");
+    assert_eq!(read_all(&mut fs, ino), expect);
+    e2fsck("depth-two", &img);
+}
+
+#[test]
+fn depth_two_tree_carries_checksums() {
+    // The fixture is made by mke2fs with metadata_csum, so every leaf and
+    // index block gets a checksum and e2fsck verifies them.
+    let mut fs = rw(fixture("ext4-4k"));
+    let ino = fs.create(ROOT_INO, "frag", NewKind::File, 0o644, 0, 0).unwrap();
+    let mut expect = Vec::new();
+    for i in 0..1_400u64 {
+        let data = pattern(4096, i as usize);
+        fs.write(ino, i * 4096, &data).unwrap();
+        expect.extend_from_slice(&data);
+        let pad = fs.create(ROOT_INO, &format!("pad-{i}"), NewKind::File, 0o644, 0, 0).unwrap();
+        fs.write(pad, 0, &[i as u8]).unwrap();
+    }
+    fs.check().unwrap();
+    let img = fs.unmount().unwrap();
+    let mut fs = ro(img.clone());
+    assert_eq!(&fs.inode(ino).unwrap().block[6..8], &[2, 0], "extent tree depth");
+    assert_eq!(read_all(&mut fs, ino), expect);
+    e2fsck("depth-two-csum", &img);
 }
 
 #[test]
