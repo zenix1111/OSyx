@@ -847,3 +847,57 @@ fn the_clipboard_is_shared_by_every_client() {
     assert_eq!(h.try_send(b, Request::ClipboardSet { entries: big }, None), Err(proto::error::MALFORMED));
     assert!(h.c.is_dead(b));
 }
+
+#[test]
+fn unicode_clipboard_text_is_shared_between_clients() {
+    let mut h = Harness::new();
+    let native = h.client(11);
+    let windows = h.client(12);
+    h.events();
+    h.send(native, Request::ClipboardSet { entries: vec![proto::clipboard_text_entry("Zażółć 🌍")] });
+    let received = h.events_for(windows);
+    let entries = received.iter().find_map(|e| match e {
+        Event::ClipboardChanged { entries, .. } => Some(entries),
+        _ => None,
+    }).expect("Windows client receives clipboard change");
+    assert_eq!(proto::clipboard_text(entries).as_deref(), Some("Zażółć 🌍"));
+}
+
+#[test]
+fn file_clipboard_is_shared_between_clients() {
+    let mut h = Harness::new();
+    let source = h.client(31);
+    let target = h.client(32);
+    h.events();
+    let paths = vec![String::from("/home/user/ż.txt")];
+    let entry = proto::clipboard_files_entry(&paths, true).unwrap();
+    h.send(source, Request::ClipboardSet { entries: vec![entry] });
+    let events = h.events_for(target);
+    let entries = events.iter().find_map(|e| match e {
+        Event::ClipboardChanged { entries, .. } => Some(entries),
+        _ => None,
+    }).expect("target receives file clipboard");
+    assert_eq!(proto::clipboard_files(entries), Some((paths, true)));
+}
+
+#[test]
+fn file_drag_delivers_only_to_the_window_at_release() {
+    let mut h = Harness::new();
+    let source = h.client(21);
+    let target = h.client(22);
+    h.create(source, 1, Role::Normal, 0, (30, 60, 200, 160));
+    h.create(target, 1, Role::Normal, 0, (350, 60, 200, 160));
+    h.paint(source, 1, 200, 160, 0);
+    h.paint(target, 1, 200, 160, 0);
+    h.move_to(50, 80);
+    h.input(kind::BUTTON, 1, 1, 0, 0);
+    h.send(source, Request::FileDrag { window: 1, path: "/home/user/picture.png".to_string() });
+    h.move_to(380, 100);
+    h.input(kind::BUTTON, 1, 0, 0, 0);
+    let events = h.events_for(target);
+    assert!(events.iter().any(|e| matches!(e, Event::FileDrop { window: 1, x: 30, y: 40, path } if path == "/home/user/picture.png")), "{events:?}");
+    // Without a pressed source window, an unsolicited request cannot drop.
+    h.send(source, Request::FileDrag { window: 1, path: "/other".to_string() });
+    h.click(380, 100);
+    assert!(!h.events_for(target).iter().any(|e| matches!(e, Event::FileDrop { .. })));
+}

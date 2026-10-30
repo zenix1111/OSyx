@@ -1,0 +1,9 @@
+[package]
+name = "osyx-filekit"
+description = "Pure logic of the Files application: file kinds, open-with associations, tar and zip archives, selection helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }

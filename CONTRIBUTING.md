@@ -29,3 +29,10 @@ For a focused network change, run `cargo test -p osyx-net` and `./scripts/net-te
 4. Respond to review and keep the branch up to date.
 
 For security issues, follow [SECURITY.md](SECURITY.md) instead of filing a public issue.
+
+## Merging without a release
+
+Automatic releases run after CI passes on `main`. To merge without creating a
+release, include `/norelease` in the merge commit title or description (including
+the squash commit message). This does not disable manually dispatched releases.
+The existing `[skip release]` marker also remains supported.

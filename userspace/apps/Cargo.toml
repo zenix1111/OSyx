@@ -27,7 +27,7 @@ bench = false
 os-std = { path = "../../runtime/os-std" }
 os-sys = { path = "../../runtime/os-sys" }
 osyx-abi = { path = "../../shared/abi" }
-aml = { path = "../../third_party/aml" }
+osyx-battery = { path = "../battery" }
 
 [[bin]]
 name = "batteryd"

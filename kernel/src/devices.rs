@@ -286,6 +286,14 @@ pub fn disk_added(b: &Arc<dyn BlockDev>) {
     }
 }
 
+/// Called by the block layer when a disk is unregistered (unplugged or
+/// ejected): its node leaves `/dev/disks`.
+pub fn disk_removed(name: &str) {
+    if DISKS_WATCHED.load(Ordering::Acquire) {
+        let _ = unregister(&alloc::format!("disks/{name}"));
+    }
+}
+
 /// Registers the built-in devices and one node per block device.
 pub fn init() {
     let builtin: [(&str, Arc<dyn CharDevice>, u32, u32); 3] = [

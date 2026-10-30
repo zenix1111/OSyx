@@ -309,6 +309,22 @@ extern "C" fn osyx_syscall_dispatch(f: &mut SyscallFrame) -> u64 {
                 Ok(0)
             }
         }
+        nr::SET_FS32_BASE => {
+            // 32-bit code addresses 32 bits and the descriptor base field is
+            // 32 bits wide: a base in the kernel half cannot be represented,
+            // so it is refused rather than truncated. Page alignment keeps
+            // the TEB and everything the loader maps around it in one page
+            // frame, as Windows lays it out.
+            if f.rdi >= 1 << 32
+                || !f.rdi.is_multiple_of(mem::PAGE_SIZE)
+                || (f.rdi != 0 && !crate::fixup::user_range_ok(f.rdi, 1))
+            {
+                Err(Errno::InvalidArgument)
+            } else {
+                sched::set_current_fs32_base(f.rdi);
+                Ok(0)
+            }
+        }
         nr::GETTID => Ok(sched::current_tid()),
         nr::OPEN => user_path(f.rdi, f.rsi)
             .and_then(|p| vfs::open(&Lookup::current(), &p, f.rdx, f.r10 as u32))

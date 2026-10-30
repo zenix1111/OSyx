@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+pub mod clipboard;
 pub mod event;
 pub mod focus;
 pub mod icon;
@@ -26,6 +27,7 @@ pub mod widget;
 #[cfg(test)]
 mod tests;
 
+pub use clipboard::Clipboard;
 pub use event::{ClickCounter, Event, KeyEvent, Response};
 pub use focus::FocusChain;
 pub use icon::Icon;

@@ -447,15 +447,18 @@ impl Stack {
         if let Some(i) = self.ifaces.get_mut(iface) {
             if i.link_up != up {
                 i.link_up = up;
-                // A link that comes (back) up without a lease asks at once
-                // instead of waiting out the backoff of the attempts made
-                // while it was down (Wi-Fi joins long after boot).
-                restart = up && i.dhcp.as_ref().is_some_and(|d| d.lease().is_none());
+                // Reacquire configuration after a link change: Wi-Fi may have
+                // rejoined a different network while the old lease is valid.
+                restart = up && i.dhcp.is_some();
+                if up {
+                    i.arp.flush();
+                }
                 let line = alloc::format!("{}: link {}", i.name, if up { "up" } else { "down" });
                 self.logf(line);
             }
         }
         if restart {
+            self.dns_cache.flush();
             let _ = self.enable_dhcp(iface);
         }
     }
@@ -664,6 +667,24 @@ impl Stack {
         let packets =
             ipv4::build(src, Ipv4Addr::BROADCAST, proto, ipv4::DEFAULT_TTL, self.ident, payload, mtu, false).ok_or(NetError::MessageTooLong)?;
         self.send_ip_packets(Ipv4Addr::BROADCAST, packets, Some(iface))
+    }
+
+    /// Sends a DHCP renewal using only routes belonging to its interface.
+    fn send_dhcp_unicast(&mut self, iface: usize, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Result<(), NetError> {
+        let route = self.routes.iter()
+            .filter(|r| r.iface == iface && self.ifaces[iface].link_up && dst.in_subnet(r.dest, r.prefix))
+            .max_by_key(|r| r.prefix)
+            .ok_or(NetError::NoRoute)?;
+        let hop = route.gateway.unwrap_or(dst);
+        let mtu = self.ifaces[iface].mtu;
+        self.ident = self.ident.wrapping_add(1);
+        let packets = ipv4::build(src, dst, PROTO_UDP, ipv4::DEFAULT_TTL, self.ident, payload, mtu, false)
+            .ok_or(NetError::MessageTooLong)?;
+        self.stats.ip_out += packets.len() as u64;
+        for packet in packets {
+            self.send_packet_on(iface, hop, packet, false);
+        }
+        Ok(())
     }
 
     fn send_icmp_error(&mut self, kind: u8, code: u8, original: &[u8], to: Ipv4Addr, from: Ipv4Addr) {
@@ -1006,18 +1027,17 @@ impl Stack {
             let r = if t.dst.is_broadcast() {
                 self.send_broadcast(iface, t.src, PROTO_UDP, &dgram)
             } else {
-                self.send_ip(t.src, t.dst, PROTO_UDP, &dgram, false)
+                self.send_dhcp_unicast(iface, t.src, t.dst, &dgram)
             };
             let _ = r;
         }
         match ev {
             Some(dhcp::Event::Bound(l)) | Some(dhcp::Event::Renewed(l)) => {
                 let name = self.ifaces[iface].name.clone();
-                if self.ifaces[iface].addr != Some((l.addr, l.prefix)) {
-                    self.set_address(iface, Some((l.addr, l.prefix)), l.router, RouteOrigin::Dhcp);
-                }
-                if !self.dns_static && !l.dns.is_empty() {
+                self.set_address(iface, Some((l.addr, l.prefix)), l.router, RouteOrigin::Dhcp);
+                if !self.dns_static && self.dns_servers != l.dns {
                     self.dns_servers = l.dns.clone();
+                    self.dns_cache.flush();
                 }
                 let dns: Vec<String> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
                 self.logf(alloc::format!(
@@ -1039,6 +1059,7 @@ impl Stack {
                 self.set_address(iface, None, None, RouteOrigin::Dhcp);
                 if !self.dns_static {
                     self.dns_servers.clear();
+                    self.dns_cache.flush();
                 }
                 self.logf(alloc::format!("{}: DHCP lease lost", name));
             }
