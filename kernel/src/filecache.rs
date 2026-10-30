@@ -213,8 +213,10 @@ pub fn note_write(key: Key, offset: u64, data: &[u8]) {
 }
 
 /// Reads `out` at `offset` through the cache; `fill` is the file system's
-/// own read. Any cache failure falls back to reading directly.
-pub fn read(key: Key, offset: u64, out: &mut [u8], fill: impl Fn(u64, &mut [u8]) -> Result<usize, Errno>) -> Result<usize, Errno> {
+/// own read. `source`, when given, lets a background thread extend the
+/// read-ahead window past what this call reads. Any cache failure falls back
+/// to reading directly.
+pub fn read(key: Key, offset: u64, out: &mut [u8], fill: impl Fn(u64, &mut [u8]) -> Result<usize, Errno>, source: Option<&Source>) -> Result<usize, Errno> {
     if recent_read(key, offset, out) {
         RECENT_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return Ok(out.len());
@@ -224,7 +226,7 @@ pub fn read(key: Key, offset: u64, out: &mut [u8], fill: impl Fn(u64, &mut [u8])
         let at = offset + done as u64;
         let index = at / mem::PAGE_SIZE;
         let within = (at % mem::PAGE_SIZE) as usize;
-        let cached = match page(key, index, &fill) {
+        let cached = match page(key, index, &fill, source) {
             Ok(p) => p,
             Err(Errno::NoMemory) => None,
             Err(e) => return Err(e),
@@ -335,13 +337,130 @@ pub(crate) fn peek(key: Key, index: u64) -> Option<Page> {
 }
 
 /// Read-ahead window for sequential readers, in pages: it starts small and
-/// doubles with every sequential miss. Regular file reads run without the
-/// kernel entry lock now, so a long run only delays its own reader; the cap
-/// still bounds that delay behind a busy disk (512 KiB).
+/// doubles with every sequential miss. The reader gets the first pages of the
+/// window before its read returns; a background thread reads the rest, so a
+/// long run does not make the reader wait behind the disk.
 const READAHEAD_START: u64 = 8;
 const READAHEAD_MAX: u64 = 128;
+/// Pages a sequential miss reads before returning; the rest of the window is
+/// queued for the read-ahead thread.
+const READAHEAD_SYNC: u64 = 8;
 
-pub(crate) fn page(key: Key, index: u64, fill: &impl Fn(u64, &mut [u8]) -> Result<usize, Errno>) -> Result<Option<Page>, Errno> {
+/// What the read-ahead thread needs to read a file without the caller.
+#[derive(Clone)]
+pub struct Source {
+    pub fs: Arc<dyn crate::vfs::Filesystem>,
+    pub ino: u64,
+}
+
+struct Job {
+    key: Key,
+    source: Source,
+    first: u64,
+    count: u64,
+    generation: u64,
+}
+
+static JOBS: KMutex<Vec<Job>> = KMutex::new(Vec::new());
+const JOBS_MAX: usize = 8;
+
+/// Starts the read-ahead thread: it reads queued windows into the cache.
+pub fn start_readahead() {
+    crate::sched::spawn_kernel("readahead", readahead_thread, 0, 0);
+}
+
+fn readahead_thread(_: u64, _: u64) {
+    loop {
+        let job = {
+            let mut q = JOBS.lock();
+            if q.is_empty() { None } else { Some(q.remove(0)) }
+        };
+        match job {
+            Some(job) => readahead(job),
+            None => crate::sched::sleep_ticks(crate::arch::timer::ms_to_ticks(5)),
+        }
+    }
+}
+
+fn queue_readahead(key: Key, source: &Source, first: u64, count: u64, generation: u64) {
+    if count == 0 {
+        return;
+    }
+    let mut q = JOBS.lock();
+    // A newer window of the same file replaces an older one; otherwise the
+    // reader has moved on and the old pages are no longer worth reading.
+    q.retain(|j| j.key != key);
+    if q.len() == JOBS_MAX {
+        q.remove(0);
+    }
+    q.push(Job { key, source: source.clone(), first, count, generation });
+}
+
+fn readahead(job: Job) {
+    let mut scratch = alloc::vec![0u8; mem::PAGE_SIZE as usize];
+    for index in job.first..job.first + job.count {
+        if peek(job.key, index).is_some() {
+            continue;
+        }
+        let mut len = 0;
+        while len < scratch.len() {
+            match job.source.fs.read(job.source.ino, index * mem::PAGE_SIZE + len as u64, &mut scratch[len..]) {
+                Ok(0) => break,
+                Ok(n) => len += n,
+                // Best effort: the reader reads the page itself on a miss.
+                Err(_) => return,
+            }
+        }
+        if len == 0 {
+            return;
+        }
+        let Ok(shm) = SharedMemory::page_from(&scratch[..len]) else { return };
+        if insert(job.key, index, job.generation, &[(index, shm, len)]).is_none() {
+            // The cache was invalidated: the rest of the window is stale.
+            return;
+        }
+    }
+}
+
+/// Caches freshly read pages; returns the page at `index` if it landed.
+fn insert(key: Key, index: u64, generation: u64, fresh: &[(u64, Arc<SharedMemory>, usize)]) -> Option<Page> {
+    let mut c = CACHE.lock();
+    if c.generation != generation {
+        return None;
+    }
+    if c.cap == 0 {
+        c.cap = cap();
+    }
+    c.clock += 1;
+    let clock = c.clock;
+    let added = {
+        let e = c.entries.entry(key).or_insert_with(|| Entry { pages: BTreeMap::new(), used: clock, bytes: 0, next: index, window: READAHEAD_START });
+        e.used = clock;
+        let mut added = 0;
+        for (i, shm, n) in fresh {
+            if !e.pages.contains_key(i) {
+                e.pages.insert(*i, (shm.clone(), *n));
+                e.bytes += mem::PAGE_SIZE as usize;
+                added += mem::PAGE_SIZE as usize;
+            }
+        }
+        if let Some((last, _, _)) = fresh.last() {
+            e.next = last + 1;
+        }
+        added
+    };
+    c.bytes += added;
+    while c.bytes > c.cap {
+        let victim = c.entries.iter().filter(|(k, _)| **k != key).min_by_key(|(_, e)| e.used).map(|(k, _)| *k);
+        let Some(victim) = victim else { break };
+        if let Some(e) = c.entries.remove(&victim) {
+            c.bytes -= e.bytes;
+        }
+    }
+    c.entries.get(&key).and_then(|e| e.pages.get(&index)).cloned()
+}
+
+pub(crate) fn page(key: Key, index: u64, fill: &impl Fn(u64, &mut [u8]) -> Result<usize, Errno>, source: Option<&Source>) -> Result<Option<Page>, Errno> {
     let (generation, want) = {
         let mut c = CACHE.lock();
         c.clock += 1;
@@ -368,7 +487,8 @@ pub(crate) fn page(key: Key, index: u64, fill: &impl Fn(u64, &mut [u8]) -> Resul
         (generation, if crate::smp::owner_is_me() { want.min(32) } else { want })
     };
     FC_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut buf = alloc::vec![0u8; (want * mem::PAGE_SIZE) as usize];
+    let sync = want.min(READAHEAD_SYNC).max(1);
+    let mut buf = alloc::vec![0u8; (sync * mem::PAGE_SIZE) as usize];
     let started = crate::interrupts::uptime_ms();
     let mut len = 0;
     while len < buf.len() {
@@ -395,43 +515,14 @@ pub(crate) fn page(key: Key, index: u64, fill: &impl Fn(u64, &mut [u8]) -> Resul
         let shm = SharedMemory::page_from(&buf[start..start + n])?;
         fresh.push((index + k as u64, shm, n));
     }
-    let mut c = CACHE.lock();
-    if c.generation == generation {
-        if c.cap == 0 {
-            c.cap = cap();
+    let page = insert(key, index, generation, &fresh);
+    if want > sync {
+        if let Some(source) = source {
+            queue_readahead(key, source, index + count as u64, want - count as u64, generation);
         }
-        c.clock += 1;
-        let clock = c.clock;
-        let added = {
-            let e = c.entries.entry(key).or_insert_with(|| Entry { pages: BTreeMap::new(), used: clock, bytes: 0, next: index, window: READAHEAD_START });
-            e.used = clock;
-            let mut added = 0;
-            for (i, shm, n) in &fresh {
-                if !e.pages.contains_key(i) {
-                    e.pages.insert(*i, (shm.clone(), *n));
-                    e.bytes += mem::PAGE_SIZE as usize;
-                    added += mem::PAGE_SIZE as usize;
-                }
-            }
-            e.next = index + count as u64;
-            added
-        };
-        c.bytes += added;
-        while c.bytes > c.cap {
-            let victim = c
-                .entries
-                .iter()
-                .filter(|(k, _)| **k != key)
-                .min_by_key(|(_, e)| e.used)
-                .map(|(k, _)| *k);
-            let Some(victim) = victim else { break };
-            if let Some(e) = c.entries.remove(&victim) {
-                c.bytes -= e.bytes;
-            }
-        }
-        if let Some((p, len)) = c.entries.get(&key).and_then(|e| e.pages.get(&index)).cloned() {
-            return Ok(Some((p, len)));
-        }
+    }
+    if let Some(page) = page {
+        return Ok(Some(page));
     }
     // The cache was invalidated while reading: return the bytes without
     // inserting them. `fresh` starts at `index`.

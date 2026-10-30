@@ -226,19 +226,25 @@ impl<'a> ImportEntries<'a> {
         if self.index == MAX_THUNKS {
             return Err(bad("thunk table not terminated"));
         }
-        let offset = self.index.checked_mul(8).ok_or(bad("thunk index overflows"))?;
+        let width: u32 = if self.pe.is_pe32() { 4 } else { 8 };
+        let offset = self.index.checked_mul(width).ok_or(bad("thunk index overflows"))?;
         let rva = self.table.checked_add(offset).ok_or(bad("thunk table overflows"))?;
         let iat_rva = self.iat.checked_add(offset).ok_or(bad("IAT overflows"))?;
-        let thunk = self.pe.u64_at_rva(rva).map_err(|_| bad("thunk not in file"))?;
+        // A PE32 thunk is 32 bits wide with the ordinal flag in bit 31.
+        let (thunk, ordinal_flag) = if self.pe.is_pe32() {
+            (self.pe.u32_at_rva(rva).map_err(|_| bad("thunk not in file"))? as u64, 1u64 << 31)
+        } else {
+            (self.pe.u64_at_rva(rva).map_err(|_| bad("thunk not in file"))?, ORDINAL_FLAG)
+        };
         if thunk == 0 {
             return Ok(None);
         }
-        if iat_rva.checked_add(8).is_none_or(|e| e > self.pe.size_of_image()) {
+        if iat_rva.checked_add(width).is_none_or(|e| e > self.pe.size_of_image()) {
             return Err(bad("IAT slot outside the image"));
         }
         self.index += 1;
-        if thunk & ORDINAL_FLAG != 0 {
-            if thunk & !ORDINAL_FLAG & !0xFFFF != 0 {
+        if thunk & ordinal_flag != 0 {
+            if thunk & !ordinal_flag & !0xFFFF != 0 {
                 return Err(bad("reserved bits set in an ordinal thunk"));
             }
             return Ok(Some(ImportEntry::ByOrdinal { ordinal: thunk as u16, iat_rva }));

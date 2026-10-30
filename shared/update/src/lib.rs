@@ -36,6 +36,8 @@ pub const MAGIC: &str = "osyx-update 1";
 pub const MANIFEST: &str = "manifest.txt";
 pub const SIGNATURE: &str = "manifest.sig";
 pub const PAYLOAD: &str = "payload.bin";
+/// Suffix used for files staged beside update targets.
+pub const STAGED_SUFFIX: &str = ".osyx-new";
 
 /// Preserve custom update servers while following the repository transfer.
 pub fn update_url(url: &str) -> &str {
@@ -149,7 +151,7 @@ impl Manifest {
             match f.next() {
                 Some("version") => {
                     let v = f.next().ok_or_else(bad)?;
-                    if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    if v.split('.').any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) || part.parse::<u64>().is_err()) {
                         return Err(bad());
                     }
                     version = Some(v.to_string());
@@ -170,6 +172,9 @@ impl Manifest {
                     if files.iter().any(|e| e.path == path) {
                         return Err(format!("manifest line {}: {path} listed twice", n + 2));
                     }
+                    if files.iter().any(|e| e.path.strip_suffix(STAGED_SUFFIX) == Some(path) || path.strip_suffix(STAGED_SUFFIX) == Some(e.path.as_str())) {
+                        return Err(format!("manifest line {}: {path} conflicts with a staged file", n + 2));
+                    }
                     files.push(Entry { path: path.to_string(), size, mode, sha256 });
                 }
                 Some("") if line.is_empty() => {}
@@ -178,7 +183,7 @@ impl Manifest {
         }
         let version = version.ok_or("manifest without a version")?;
         let (payload_sha256, payload_size) = payload.ok_or("manifest without a payload")?;
-        if files.iter().map(|f| f.size).sum::<u64>() != payload_size {
+        if files.iter().try_fold(0u64, |sum, f| sum.checked_add(f.size)) != Some(payload_size) {
             return Err(String::from("the files do not add up to the payload size"));
         }
         Ok(Manifest { version, payload_size, payload_sha256, files })
@@ -246,6 +251,38 @@ mod tests {
         let evil = m.to_text().replace("bin/init", "etc/shadow");
         assert!(Manifest::parse(&evil).is_err());
         assert!(Manifest::parse("osyx-update 2\nversion 1\n").is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_overflowing_file_sizes() {
+        let m = Manifest {
+            version: "1.0".to_string(),
+            payload_size: 0,
+            payload_sha256: [0; 32],
+            files: vec![entry("bin/a", u64::MAX), entry("bin/b", 1)],
+        };
+        assert!(Manifest::parse(&m.to_text()).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_staging_path_collisions_in_either_order() {
+        for files in [vec![entry("bin/a", 1), entry("bin/a.osyx-new", 1)], vec![entry("bin/a.osyx-new", 1), entry("bin/a", 1)]] {
+            let manifest = Manifest { version: "1.0".to_string(), payload_size: 2, payload_sha256: [0; 32], files };
+            assert!(Manifest::parse(&manifest.to_text()).is_err());
+        }
+        let manifest = Manifest { version: "1.0".to_string(), payload_size: 2, payload_sha256: [0; 32], files: vec![entry("bin/a", 1), entry("bin/b.osyx-new", 1)] };
+        assert!(Manifest::parse(&manifest.to_text()).is_ok());
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_version_components() {
+        let manifest = Manifest { version: "1.2".to_string(), payload_size: 0, payload_sha256: [0; 32], files: vec![] };
+        assert!(Manifest::parse(&manifest.to_text()).is_ok());
+        for version in [".", ".1", "1.", "1..2", "1.18446744073709551616"] {
+            let mut malformed = manifest.clone();
+            malformed.version = version.to_string();
+            assert!(Manifest::parse(&malformed.to_text()).is_err(), "{version}");
+        }
     }
 
     #[test]

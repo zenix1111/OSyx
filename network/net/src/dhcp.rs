@@ -400,6 +400,31 @@ impl Client {
         if m.op != 2 || m.xid != self.xid || m.chaddr != self.mac {
             return (None, None);
         }
+        if matches!(m.msg_type, ACK | NAK) {
+            if m.msg_type == ACK && matches!(self.phase, Phase::Renewing | Phase::Rebinding) {
+                let Some(lease) = &self.lease else { return (None, None) };
+                if (!m.yiaddr.is_unspecified() && m.yiaddr != lease.addr)
+                    || (!m.ciaddr.is_unspecified() && m.ciaddr != lease.addr)
+                {
+                    return (None, None);
+                }
+            }
+            match self.phase {
+                Phase::Requesting => {
+                    let Some((addr, server)) = self.offer else { return (None, None) };
+                    if m.server_id.is_some_and(|id| id != server) || (m.msg_type == ACK && m.yiaddr != addr) {
+                        return (None, None);
+                    }
+                }
+                Phase::Renewing => {
+                    let Some(lease) = &self.lease else { return (None, None) };
+                    if m.server_id.is_some_and(|server| server != lease.server) {
+                        return (None, None);
+                    }
+                }
+                _ => {}
+            }
+        }
         match (self.phase, m.msg_type) {
             (Phase::Selecting, OFFER) => {
                 let Some(server) = m.server_id else { return (None, None) };
@@ -430,21 +455,29 @@ impl Client {
     }
 
     fn lease_from(&self, m: &Message, now: u64) -> Option<Lease> {
-        let addr = if m.yiaddr.is_unspecified() { m.ciaddr } else { m.yiaddr };
+        let addr = if !m.yiaddr.is_unspecified() {
+            m.yiaddr
+        } else if !m.ciaddr.is_unspecified() {
+            m.ciaddr
+        } else {
+            self.lease.as_ref().map_or(Ipv4Addr::UNSPECIFIED, |l| l.addr)
+        };
         if addr.is_unspecified() {
             return None;
         }
         let server = m.server_id.or(self.offer.map(|o| o.1)).or(self.lease.as_ref().map(|l| l.server))?;
         let lease_s = m.lease_s.unwrap_or(MIN_LEASE_S).max(MIN_LEASE_S) as u64;
-        let t1 = m.t1_s.map(|v| v as u64).filter(|&v| v < lease_s).unwrap_or(lease_s / 2);
-        let t2 = m.t2_s.map(|v| v as u64).filter(|&v| v > t1 && v < lease_s).unwrap_or(lease_s * 7 / 8);
-        let prefix = m.subnet.and_then(mask_prefix).unwrap_or(24);
+        let defaults = (lease_s / 2, lease_s * 7 / 8);
+        let proposed = (m.t1_s.map(u64::from).unwrap_or(defaults.0), m.t2_s.map(u64::from).unwrap_or(defaults.1));
+        let (t1, t2) = if proposed.0 > 0 && proposed.0 < proposed.1 && proposed.1 < lease_s { proposed } else { defaults };
+        let prior = self.lease.as_ref().filter(|l| l.addr == addr);
+        let prefix = m.subnet.and_then(mask_prefix).or_else(|| prior.map(|l| l.prefix)).unwrap_or(24);
         Some(Lease {
             addr,
             prefix,
-            router: m.routers.first().copied(),
-            dns: m.dns.clone(),
-            domain: m.domain.clone(),
+            router: m.routers.first().copied().or_else(|| prior.and_then(|l| l.router)),
+            dns: if m.dns.is_empty() { prior.map_or_else(Vec::new, |l| l.dns.clone()) } else { m.dns.clone() },
+            domain: m.domain.clone().or_else(|| prior.and_then(|l| l.domain.clone())),
             server,
             obtained: now,
             lease_ms: lease_s * 1000,
@@ -457,10 +490,9 @@ impl Client {
     pub fn next_deadline(&self) -> Option<u64> {
         match self.phase {
             Phase::Init => Some(0),
-            Phase::Selecting | Phase::Requesting | Phase::Renewing | Phase::Rebinding => {
-                let l = self.lease.as_ref().map(|l| l.t2.min(l.expires()));
-                Some(l.map_or(self.next_send, |l| l.min(self.next_send)))
-            }
+            Phase::Selecting | Phase::Requesting => Some(self.next_send),
+            Phase::Renewing => Some(self.lease.as_ref().map_or(self.next_send, |l| l.t2.min(self.next_send))),
+            Phase::Rebinding => Some(self.lease.as_ref().map_or(self.next_send, |l| l.expires().min(self.next_send))),
             Phase::Bound => self.lease.as_ref().map(|l| l.t1),
             Phase::Stopped => None,
         }

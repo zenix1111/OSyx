@@ -17,7 +17,9 @@
 //!   against as is: export addresses do not depend on its imports) and are
 //!   reported; initialisation follows dependency order, cycles broken at
 //!   the edge that closes them;
-//! * forwarder chains are bounded ([`MAX_FORWARD_DEPTH`]).
+//! * forwarder chains are bounded ([`MAX_FORWARD_DEPTH`]);
+//! * a PE32 image and a PE32+ image cannot import each other (their thunks
+//!   are different widths) and 32-bit images are never placed above 4 GiB.
 
 use crate::apiset::{self, Schema};
 use crate::image::{self, ImageError, Protection};
@@ -61,7 +63,7 @@ impl AsRef<[u8]> for PeData {
 
 pub enum Source {
     Builtin(Box<dyn BuiltinModule>),
-    /// The bytes of a PE32+ DLL.
+    /// The bytes of a PE image (PE32 or PE32+).
     Pe(Vec<u8>),
     PeMapped(Box<dyn PeMapping>),
 }
@@ -78,6 +80,31 @@ pub trait Host {
     /// the host fails); otherwise `preferred` is only a hint. Returns the
     /// base actually used and its writable mapping.
     fn reserve(&mut self, size: u64, preferred: u64, fixed: bool) -> Result<(u64, Self::Image), LinkError>;
+    /// [`Host::reserve`], but the image must lie entirely below `max`: a
+    /// 32-bit image cannot be placed at or above 4 GiB. Hosts that can place
+    /// memory low override this; the default ignores `max` and delegates to
+    /// [`Host::reserve`], which the linker then checks as well.
+    fn reserve_below(
+        &mut self,
+        size: u64,
+        preferred: u64,
+        fixed: bool,
+        max: u64,
+    ) -> Result<(u64, Self::Image), LinkError> {
+        let _ = max;
+        self.reserve(size, preferred, fixed)
+    }
+    /// Resolves one import of a PE32 image to the value written into its
+    /// 4-byte IAT slot. A 32-bit image cannot hold a 64-bit address, so a
+    /// host may return the address of a bridge stub instead; 0 refuses the
+    /// import and fails the load. `address` is the resolved export (a
+    /// built-in's own entry point or a PE32 module's address). `pe32` is
+    /// false for PE32+ images, whose slots keep `address` unchanged: hosts
+    /// that do not bridge 32-bit code leave the default.
+    fn import_thunk(&mut self, symbol: Option<&str>, ordinal: u16, address: u64, pe32: bool) -> u64 {
+        let _ = (symbol, ordinal, pe32);
+        address
+    }
     /// Finishes the image at `base` and applies the protections (RVAs relative
     /// to `base`). Consuming the mapping ends writable access to the image.
     fn commit(&mut self, base: u64, image: Self::Image, prot: &[Protection]) -> Result<(), LinkError>;
@@ -131,6 +158,12 @@ pub enum LinkError {
         module: String,
         symbol: String,
     },
+    /// A PE32 image tried to use a PE32+ module (or the reverse): a 32-bit
+    /// IAT slot cannot hold a 64-bit address.
+    WidthMismatch {
+        importer: String,
+        module: String,
+    },
     TooManyModules,
     /// The host could not provide memory.
     NoMemory,
@@ -151,6 +184,9 @@ impl core::fmt::Display for LinkError {
             LinkError::ForwarderTooDeep { module, symbol } => {
                 write!(f, "forwarder chain from {module}!{symbol} is too long or circular")
             }
+            LinkError::WidthMismatch { importer, module } => {
+                write!(f, "{importer} cannot import {module}: 32-bit and 64-bit images cannot be mixed")
+            }
             LinkError::TooManyModules => f.write_str("too many modules"),
             LinkError::NoMemory => f.write_str("out of memory"),
             LinkError::Host(s) => f.write_str(s),
@@ -167,7 +203,14 @@ pub enum State {
 
 pub enum Kind {
     Builtin(Box<dyn BuiltinModule>),
-    Pe { file: PeData, size: u32, entry: u32, is_dll: bool },
+    Pe {
+        file: PeData,
+        size: u32,
+        entry: u32,
+        is_dll: bool,
+        /// A 32-bit PE32 image (4-byte thunks, low 4 GiB addresses).
+        pe32: bool,
+    },
 }
 
 pub struct Module {
@@ -187,6 +230,15 @@ impl Module {
         matches!(self.kind, Kind::Builtin(_))
     }
 
+    /// Whether this is a 32-bit PE32 module. `None` for a built-in module,
+    /// which serves both widths.
+    pub fn is_pe32(&self) -> Option<bool> {
+        match &self.kind {
+            Kind::Pe { pe32, .. } => Some(*pe32),
+            Kind::Builtin(_) => None,
+        }
+    }
+
     /// Entry point address (0 for built-in modules or no entry point).
     pub fn entry(&self) -> u64 {
         match self.kind {
@@ -197,7 +249,7 @@ impl Module {
 
     pub fn pe(&self) -> Option<PeFile<'_>> {
         match &self.kind {
-            Kind::Pe { file, .. } => PeFile::parse(file.as_ref()).ok(),
+            Kind::Pe { file, .. } => PeFile::parse_any(file.as_ref()).ok(),
             Kind::Builtin(_) => None,
         }
     }
@@ -259,6 +311,19 @@ impl<'s, H: Host> Linker<'s, H> {
         Ok(normalize(name))
     }
 
+    /// Rejects a PE module of a different width: a 32-bit image cannot import
+    /// a 64-bit module and a 64-bit image cannot import a 32-bit one.
+    /// Built-in modules are width-agnostic.
+    fn check_width(&self, importer: usize, module: usize) -> Result<(), LinkError> {
+        match (self.modules[importer].is_pe32(), self.modules[module].is_pe32()) {
+            (Some(a), Some(b)) if a != b => Err(LinkError::WidthMismatch {
+                importer: self.modules[importer].name.clone(),
+                module: self.modules[module].name.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Loads the main executable from its bytes. Returns its index.
     pub fn load_executable(&mut self, name: &str, file: Vec<u8>) -> Result<usize, LinkError> {
         self.load_pe(normalize(name), PeData::Owned(file), false)
@@ -317,11 +382,12 @@ impl<'s, H: Host> Linker<'s, H> {
             return Err(LinkError::TooManyModules);
         }
         let bad = |name: &str, error| LinkError::Image { module: name.to_string(), error };
-        let pe = PeFile::parse(file.as_ref()).map_err(|e| bad(&name, e.into()))?;
+        let pe = PeFile::parse_any(file.as_ref()).map_err(|e| bad(&name, e.into()))?;
         image::check(&pe, dll).map_err(|e| bad(&name, e))?;
         if dll != pe.is_dll() {
             return Err(bad(&name, ImageError::Subsystem(pe.optional().subsystem)));
         }
+        let pe32 = pe.is_pe32();
         let size = pe.size_of_image();
         let prot = image::protections(&pe).map_err(|e| bad(&name, e))?;
         let m0 = self.host.mark();
@@ -330,7 +396,18 @@ impl<'s, H: Host> Linker<'s, H> {
             Some(b) if relocatable => b,
             _ => pe.image_base(),
         };
-        let (base, mut img) = self.host.reserve(size as u64, preferred, !relocatable)?;
+        // A 32-bit image must be mapped below 4 GiB; the host is told the
+        // limit and the result is checked in case it cannot honour it.
+        let limit = if pe32 { image::ADDRESS_LIMIT32 } else { u64::MAX };
+        let (base, mut img) = if pe32 {
+            self.host.reserve_below(size as u64, preferred, !relocatable, limit)?
+        } else {
+            self.host.reserve(size as u64, preferred, !relocatable)?
+        };
+        if base.checked_add(size as u64).is_none_or(|end| end > limit) {
+            self.host.release(base, size as u64);
+            return Err(bad(&name, ImageError::BaseTooHigh));
+        }
         let m1 = self.host.mark();
         let shared = self.host.prepare(&name, base, img.as_mut());
         if !shared {
@@ -362,7 +439,7 @@ impl<'s, H: Host> Linker<'s, H> {
         self.modules.push(Module {
             name: name.clone(),
             base,
-            kind: Kind::Pe { file: PeData::Owned(Vec::new()), size, entry, is_dll: dll },
+            kind: Kind::Pe { file: PeData::Owned(Vec::new()), size, entry, is_dll: dll, pe32 },
             deps: Vec::new(),
             state: State::Binding,
             relocations,
@@ -388,12 +465,30 @@ impl<'s, H: Host> Linker<'s, H> {
         let mut bound = 0;
         for (dll_name, entries) in wanted {
             let dep = self.load_dll(&dll_name, &name)?;
+            // A PE32 image may only use built-in modules and other PE32
+            // modules; mixing widths would put a 64-bit address in a 32-bit
+            // slot (or the reverse).
+            self.check_width(idx, dep)?;
             if !self.modules[idx].deps.contains(&dep) {
                 self.modules[idx].deps.push(dep);
             }
             let addresses = self.resolve_group(dep, &entries, &name)?;
-            for ((_, _, iat), addr) in entries.into_iter().zip(addresses) {
-                image::write_u64(img.as_mut(), iat, addr).ok_or_else(|| bad(&name, ImageError::TooLarge))?;
+            for ((symbol, ordinal, iat), addr) in entries.into_iter().zip(addresses) {
+                // Only a 32-bit image needs a thunk usable by 32-bit code;
+                // PE32+ writes the resolved address as before.
+                let addr = if pe32 { self.host.import_thunk(symbol.as_deref(), ordinal, addr, true) } else { addr };
+                if pe32 && addr == 0 {
+                    // A 32-bit import the host cannot bridge must fail the
+                    // load instead of becoming a null slot (an ordinal has
+                    // no name, so the ordinal is what the error reports).
+                    let symbol = symbol.map_or_else(|| alloc::format!("#{ordinal}"), String::from);
+                    return Err(LinkError::SymbolNotFound {
+                        module: self.modules[dep].name.clone(),
+                        symbol,
+                        importer: name.clone(),
+                    });
+                }
+                image::write_thunk(img.as_mut(), iat, addr, pe32).ok_or_else(|| bad(&name, ImageError::TooLarge))?;
                 bound += 1;
             }
         }
@@ -433,7 +528,7 @@ impl<'s, H: Host> Linker<'s, H> {
                     symbol: sym.describe(),
                     importer: importer.to_string(),
                 };
-                let pe = PeFile::parse(file.as_ref())
+                let pe = PeFile::parse_any(file.as_ref())
                     .map_err(|e| LinkError::Image { module: m.name.clone(), error: e.into() })?;
                 let (name, ordinal, _) = &symbols[addresses.len()];
                 let first = match name {
@@ -492,7 +587,7 @@ impl<'s, H: Host> Linker<'s, H> {
                 return a.ok_or_else(|| not_found(m));
             }
             Kind::Pe { file, .. } => {
-                let pe = PeFile::parse(file.as_ref())
+                let pe = PeFile::parse_any(file.as_ref())
                     .map_err(|e| LinkError::Image { module: m.name.clone(), error: e.into() })?;
                 let exports = pe.exports().ok().flatten().ok_or_else(|| not_found(m))?;
                 let e = match sym {
@@ -511,6 +606,8 @@ impl<'s, H: Host> Linker<'s, H> {
         let from = self.modules[idx].name.clone();
         let (dll, name, ordinal) = forward;
         let target = self.load_dll(&dll, &from)?;
+        // A forwarder must not cross widths either.
+        self.check_width(idx, target)?;
         let s = match (&name, ordinal) {
             (Some(n), _) => Symbol::Name(n),
             (None, Some(o)) => Symbol::Ordinal(o),

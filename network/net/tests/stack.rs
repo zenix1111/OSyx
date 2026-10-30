@@ -435,6 +435,25 @@ fn dhcp_configures_address_route_and_dns() {
     let p = n.b.icmp_open().unwrap();
     n.b.icmp_echo(p, Ipv4Addr::new(10, 0, 2, 15), 1, b"hi").unwrap();
     assert!(n.run_until(100, |n| matches!(n.b.icmp_recv(p), Ok(IcmpEvent::Reply { .. }))));
+    // A second interface on the same subnet must not steal DHCP renewals.
+    let other = n.a.add_ethernet("eth1", osyx_net::wire::MacAddr([0x52, 0x54, 0, 0, 0, 3]), 1500);
+    n.a.configure_static(other, Ipv4Addr::new(10, 0, 2, 16), 24, Some(server)).unwrap();
+    let renew_at = n.a.dhcp_state(1).unwrap().1.unwrap().t1;
+    n.a.take_tx();
+    n.a.set_now(renew_at);
+    n.a.poll();
+    let frames = n.a.take_tx();
+    assert!(!frames.is_empty(), "DHCP renewal produced no frames");
+    assert!(frames.iter().all(|(iface, _)| *iface == 1), "DHCP renewal left through the wrong interface");
+    // Reassociation must not reuse an address from the previous network.
+    n.a.dns_cache.put("old.example", vec![server], 3600, n.now);
+    n.a.set_link(1, false);
+    n.a.set_link(1, true);
+    assert_eq!(n.a.dns_cache.get("old.example", n.now), None);
+    assert_eq!(n.a.interfaces()[1].addr, None);
+    assert_eq!(n.a.dhcp_state(1).unwrap().0, dhcp::Phase::Init);
+    n.a.poll();
+    assert_eq!(n.a.dhcp_state(1).unwrap().0, dhcp::Phase::Selecting);
 }
 
 /// A tiny DNS server on B: answers A queries from a table, can truncate.

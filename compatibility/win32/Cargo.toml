@@ -18,6 +18,7 @@ osyx-abi = { path = "../../shared/abi" }
 osyx-pe = { path = "../pe-parser" }
 osyx-pe-loader = { path = "../pe-loader" }
 osyx-gfx = { path = "../../boot/gfx" }
+osyx-font = { path = "../../graphics/font" }
 prism-client = { path = "../../graphics/prism-client" }
 osyx-input = { path = "../../shared/input" }
 osyx-crypto = { path = "../../shared/crypto" }

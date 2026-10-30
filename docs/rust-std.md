@@ -45,14 +45,14 @@ supplies the platform parts:
 | `thread::{sleep, yield_now}` | Implemented | OSyx + host |
 | `thread::{spawn, Builder, JoinHandle, current, Thread, ThreadId}` | Implemented; a panicking thread ends the process (panic = abort) | OSyx (join values, ids/names, detached reaping, faults and panics in threads) + host |
 | `thread_local!`, `thread::LocalKey` | Implemented on the FS base (own TLS, not ELF TLS) with per-thread destructors | OSyx + host |
-| `sync::{Mutex, Condvar}` (futex based), `Arc`, `Weak`, `atomic` | Implemented; never poisoned; the mutex is not fair | OSyx (contention under preemption, producer/consumer, timeouts) + host (8 parallel threads) |
+| `sync::{Mutex, Condvar, RwLock, Once, OnceLock}` (futex based), `mpsc`, `Arc`, `Weak`, `atomic` | Implemented; never poisoned; the mutex is not fair; a queued writer keeps new readers out | OSyx (contention under preemption, producer/consumer, timeouts, readers/writers, once across threads, mpsc senders/bounded/timeout) + host (8 parallel threads) |
 | `time::{Instant, Duration}` | Implemented (1 ms resolution) | OSyx + host |
 | `env::args` | Implemented | OSyx (tested with `init.args`) + host |
 | `env::{var, vars, set_var, remove_var}` | Implemented: the `envp` block from the start-up stack, kept in a locked process-wide copy that children inherit | OSyx (inheritance, `env_clear`, exact `envp` in children) + host |
 | `env::current_exe` | Implemented (`AT_EXECFN`: canonical path the kernel loaded) | OSyx + host |
 | `os::{sysinfo, kernel_version, heap_stats, aux_value, raw}` | Implemented | OSyx |
 | `rt`: `_start` (argv, envp and auxv located with `osyx_abi::startup`), `entry!`, `Termination`, panic → status 101 | Implemented | OSyx (tested) |
-| `sync::{RwLock, Once, OnceLock, mpsc}`, `net`, `fs::hard_link`, `fs::canonicalize` | Planned | — |
+| `net`, `fs::hard_link`, `fs::canonicalize` | Planned | — |
 
 On the host back end, futexes are emulated (per-address wake generations on
 a global `std` condition variable) and threads are real host threads, so the

@@ -1,4 +1,5 @@
 use crate::event::{Event, KeyEvent, Response};
+use crate::clipboard::Clipboard;
 use crate::layout::{contains, inset_xy};
 use crate::paint::{Align, FontKind, Fonts, Painter};
 use alloc::string::String;
@@ -295,6 +296,41 @@ impl TextField {
             self.ensure_visible(fonts);
         }
         r
+    }
+
+    /// Handles text clipboard shortcuts before the regular editing keys.
+    pub fn event_with_clipboard(&mut self, ev: &Event, focused: bool, fonts: &Fonts, clipboard: &mut Clipboard) -> Response {
+        if let Event::Key(k) = ev {
+            if focused && k.down && k.ctrl() {
+                match k.key {
+                    key::C | key::X => {
+                        if !self.masked {
+                            if let Some((a, b)) = self.selection() {
+                                clipboard.set(&self.text[a..b]);
+                                if k.key == key::X {
+                                    self.delete_selection();
+                                    self.ensure_visible(fonts);
+                                    return Response::Changed;
+                                }
+                            }
+                        }
+                        return Response::Consumed;
+                    }
+                    key::V => {
+                        if let Some(text) = clipboard.text() {
+                            // A single-line field must not insert control characters.
+                            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                            self.insert(&text);
+                            self.ensure_visible(fonts);
+                            return Response::Changed;
+                        }
+                        return Response::Consumed;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.event(ev, focused, fonts)
     }
 
     pub fn draw(&self, p: &mut Painter, focused: bool) {

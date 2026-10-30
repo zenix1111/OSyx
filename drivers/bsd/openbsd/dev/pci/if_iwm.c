@@ -4140,7 +4140,7 @@ iwm_firmware_load_chunk(struct iwm_softc *sc, uint32_t dst_addr,
 	/* Wait for this segment to load. */
 	err = 0;
 	while (!sc->sc_fw_chunk_done) {
-		err = tsleep_nsec(&sc->sc_fw, 0, "iwmfw", SEC_TO_NSEC(1));
+		err = tsleep_nsec(&sc->sc_fw, 0, "iwmfw", INFSLP);
 		if (err)
 			break;
 	}
@@ -4320,7 +4320,7 @@ iwm_load_firmware(struct iwm_softc *sc, enum iwm_ucode_type ucode_type)
 		return err;
 
 	/* wait for the firmware to load */
-	err = tsleep_nsec(&sc->sc_uc, 0, "iwmuc", SEC_TO_NSEC(1));
+	err = tsleep_nsec(&sc->sc_uc, 0, "iwmuc", INFSLP);
 	if (err || !sc->sc_uc.uc_ok)
 		printf("%s: could not load firmware\n", DEVNAME(sc));
 
@@ -4526,7 +4526,7 @@ iwm_run_init_mvm_ucode(struct iwm_softc *sc, int justnvm)
 	 */
 	while ((sc->sc_init_complete & wait_flags) != wait_flags) {
 		err = tsleep_nsec(&sc->sc_init_complete, 0, "iwminit",
-		    SEC_TO_NSEC(2));
+		    INFSLP);
 		if (err)
 			break;
 	}
@@ -6426,7 +6426,7 @@ iwm_send_cmd(struct iwm_softc *sc, struct iwm_host_cmd *hcmd)
 	IWM_WRITE(sc, IWM_HBUS_TARG_WRPTR, ring->qid << 8 | ring->cur);
 
 	if (!async) {
-		err = tsleep_nsec(desc, PCATCH, "iwmcmd", SEC_TO_NSEC(1));
+		err = tsleep_nsec(desc, PCATCH, "iwmcmd", INFSLP);
 		if (err == 0) {
 			/* if hardware is no longer up, return error */
 			if (generation != sc->sc_generation) {
@@ -10422,18 +10422,24 @@ iwm_init(struct ifnet *ifp)
 
 	/* 
 	 * ieee80211_begin_scan() ends up scheduling iwm_newstate_task().
-	 * Wait until the transition to SCAN state has completed.
+	 * Wait until the transition to SCAN state has completed. The state
+	 * is checked before sleeping: a join that restarts an interface
+	 * already scanning gets no wakeup and must not time out. INFSLP is
+	 * capped at 10 s by the OSyx compat layer instead of never timing
+	 * out as on OpenBSD.
 	 */
-	do {
+	while (ic->ic_state != IEEE80211_S_SCAN) {
 		err = tsleep_nsec(&ic->ic_state, PCATCH, "iwminit",
-		    SEC_TO_NSEC(1));
+		    INFSLP);
 		if (generation != sc->sc_generation)
 			return ENXIO;
-		if (err) {
-			iwm_stop(ifp);
-			return err;
-		}
-	} while (ic->ic_state != IEEE80211_S_SCAN);
+		if (err)
+			break;
+	}
+	if (ic->ic_state != IEEE80211_S_SCAN) {
+		iwm_stop(ifp);
+		return err ? err : ETIMEDOUT;
+	}
 
 	return 0;
 }

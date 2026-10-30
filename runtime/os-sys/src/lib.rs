@@ -182,6 +182,17 @@ mod imp {
         decode(syscall1(nr::SET_FS_BASE, base as u64)).map(|_| ())
     }
 
+    /// Sets the FS base that 32-bit compatibility-mode code sees at
+    /// `fs:[0x18]` (the 32-bit TEB); 0 removes it and restores the calling
+    /// thread's 64-bit FS base. `base` must be page-aligned and below 4 GiB.
+    ///
+    /// A non-zero base takes effect immediately (FS is loaded from the
+    /// descriptor), so 64-bit code in the same thread regains its TLS with
+    /// [`set_fs_base`]; the WoW64 bridge flips the two at each mode crossing.
+    pub fn set_fs32_base(base: usize) -> Result<(), Errno> {
+        decode(syscall1(nr::SET_FS32_BASE, base as u64)).map(|_| ())
+    }
+
     /// The calling thread's kernel id. OSyx Std stores it in its TCB at
     /// `fs:[8]` (after the self pointer at `fs:[0]`); the system call is only
     /// needed for threads whose TCB is missing or not filled in yet.

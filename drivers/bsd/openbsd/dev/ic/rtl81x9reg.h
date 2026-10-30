@@ -933,6 +933,11 @@ struct rl_softc {
 #define	RL_IMTYPE_HW		2	/* hardware based */
 	int			rl_timerintr;
 
+#ifdef __OSYX__
+	unsigned int		rl_osyx_diag_ticks;
+	u_int16_t		rl_osyx_isr_seen;
+#endif
+
 	struct kstat		*rl_kstat;
 };
 
