@@ -153,7 +153,12 @@ fn install(log: &mut Log, m: &Manifest, payload: &str) -> Result<usize, String> 
                 if let Some((dir, _)) = to.rsplit_once('/') {
                     fs::create_dir_all(dir).map_err(|err| format!("{dir}: {err}"))?;
                 }
-                let file = fs::File::create(&tmp).map_err(|err| format!("{tmp}: {err}"))?;
+                match fs::remove_file(&tmp) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == os_std::error::ErrorKind::NotFound => {}
+                    Err(err) => return Err(format!("{tmp}: {err}")),
+                }
+                let file = fs::File::create_new(&tmp).map_err(|err| format!("{tmp}: {err}"))?;
                 temporary.push(tmp.clone());
                 Some(file)
             };
