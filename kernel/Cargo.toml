@@ -28,6 +28,6 @@ osyx-part = { path = "../storage/part" }
 osyx-tmpfs = { path = "../storage/tmpfs" }
 osyx-vfs = { path = "../storage/vfs" }
 # The live root (a boot module) is zlib-compressed; no_std with alloc only.
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 # Zstandard decoder (pure Rust, MIT) for the live root (OSYXLR2).
 ruzstd = { version = "0.9.1", default-features = false }

@@ -52,4 +52,4 @@ prism-core = { path = "../../graphics/prism-core" }
 prism-proto = { path = "../../graphics/prism-proto" }
 osyx-install = { path = "../install" }
 osyx-crypto = { path = "../../shared/crypto" }
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
