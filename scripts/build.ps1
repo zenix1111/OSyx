@@ -77,9 +77,9 @@ if (-not $NoZen -and -not $NoInit -and -not $KeepRoot) {
     # Program -> directory on the root file system. The graphical session
     # (PRISM, the desktop shell and its applications) lives in /system/bin.
     $installDirs = [ordered]@{
-        init = 'bin'; worker = 'bin'; probe = 'usr/bin'; axis = 'bin'; firstboot = 'bin'; fetch = 'bin'; get = 'bin'; 'osyx-update' = 'bin'; batteryd = 'bin'
+        init = 'bin'; worker = 'bin'; probe = 'usr/bin'; axis = 'bin'; firstboot = 'bin'; fetch = 'bin'; get = 'bin'; 'osyx-update' = 'bin'; batteryd = 'bin'; i2chidd = 'bin'
         prism = 'system/bin'; desktop = 'system/bin'; terminal = 'system/bin'; files = 'system/bin'; sysinfo = 'system/bin'
-        ping = 'bin'; net = 'bin'; netstat = 'bin'; dns = 'bin'; nc = 'bin'; timesync = 'bin'
+        ping = 'bin'; net = 'bin'; netstat = 'bin'; dns = 'bin'; nc = 'bin'; timesync = 'bin'; 'wifi-watch' = 'bin'
         winrun = 'bin'
         taskmgr = 'system/bin'; settings = 'system/bin'; setup = 'system/bin'
         zen = 'system/bin'; open = 'bin'; 'run-app' = 'system/bin'

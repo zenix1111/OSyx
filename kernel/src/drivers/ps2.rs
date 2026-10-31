@@ -10,7 +10,7 @@
 //! The keyboard runs scan code set 2 with the controller translating to set
 //! 1, which is converted to HID usages for the input core. The mouse is
 //! reset and switched to IntelliMouse mode when it supports it (wheel,
-//! 4-byte packets); touchpads behind I2C rather than PS/2 are not covered.
+//! 4-byte packets); touchpads behind I2C rather than PS/2 are in `drivers::i2c`.
 
 use crate::arch::cpu::{inb, outb};
 use crate::arch::timer::{self, Deadline};

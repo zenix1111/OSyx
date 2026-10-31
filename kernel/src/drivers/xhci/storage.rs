@@ -35,6 +35,7 @@ const SCSI_READ_CAPACITY_10: u8 = 0x25;
 const SCSI_READ_10: u8 = 0x28;
 const SCSI_WRITE_10: u8 = 0x2A;
 const SCSI_SYNC_CACHE_10: u8 = 0x35;
+const SCSI_START_STOP_UNIT: u8 = 0x1B;
 const SCSI_READ_CAPACITY_16: u8 = 0x9E;
 
 static DISKS: AtomicUsize = AtomicUsize::new(0);
@@ -45,6 +46,8 @@ pub(super) enum Op {
     Read,
     Write,
     Flush,
+    /// Flush the drive's cache and spin it down (START STOP UNIT).
+    Eject,
 }
 
 pub(super) struct Request {
@@ -78,6 +81,30 @@ pub(super) fn has_work(controller: usize) -> bool {
     QUEUE.lock().iter().any(|r| r.controller == controller)
 }
 
+/// Fails every queued request for a device that was unplugged, so no
+/// caller waits for the full request timeout.
+pub(super) fn fail_pending(controller: usize, slot: u8) {
+    let failed: Vec<Arc<Request>> = {
+        let mut queue = QUEUE.lock();
+        let mut keep = VecDeque::new();
+        let mut failed = Vec::new();
+        while let Some(r) = queue.pop_front() {
+            if r.controller == controller && r.slot == slot {
+                failed.push(r);
+            } else {
+                keep.push_back(r);
+            }
+        }
+        *queue = keep;
+        failed
+    };
+    for r in failed {
+        r.ok.store(false, Ordering::Release);
+        r.done.store(true, Ordering::Release);
+    }
+    WAKE.wake_all();
+}
+
 /// Per-disk SCSI state, stored with the USB device in the controller.
 pub(super) struct StorageState {
     pub(super) dci_in: u8,
@@ -88,6 +115,11 @@ pub(super) struct StorageState {
     pub(super) tag: u32,
     pub(super) generation: u64,
     pub(super) failed: bool,
+    /// Shared with the block device: set when the drive is unplugged or
+    /// ejected, after which its I/O fails at once.
+    pub(super) gone: Arc<AtomicBool>,
+    /// Block device name, for the storage manager when the drive vanishes.
+    pub(super) disk_name: String,
 }
 
 /// A USB disk seen by the block layer.
@@ -97,11 +129,16 @@ pub struct UsbDisk {
     generation: u64,
     name: String,
     what: String,
+    model: String,
     sectors: u64,
+    gone: Arc<AtomicBool>,
 }
 
 impl UsbDisk {
     fn request(&self, op: Op, lba: u64, len: usize, data: Option<&[u8]>) -> Result<Vec<u8>, BlockError> {
+        if self.gone.load(Ordering::Acquire) {
+            return Err(BlockError::Io);
+        }
         if len > MAX_TRANSFER || !len.is_multiple_of(SECTOR_SIZE) {
             return Err(BlockError::InvalidRequest);
         }
@@ -164,6 +201,27 @@ impl BlockDev for UsbDisk {
 
     fn flush(&self) -> Result<(), BlockError> {
         self.request(Op::Flush, 0, 0, None).map(|_| ())
+    }
+
+    fn removable(&self) -> bool {
+        true
+    }
+
+    fn present(&self) -> bool {
+        !self.gone.load(Ordering::Acquire)
+    }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn eject(&self) -> Result<(), BlockError> {
+        // The stop command may be refused by sticks that cannot spin
+        // down; the cache flush before it is what matters, and its failure
+        // is reported.
+        let r = self.request(Op::Eject, 0, 0, None).map(|_| ());
+        self.gone.store(true, Ordering::Release);
+        r
     }
 }
 
@@ -262,6 +320,19 @@ impl Xhci {
             Op::Flush => {
                 let cdb = [SCSI_SYNC_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
                 self.scsi(request.slot, &cdb, false, 0, None)?;
+            }
+            Op::Eject => {
+                let cdb = [SCSI_SYNC_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                self.scsi(request.slot, &cdb, false, 0, None)?;
+                // IMMED = 0, START = 0, LOEJ = 0: stop the unit. Drives that
+                // do not implement it answer with a SCSI status; the data is
+                // on the medium by now.
+                let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0, 0];
+                if let Err(e) = self.scsi(request.slot, &stop, false, 0, None) {
+                    if !matches!(e, XhciError::Scsi(_)) {
+                        return Err(e);
+                    }
+                }
             }
         }
         Ok(())
@@ -387,6 +458,7 @@ impl Xhci {
             )
         };
         let generation = GENERATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        let gone = Arc::new(AtomicBool::new(false));
         {
             let device = self.devices.get_mut(&slot).ok_or(XhciError::BadSlot)?;
             device.storage = Some(StorageState {
@@ -398,6 +470,8 @@ impl Xhci {
                 tag: 0,
                 generation,
                 failed: false,
+                gone: gone.clone(),
+                disk_name: String::new(),
             });
         }
 
@@ -470,7 +544,16 @@ impl Xhci {
             vendor,
             what
         );
-        block::register(Arc::new(UsbDisk { controller: self.index, slot, generation, name, what, sectors }));
+        let model = match (vendor.is_empty(), product.is_empty()) {
+            (false, false) => alloc::format!("{vendor} {product}"),
+            (true, false) => product.clone(),
+            (false, true) => vendor.clone(),
+            (true, true) => String::new(),
+        };
+        if let Some(state) = self.devices.get_mut(&slot).and_then(|d| d.storage.as_mut()) {
+            state.disk_name = name.clone();
+        }
+        block::register(Arc::new(UsbDisk { controller: self.index, slot, generation, name, what, model, sectors, gone }));
         Ok(())
     }
 }

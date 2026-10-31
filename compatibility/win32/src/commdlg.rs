@@ -321,8 +321,42 @@ extern "win64" fn ILFree(pidl: u64) {
     crate::ole32::CoTaskMemFree(pidl);
 }
 
+extern "win64" fn ChooseColorW(cc: u64) -> i32 {
+    set_error(0);
+    if cc == 0 {
+        set_error(2); // CDERR_INITIALIZATION
+        return 0;
+    }
+    if unsafe { teb::get::<u32>(cc, 0) } != 72 {
+        set_error(1); // CDERR_STRUCTSIZE
+        return 0;
+    }
+    0 // cancelled
+}
+
+extern "win64" fn PrintDlgExW(pd: u64) -> u32 {
+    if pd == 0 || unsafe { teb::get::<u32>(pd, 0) } != 136 {
+        return 0x8007_0057; // E_INVALIDARG
+    }
+    // PD_RETURNDEFAULT = 0x0400: OSyx has no default printer.
+    if unsafe { teb::get::<u32>(pd, 28) } & 0x0400 != 0 {
+        set_error(0x1008); // PDERR_NODEFAULTPRN
+        return 0x8000_4005; // E_FAIL
+    }
+    unsafe { teb::put(pd, 128, 0u32) }; // PD_RESULT_CANCEL
+    0 // S_OK
+}
+
 pub fn exports() -> Vec<(&'static str, u64)> {
-    export_table![GetOpenFileNameW, GetOpenFileNameA, GetSaveFileNameW, GetSaveFileNameA, CommDlgExtendedError]
+    export_table![
+        GetOpenFileNameW,
+        GetOpenFileNameA,
+        GetSaveFileNameW,
+        GetSaveFileNameA,
+        ChooseColorW,
+        PrintDlgExW,
+        CommDlgExtendedError
+    ]
 }
 pub fn shell_exports() -> Vec<(&'static str, u64)> {
     export_table![

@@ -12,10 +12,13 @@
 //! * `fault`:       dereference an unmapped address (the kernel must kill us)
 //! * `panic`:       panic (OSyx Std must report it and exit with 101)
 //! * `exit,<code>`: exit with `<code>`
+//! * `i2c`:         run /bin/i2chidd (HID over I2C discovery) and exit with its status
 //! * `swap-stress`: exercise compressible anonymous pages under memory pressure
 //! * `crash-prep`:  leave an open, removed file on / for the power-cut test
 //! * `net,<tcp>,<udp>`: network checks against the host's echo servers on
 //!   10.0.2.2 (see `net_checks.rs`); exit status = failed checks
+//! * `media`:      USB stick automount / eject / unplug checks (see
+//!   `media_checks.rs`); exit status = failed checks
 //! * `win,<tcp>,<udp>`: Windows PE32+ programs under /bin/winrun (see
 //!   `win_checks.rs`); exit status = failed checks
 
@@ -27,6 +30,8 @@ use os_std::os::raw::{self, Errno, PROT_EXEC, PROT_READ, PROT_WRITE};
 use os_std::prelude::*;
 use os_std::process::{Child, Command};
 use os_std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use os_std::mpsc;
+use os_std::sync::{Once, OnceLock, RwLock};
 use os_std::time::{Duration, Instant};
 use os_std::{env, fs, os, process, thread};
 
@@ -38,6 +43,8 @@ mod fpu;
 mod fs_checks;
 #[path = "../ipc_checks.rs"]
 mod ipc_checks;
+#[path = "../media_checks.rs"]
+mod media_checks;
 #[path = "../net_checks.rs"]
 mod net_checks;
 #[path = "../win_checks.rs"]
@@ -101,16 +108,56 @@ fn main() -> i32 {
             let code = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             process::exit(code);
         }
+        // `tests,i2c`: run the HID over I2C discovery service (ACPI -> kernel
+        // driver) and exit with its status. The i2c-hid-test script gives the
+        // VM an SSDT with a touchpad whose controller does not exist.
+        Some("i2c") => {
+            return match Command::new("/bin/i2chidd").status() {
+                Ok(s) => {
+                    println!("init: i2chidd exit status {:?}", s.code());
+                    s.code().unwrap_or(1)
+                }
+                Err(e) => {
+                    eprintln!("init: cannot run /bin/i2chidd: {e}");
+                    1
+                }
+            };
+        }
         Some("desktop") => return desktop_session(),
         // QEMU has no battery: after batteryd has reported none, publish a
         // charging battery at 73 %, then a discharging one at 12 %, so the
-        // taskbar indicator can be checked.
+        // taskbar indicator and its details can be checked.
         Some("battery-demo") => {
+            use osyx_abi::battery::{State, Status};
             thread::spawn(|| {
-                for (delay, state) in [(10, "73 1 1\n"), (8, "12 0 0\n")] {
+                let charging = Status {
+                    state: State::Charging,
+                    percent: 73,
+                    ac: true,
+                    batteries: 1,
+                    minutes_to_full: Some(35),
+                    energy_mwh: Some(35_000),
+                    capacity_mwh: Some(48_000),
+                    design_mwh: Some(57_000),
+                    rate_mw: Some(22_000),
+                    voltage_mv: Some(12_100),
+                    ..Status::NONE
+                };
+                let discharging = Status {
+                    state: State::Discharging,
+                    percent: 12,
+                    ac: false,
+                    minutes_to_full: None,
+                    minutes_to_empty: Some(40),
+                    energy_mwh: Some(5_800),
+                    rate_mw: Some(8_700),
+                    ..charging
+                };
+                for (delay, state) in [(10, charging), (8, discharging)] {
                     thread::sleep(Duration::from_secs(delay));
-                    let _ = fs::write(osyx_abi::BATTERY_STATUS_PATH, state);
-                    println!("BATTERY_DEMO {}", state.trim_end());
+                    let text = state.to_string();
+                    let _ = fs::write(osyx_abi::BATTERY_STATUS_PATH, &text);
+                    println!("BATTERY_DEMO {}", text.trim_end().replace('\n', " | "));
                 }
             });
             return desktop_session();
@@ -124,6 +171,23 @@ fn main() -> i32 {
             let mode = args.get(3).map(String::as_str).unwrap_or("");
             return zen_probe(args.get(2).map(String::as_str), mode == "trace", mode == "mozlog", mode == "events", mode == "count", true, mode == "prof");
         }
+        // `init tests winapp <program> [args...]`: PRISM and then one Windows
+        // GUI program (an installer, for instance) with winrun's verbose log.
+        Some("winapp") => {
+            if let Err(e) = Command::new("/system/bin/prism").spawn() {
+                println!("winapp: PRISM did not start: {e}");
+                return 1;
+            }
+            thread::sleep(Duration::from_secs(2));
+            let mut c = Command::new("/bin/winrun");
+            c.arg("-v");
+            for a in &args[2..] {
+                c.arg(a);
+            }
+            let code = c.status().ok().and_then(|s| s.code()).unwrap_or(1);
+            println!("winapp: exit status {code}");
+            return code;
+        }
         // `init winrun <program> [args...]`: one Windows program with no
         // sessions around it, for bring-up diagnostics.
         Some("winrun") => {
@@ -134,6 +198,8 @@ fn main() -> i32 {
             }
             return c.status().ok().and_then(|s| s.code()).unwrap_or(1);
         }
+        // USB stick scenario driven by scripts/usb-storage-test.ps1.
+        Some("media") => return media_checks::run(),
         Some("net") => {
             let port = |i: usize, d: u16| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
             let mut t = Tests::default();
@@ -602,10 +668,45 @@ fn desktop_session() -> i32 {
             Err(e) => eprintln!("init: cannot start /bin/firstboot: {e}"),
         }
     }
-    // Battery and AC state for the taskbar (ACPI; runs as root).
-    match Command::new("/bin/batteryd").spawn() {
-        Ok(c) => println!("init: battery state kept by process {}", c.id()),
-        Err(e) => eprintln!("init: cannot start /bin/batteryd: {e}"),
+    // Battery and AC state for the taskbar (ACPI; runs as root). The AML
+    // interpreter can meet firmware it cannot handle and end the process:
+    // it is started again a few times.
+    thread::spawn(|| {
+        const GIVE_UP_AFTER: u32 = 8;
+        let mut quick_failures = 0;
+        loop {
+            let started = Instant::now();
+            match Command::new("/bin/batteryd").status() {
+                Ok(s) if s.success() => {
+                    println!("init: batteryd finished");
+                    return;
+                }
+                Ok(s) => eprintln!("init: batteryd ended with status {:#x}", s.raw()),
+                Err(e) => {
+                    eprintln!("init: cannot start /bin/batteryd: {e}");
+                    return;
+                }
+            }
+            // A run of a minute or more was working: it starts the count over.
+            quick_failures = if started.elapsed() >= Duration::from_secs(60) { 1 } else { quick_failures + 1 };
+            if quick_failures >= GIVE_UP_AFTER {
+                eprintln!("init: batteryd keeps failing; no battery state will be published");
+                return;
+            }
+            thread::sleep(Duration::from_secs(5 * quick_failures as u64));
+        }
+    });
+    println!("init: battery state kept by /bin/batteryd");
+    // Touchpads and keyboards on I2C (HID over I2C): ACPI discovery, then the
+    // kernel driver takes over. Runs as root and exits when done.
+    match Command::new("/bin/i2chidd").spawn() {
+        Ok(c) => println!("init: HID over I2C discovery running (process {})", c.id()),
+        Err(e) => eprintln!("init: cannot start /bin/i2chidd: {e}"),
+    }
+    // Recover an established Wi-Fi connection when its gateway stops responding.
+    match Command::new("/bin/wifi-watch").spawn() {
+        Ok(c) => println!("init: Wi-Fi recovery running (process {})", c.id()),
+        Err(e) => eprintln!("init: cannot start /bin/wifi-watch: {e}"),
     }
     // Network time: the clock is set once a network is up.
     match Command::new("/bin/timesync").arg("--daemon").spawn() {
@@ -855,6 +956,93 @@ fn thread_checks(t: &mut Tests) {
         let start = Instant::now();
         let (_g, r) = cv.wait_timeout(m.lock().unwrap(), Duration::from_millis(30)).unwrap();
         r.timed_out() && start.elapsed() >= Duration::from_millis(30)
+    });
+    t.check("RwLock: readers share, writers exclude", || {
+        // The pair must never be seen half-updated: a writer between the two
+        // stores would be caught by a concurrent reader.
+        let lock = Arc::new(RwLock::new((0u64, 0u64)));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let lock = lock.clone();
+                thread::spawn(move || {
+                    for _ in 0..4_000 {
+                        let g = lock.read().unwrap();
+                        if g.0 != g.1 {
+                            return false;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    true
+                })
+            })
+            .collect();
+        let writer = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                for _ in 0..1_000 {
+                    let mut g = lock.write().unwrap();
+                    g.0 += 1;
+                    core::hint::spin_loop();
+                    g.1 += 1;
+                }
+            })
+        };
+        let readers_ok = readers.into_iter().all(|h| h.join().unwrap_or(false));
+        readers_ok && writer.join().is_ok() && *lock.read().unwrap() == (1_000, 1_000)
+    });
+    t.check("Once / OnceLock: initialise exactly once", || {
+        let once = Arc::new(Once::new());
+        let runs = Arc::new(AtomicU32::new(0));
+        let cell = Arc::new(OnceLock::<u64>::new());
+        let hs: Vec<_> = (0..4u64)
+            .map(|i| {
+                let once = once.clone();
+                let runs = runs.clone();
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    once.call_once(|| {
+                        runs.fetch_add(1, Ordering::Relaxed);
+                    });
+                    *cell.get_or_init(|| i * 10)
+                })
+            })
+            .collect();
+        let values: Vec<u64> = hs.into_iter().filter_map(|h| h.join().ok()).collect();
+        let expected = cell.get().copied();
+        runs.load(Ordering::Relaxed) == 1
+            && values.len() == 4
+            && values.iter().all(|v| Some(*v) == expected)
+    });
+    t.check("mpsc: 4 senders, bounded try_send, timeout", || {
+        let (tx, rx) = mpsc::channel::<u64>();
+        let hs: Vec<_> = (0..4u64)
+            .map(|i| {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    for j in 0..100 {
+                        tx.send(i * 100 + j).unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        let mut sum = 0;
+        while let Ok(v) = rx.recv() {
+            sum += v;
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let full_ok = {
+            let (stx, srx) = mpsc::sync_channel::<u8>(1);
+            stx.try_send(1).is_ok()
+                && matches!(stx.try_send(2), Err(mpsc::TrySendError::Full(2)))
+                && srx.recv() == Ok(1)
+        };
+        let (ktx, krx) = mpsc::channel::<u8>();
+        let timeout_ok = krx.recv_timeout(Duration::from_millis(10)) == Err(mpsc::RecvTimeoutError::Timeout);
+        drop(ktx);
+        sum == 100 * (0..4u64).sum::<u64>() * 100 + 4 * (0..100u64).sum::<u64>() && full_ok && timeout_ok
     });
     t.check("futex: value mismatch and timeout", || {
         let word = AtomicU32::new(0);

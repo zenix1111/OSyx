@@ -4,15 +4,16 @@
 //! Every request is a descriptor chain: a 16-byte header (type, sector), the
 //! data pages and a one-byte status the device writes last. Data goes
 //! through DMA pages owned by the driver (bounce buffers), so callers can
-//! pass any kernel buffer. One request is in flight per disk at a time.
+//! pass any kernel buffer. A transfer larger than one chain is split into
+//! several chains submitted together, so the device overlaps them.
 
-use super::virtio::{Buffer, Transport, VirtioError, Virtqueue};
+use super::virtio::{AsyncQueue, Buffer, Transport, VirtioError};
+use crate::arch::timer::Deadline;
 use crate::block::{BlockDev, BlockError, SECTOR_SIZE};
 use crate::mem::{alloc_frame, phys_to_virt, PAGE_SIZE};
 use crate::pci;
 use crate::sync::KMutex;
-use alloc::format;
-use alloc::string::String;
+use alloc::{format, string::String, vec::Vec};
 
 /// Transitional and modern virtio-blk PCI device ids.
 pub const DEVICE_IDS: [u16; 2] = [0x1001, 0x1042];
@@ -29,6 +30,11 @@ const S_OK: u8 = 0;
 /// smaller queue use fewer pages.
 const MAX_DATA_PAGES: usize = 256;
 const PAGE: usize = PAGE_SIZE as usize;
+/// Chains submitted together for one call: the device works on them
+/// concurrently, so a read-ahead run overlaps disk latency.
+const SLOTS: usize = 4;
+const TIMEOUT_MS: u64 = 5000;
+const SPIN_POLLS: u32 = 1000;
 
 // TEMP per-request timing.
 static OPS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
@@ -55,15 +61,17 @@ pub fn request_stats() -> [(u64, u64, u64, u64, u64); 3] {
 }
 
 struct Inner {
-    queue: Virtqueue,
-    /// Request header at offset 0, status byte at offset 16.
-    header: u64,
-    data: [u64; MAX_DATA_PAGES],
-    /// Descriptor chain template: header, data pages, status. Kept off the
-    /// stack because the request path runs on deep write-back stacks.
-    chain: alloc::boxed::Box<[Buffer]>,
-    /// DMA pages actually used by one request.
-    pages: usize,
+    queue: AsyncQueue,
+    /// One header/status frame per slot: request header at offset 0, status
+    /// byte at offset 16.
+    headers: Vec<u64>,
+    /// DMA data pages, `pages_per_slot` per slot.
+    data: Vec<u64>,
+    /// Descriptor chain templates side by side, `pages_per_slot + 2` per
+    /// slot. Kept off the stack because the request path runs on deep
+    /// write-back stacks.
+    chains: alloc::boxed::Box<[Buffer]>,
+    pages_per_slot: usize,
     /// Set after a timeout: the device may still own the buffers.
     failed: bool,
 }
@@ -90,22 +98,25 @@ impl VirtioBlk {
     pub fn probe(dev: &pci::Device, name: String) -> Result<VirtioBlk, VirtioError> {
         let t = Transport::new(dev)?;
         let features = t.negotiate(F_RO | F_FLUSH)?;
-        let queue = t.setup_queue(0)?;
-        let data_pages = (queue.size() as usize).saturating_sub(2).min(MAX_DATA_PAGES);
-        if data_pages < 2 {
+        let queue = t.setup_async_queue(0, None)?;
+        // Each slot owns a chain and a status byte; keep one chain's worth of
+        // descriptors for every slot.
+        let pages_per_slot = (queue.size() as usize - 2 * SLOTS) / SLOTS;
+        let pages_per_slot = pages_per_slot.min(MAX_DATA_PAGES / SLOTS);
+        if pages_per_slot < 2 {
             return Err(VirtioError::NoQueue);
         }
-        let header = alloc_frame().ok_or(VirtioError::OutOfMemory)?;
-        let mut data = [0u64; MAX_DATA_PAGES];
-        for d in data.iter_mut().take(data_pages) {
-            *d = alloc_frame().ok_or(VirtioError::OutOfMemory)?;
+        let pages = pages_per_slot * SLOTS;
+        let mut headers = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            headers.push(alloc_frame().ok_or(VirtioError::OutOfMemory)?);
         }
-        let mut chain = alloc::vec::Vec::with_capacity(data_pages + 2);
-        chain.push(Buffer { phys: header, len: 16, device_writes: false });
-        for &page in &data[..data_pages] {
-            chain.push(Buffer { phys: page, len: PAGE as u32, device_writes: false });
+        let mut data = Vec::with_capacity(pages);
+        for _ in 0..pages {
+            data.push(alloc_frame().ok_or(VirtioError::OutOfMemory)?);
         }
-        chain.push(Buffer { phys: header + 16, len: 1, device_writes: true });
+        let chains = alloc::vec![Buffer { phys: 0, len: 0, device_writes: false }; SLOTS * (pages_per_slot + 2)]
+            .into_boxed_slice();
         t.driver_ok();
         let capacity = t.device_config_u64(0);
         crate::kprintln!(
@@ -126,13 +137,13 @@ impl VirtioBlk {
             capacity,
             read_only: features & F_RO != 0,
             can_flush: features & F_FLUSH != 0,
-            data_pages,
+            data_pages: pages,
             inner: KMutex::new(Inner {
                 queue,
-                header,
+                headers,
                 data,
-                chain: chain.into_boxed_slice(),
-                pages: data_pages,
+                chains,
+                pages_per_slot,
                 failed: false,
             }),
             _transport: t,
@@ -152,38 +163,82 @@ impl VirtioBlk {
             Dir::Write => T_OUT,
             Dir::Flush => T_FLUSH,
         };
-        let hv = phys_to_virt(g.header);
-        // SAFETY: the header frame belongs to this driver; the device does not
-        // own it between requests.
-        unsafe {
-            core::ptr::write_volatile(hv as *mut u32, kind);
-            core::ptr::write_volatile((hv + 4) as *mut u32, 0);
-            core::ptr::write_volatile((hv + 8) as *mut u64, lba);
-            core::ptr::write_volatile((hv + 16) as *mut u8, 0xFF);
-        }
         let pages = len.div_ceil(PAGE);
-        if pages > g.pages {
+        let per_slot = g.pages_per_slot;
+        if pages > per_slot * SLOTS {
             return Err(BlockError::InvalidRequest);
         }
         let inner = &mut *g;
         stage(&inner.data[..pages]);
-        let header = inner.header;
-        let chain = &mut inner.chain[..pages + 2];
-        chain[0] = Buffer { phys: header, len: 16, device_writes: false };
-        for i in 0..pages {
-            let n = (len - i * PAGE).min(PAGE) as u32;
-            chain[1 + i] = Buffer { phys: inner.data[i], len: n, device_writes: dir == Dir::Read };
+        let chunks = pages.div_ceil(per_slot).max(1);
+        for i in 0..chunks {
+            let first = i * per_slot;
+            let count = pages.saturating_sub(first).min(per_slot);
+            let header = inner.headers[i];
+            let hv = phys_to_virt(header);
+            // SAFETY: the header frame belongs to this slot and the device
+            // does not own it until the chain below is queued.
+            unsafe {
+                core::ptr::write_volatile(hv as *mut u32, kind);
+                core::ptr::write_volatile((hv + 4) as *mut u32, 0);
+                core::ptr::write_volatile((hv + 8) as *mut u64, lba + (first * PAGE / SECTOR_SIZE) as u64);
+                core::ptr::write_volatile((hv + 16) as *mut u8, 0xFF);
+            }
+            let base = i * (per_slot + 2);
+            let chain = &mut inner.chains[base..base + count + 2];
+            chain[0] = Buffer { phys: header, len: 16, device_writes: false };
+            for j in 0..count {
+                let n = (len - (first + j) * PAGE).min(PAGE) as u32;
+                chain[1 + j] = Buffer { phys: inner.data[first + j], len: n, device_writes: dir == Dir::Read };
+            }
+            chain[1 + count] = Buffer { phys: header + 16, len: 1, device_writes: true };
         }
-        chain[1 + pages] = Buffer { phys: header + 16, len: 1, device_writes: true };
-        if let Err(e) = inner.queue.run(chain) {
-            crate::kprintln!("virtio-blk {}: request failed: {:?}; disk disabled", self.name, e);
-            inner.failed = true;
-            return Err(BlockError::Io);
+        // All chains of this call are queued before the doorbell: the device
+        // then reads them concurrently instead of one round trip each.
+        let mut pending = [(0u16, 0usize); SLOTS];
+        {
+            let Inner { queue, chains, .. } = &mut *inner;
+            for (i, p) in pending.iter_mut().take(chunks).enumerate() {
+                let base = i * (per_slot + 2);
+                let count = pages.saturating_sub(i * per_slot).min(per_slot);
+                // The slot sizing above guarantees room for every chain.
+                let head = queue.add(&chains[base..base + count + 2]).expect("chains fit the queue");
+                *p = (head, i);
+            }
+            queue.kick();
         }
-        // SAFETY: the device has returned the chain.
-        let status = unsafe { core::ptr::read_volatile((hv + 16) as *const u8) };
-        if status != S_OK {
-            return Err(BlockError::Io);
+        let deadline = Deadline::after_ms(TIMEOUT_MS);
+        let mut polls = 0;
+        let mut done = 0;
+        while done < chunks {
+            if let Some((head, _len)) = inner.queue.pop_used() {
+                if pending[..chunks].iter().any(|&(h, _)| h == head) {
+                    done += 1;
+                    polls = 0;
+                    continue;
+                }
+                crate::kprintln!("virtio-blk {}: used an unknown descriptor {}; disk disabled", self.name, head);
+                inner.failed = true;
+                return Err(BlockError::Io);
+            }
+            if deadline.expired() {
+                crate::kprintln!("virtio-blk {}: request timed out; disk disabled", self.name);
+                inner.failed = true;
+                return Err(BlockError::Io);
+            }
+            if polls < SPIN_POLLS {
+                polls += 1;
+                core::hint::spin_loop();
+            } else {
+                crate::sched::yield_now();
+            }
+        }
+        for &header in &inner.headers[..chunks] {
+            // SAFETY: the device has returned every chain.
+            let status = unsafe { core::ptr::read_volatile((phys_to_virt(header) + 16) as *const u8) };
+            if status != S_OK {
+                return Err(BlockError::Io);
+            }
         }
         fetch(&inner.data[..pages]);
         let dt = crate::arch::timer::tsc().wrapping_sub(t0);

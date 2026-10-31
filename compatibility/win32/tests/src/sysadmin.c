@@ -86,6 +86,29 @@ void __stdcall start(void) {
     check("device hardware ID is PCI", SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, &prop_type, (BYTE *)hwid, sizeof hwid, &bytes) && hwid[0] == 'P' && hwid[1] == 'C' && hwid[2] == 'I');
     check("device registry mutation is not claimed supported", !SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_SERVICE, &prop_type, (BYTE *)hwid, sizeof hwid, &bytes) && GetLastError() == ERROR_NOT_SUPPORTED);
     check("device set closed once", SetupDiDestroyDeviceInfoList(set) && !SetupDiDestroyDeviceInfoList(set) && GetLastError() == ERROR_INVALID_HANDLE);
+    ULONG aa_size = 0;
+    check("GetAdaptersAddresses size query", GetAdaptersAddresses(AF_INET, 0x90, NULL, NULL, &aa_size) == ERROR_BUFFER_OVERFLOW && aa_size >= sizeof(IP_ADAPTER_ADDRESSES));
+    IP_ADAPTER_ADDRESSES *aa = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, aa_size);
+    check("GetAdaptersAddresses populates unicast and friendly name",
+          GetAdaptersAddresses(AF_INET, 0x90, NULL, aa, &aa_size) == NO_ERROR &&
+          aa->FriendlyName && aa->FriendlyName[0] && aa->FirstUnicastAddress &&
+          aa->FirstUnicastAddress->Address.lpSockaddr && aa->FirstUnicastAddress->Address.iSockaddrLength == 16);
+    typedef DWORD(WINAPI *get_ip_if_table_fn)(USHORT, PVOID *);
+    typedef void(WINAPI *free_mib_fn)(PVOID);
+    typedef PCHAR(WINAPI *idx2name_fn)(ULONG, PCHAR);
+    get_ip_if_table_fn get_if_table2 = (get_ip_if_table_fn)(ULONG_PTR)GetProcAddress(ip, "GetIpInterfaceTable");
+    free_mib_fn free_mib = (free_mib_fn)(ULONG_PTR)GetProcAddress(ip, "FreeMibTable");
+    idx2name_fn idx2name = (idx2name_fn)(ULONG_PTR)GetProcAddress(ip, "if_indextoname");
+    ULONG *mib_tbl = NULL;
+    check("GetIpInterfaceTable and FreeMibTable", get_if_table2 && free_mib && get_if_table2(AF_INET, (PVOID *)&mib_tbl) == NO_ERROR && mib_tbl && mib_tbl[0] > 0);
+    if (mib_tbl) free_mib(mib_tbl);
+    struct sockaddr_in dst_sa = {0};
+    dst_sa.sin_family = AF_INET;
+    dst_sa.sin_addr.s_addr = 0x0100007f;
+    DWORD best_idx = 0;
+    char ifname[256] = {0};
+    check("GetBestInterfaceEx and if_indextoname", GetBestInterfaceEx((struct sockaddr *)&dst_sa, &best_idx) == NO_ERROR && idx2name && idx2name(best_idx, ifname) == ifname && ifname[0]);
+    HeapFree(GetProcessHeap(), 0, aa);
     HeapFree(GetProcessHeap(), 0, a); HeapFree(GetProcessHeap(), 0, ifs); HeapFree(GetProcessHeap(), 0, info);
     finish("sysadmin");
 }

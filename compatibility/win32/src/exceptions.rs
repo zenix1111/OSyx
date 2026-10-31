@@ -85,7 +85,9 @@ global_asm!(
 .global osyx_windows_raise_entry
 osyx_windows_raise_entry:
     pushfq
-    sub rsp,720
+    // 32 bytes of scratch below the Context, the 1024-byte Context itself
+    // (osyx_windows_raise_captured copies all of it), 16-byte aligned.
+    sub rsp,1088
     mov [rsp+32],rax
     mov [rsp+40],rbx
     mov [rsp+48],rcx
@@ -101,22 +103,21 @@ osyx_windows_raise_entry:
     mov [rsp+136],r13
     mov [rsp+144],r14
     mov [rsp+152],r15
-    lea rax,[rsp+736]
+    lea rax,[rsp+1104]
     mov [rsp+88],rax
-    mov rax,[rsp+728]
+    mov rax,[rsp+1096]
     mov [rsp+160],rax
-    mov rax,[rsp+720]
+    mov rax,[rsp+1088]
     mov [rsp+168],rax
-    xor eax,eax
-    mov [rsp+176],rax
-    mov [rsp+184],rax
-    mov [rsp+192],rax
-    mov [rsp+200],rax
+    // Exception selectors, x87/SSE/AVX state: clear the tail of the Context,
+    // then overlay FXSAVE at fx (Context+192). XSTATE_BV stays 0, so XRSTOR
+    // restores only the legacy components.
     cld
-    lea rdi,[rsp+208]
-    mov ecx,64
+    lea rdi,[rsp+176]
+    xor eax,eax
+    mov ecx,110
     rep stosq
-    fxsave64 [rsp+208]
+    fxsave64 [rsp+224]
     lea rcx,[rsp+32]
     call osyx_windows_raise_captured
     ud2
@@ -221,6 +222,8 @@ extern "win64" fn RemoveVectoredContinueHandler(id: u64) -> u32 {
     remove(id, true)
 }
 fn windows_context(n: &NativeContext) -> Context {
+    let mut fx = [0u8; 512];
+    fx.copy_from_slice(&n.fx[..512]);
     let mut c = Context {
         home: [0; 6],
         flags: 0x0010_000b,
@@ -230,7 +233,7 @@ fn windows_context(n: &NativeContext) -> Context {
         debug: [0; 6],
         regs: [0; 16],
         rip: if n.vector == 3 { n.rip.saturating_sub(1) } else { n.rip },
-        fx: n.fx,
+        fx,
         vectors: [0; 26],
         vector_control: 0,
         debug_control: 0,
@@ -295,7 +298,7 @@ fn apply(c: &Context, n: &mut NativeContext) {
     }
     if c.flags & 8 != 0 {
         let old_mxcsr = u32::from_le_bytes(n.fx[24..28].try_into().unwrap());
-        n.fx = c.fx;
+        n.fx[..512].copy_from_slice(&c.fx);
         if c.mxcsr != old_mxcsr {
             n.fx[24..28].copy_from_slice(&c.mxcsr.to_le_bytes());
         }
@@ -363,15 +366,15 @@ extern "C" fn entry(native: *mut NativeContext) -> ! {
         }
     }
     static REPORTS: Mutex<Vec<alloc::string::String>> = Mutex::new(Vec::new());
-    if crate::VERBOSE.load(Ordering::Relaxed) {
-        let delay = delay_load_failure(&record);
+    let delay = delay_load_failure(&record); let verbose = crate::VERBOSE.load(Ordering::Relaxed); if delay.is_some() || verbose {
+        let _ = &delay;
         let key = delay.clone().unwrap_or_else(|| alloc::format!("{:x}:{:x}", record.code, record.address));
         let report = {
             let mut seen = REPORTS.lock().unwrap();
             if seen.len() >= 32 || seen.contains(&key) { false } else { seen.push(key); true }
         };
         if report {
-            os_std::eprintln!("winrun: dispatching Windows exception {:#x} at {} in thread {}, info {:x?}", record.code, where_text(record.address), os_sys::gettid(), &record.info[..record.count.min(15) as usize]);
+            if verbose { os_std::eprintln!("winrun: dispatching Windows exception {:#x} at {} in thread {}, info {:x?}", record.code, where_text(record.address), os_sys::gettid(), &record.info[..record.count.min(15) as usize]); }
             if let Some(what) = delay { os_std::eprintln!("winrun: delay-load exception: {what}"); }
         }
     }

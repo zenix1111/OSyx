@@ -27,7 +27,23 @@ jobs:
           cargo test --locked
           -p osyx-abi -p osyx-bootinfo -p osyx-crypto -p osyx-input
           -p osyx-net -p osyx-update -p prism-proto -p prism-core -p osyx-ui
-          -p osyx-gfx -p osyx-elf -p osyx-pe -p osyx-pe-loader
+          -p osyx-gfx -p osyx-font -p osyx-elf -p osyx-pe -p osyx-pe-loader
+          -p osyx-shell
+
+      - name: Test wireless WPA support
+        run: cargo test --locked -p osyx-wireless --features wpa
+
+      - name: Test OSyx Std and the storage drivers
+        run: >-
+          cargo test --locked
+          -p os-std -p osyx-fat -p osyx-exfat -p osyx-vfs
+
+      - name: Test ext4 against e2fsprogs images
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs
+          bash storage/ext4/tests/gen-fixtures.sh
+          cargo test --locked -p osyx-ext4
 
   freestanding:
     name: Check OS targets

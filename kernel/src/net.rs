@@ -467,6 +467,14 @@ fn ensure_udp(s: &SocketObj, local: Option<Endpoint>) -> Result<u32, Errno> {
         let _ = stack_call(|st| st.udp_set_broadcast(id, true));
     }
     let mut g = s.state.lock();
+    if let Some(existing) = g.id {
+        // Another caller bound first. Release our stack socket through the
+        // network thread, outside the socket state lock.
+        drop(g);
+        CLOSING.lock().push((id, false));
+        wake();
+        return if local.is_some() { Err(Errno::InvalidArgument) } else { Ok(existing) };
+    }
     g.id = Some(id);
     g.bound = Some(ep);
     Ok(id)
@@ -572,13 +580,20 @@ pub fn sys_connect(h: u64, addr: u64) -> Result<u64, Errno> {
                     if s.state.lock().bound.is_some() {
                         stack_call(|st| st.tcp_connect_bound(id, remote))?;
                         s.state.lock().bound = None;
+                    } else if stack_call(|st| st.tcp_connected(id))? {
+                        return Err(Errno::AlreadyConnected);
                     }
                     id
                 }
                 None => {
                     let local = s.state.lock().bound;
                     let id = stack_call(|st| st.tcp_connect(local, remote))?;
-                    s.state.lock().id = Some(id);
+                    let mut g = s.state.lock();
+                    g.id = Some(id);
+                    // The stack socket now owns the local port; stop
+                    // reporting the bind reservation and never reuse it.
+                    g.bound = None;
+                    drop(g);
                     with_stack(|_| ());
                     id
                 }
@@ -670,6 +685,7 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
     }
     let timeout = s.recv_timeout.load(Ordering::Relaxed);
     let nonblock = flags & abi::MSG_DONTWAIT != 0;
+    let peek = flags & abi::MSG_PEEK != 0;
     let mut k = alloc::vec![0u8; len];
     let run = |op: &mut RecvOp| {
         if nonblock {
@@ -681,9 +697,15 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
     let (n, addr) = match s.kind {
         abi::SOCK_DGRAM => {
             let id = ensure_udp(&s, None)?;
-            run(&mut |st| st.udp_recv_from(id, &mut k).map(|(f, n, _)| (n, Some(to_sa(f)))))?
+            run(&mut |st| {
+                let r = if peek { st.udp_peek_from(id, &mut k) } else { st.udp_recv_from(id, &mut k) };
+                r.map(|(f, n, _)| (n, Some(to_sa(f))))
+            })?
         }
         abi::SOCK_PING => {
+            if peek {
+                return Err(Errno::NotSupported);
+            }
             let id = s.id().ok_or(Errno::BadHandle)?;
             run(&mut |st| match st.icmp_recv(id)? {
                 IcmpEvent::Reply { from, seq, ttl, data } => {
@@ -696,7 +718,10 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
         }
         abi::SOCK_STREAM => {
             let id = s.id().ok_or(Errno::NotConnected)?;
-            run(&mut |st| st.tcp_recv(id, &mut k).map(|n| (n, None)))?
+            run(&mut |st| {
+                let r = if peek { st.tcp_peek(id, &mut k) } else { st.tcp_recv(id, &mut k) };
+                r.map(|n| (n, None))
+            })?
         }
         _ => return Err(Errno::NotSupported),
     };
@@ -760,6 +785,18 @@ pub fn sys_ctl(h: u64, op: u64, arg: u64) -> Result<u64, Errno> {
             }
             let (st, _) = stack_call(|st| st.tcp_state(id))?;
             return Ok(tcp_state_index(st));
+        }
+        abi::ctl::ERROR => {
+            if s.kind != abi::SOCK_STREAM {
+                return Ok(0);
+            }
+            let Some(id) = s.id() else { return Ok(0) };
+            let err = stack_call(|st| st.tcp_take_error(id)).ok().flatten();
+            return Ok(err.map_or(0, |e| errno(e) as u64));
+        }
+        abi::ctl::AVAILABLE => {
+            let id = s.id().ok_or(Errno::NotConnected)?;
+            return Ok(stack_call(|st| st.available(id))? as u64);
         }
         _ => return Err(Errno::InvalidArgument),
     }

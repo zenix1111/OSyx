@@ -16,6 +16,9 @@ use prism_client::{Connection, Event, WindowSpec};
 pub struct Ctx {
     pub fonts: Fonts,
     pub theme: Theme,
+    pub clipboard: osyx_ui::Clipboard,
+    pub file_clipboard: Option<(Vec<String>, bool)>,
+    pub clipboard_entries: Option<Vec<prism_client::proto::ClipEntry>>,
     /// The window has keyboard focus.
     pub focused: bool,
     /// Set to leave the event loop (the window is destroyed).
@@ -24,6 +27,7 @@ pub struct Ctx {
     pub title: Option<String>,
     /// Notifications to post: (title, body).
     pub notes: Vec<(String, String)>,
+    pub drag_file: Option<String>,
 }
 
 /// A program with one PRISM window driven by [`run_app`].
@@ -32,6 +36,7 @@ pub trait App {
     fn layout(&mut self, w: u32, h: u32, cx: &mut Ctx);
     /// A toolkit event; returns true if the window must be redrawn.
     fn event(&mut self, ev: Ui, cx: &mut Ctx) -> bool;
+    fn file_drop(&mut self, _path: &str, _x: i32, _y: i32, _cx: &mut Ctx) -> bool { false }
     fn draw(&mut self, p: &mut Painter, w: u32, h: u32, cx: &Ctx);
     /// Extra handles to wait on (pipes, ...).
     fn wait_items(&self) -> Vec<WaitItem> {
@@ -74,10 +79,14 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
     let mut cx = Ctx {
         fonts: Fonts::load(),
         theme: configured_theme(),
+        clipboard: osyx_ui::Clipboard::default(),
+        file_clipboard: None,
+        clipboard_entries: None,
         focused: false,
         quit: false,
         title: None,
         notes: Vec::new(),
+        drag_file: None,
     };
     let mut adapter = Adapter::default();
     let mut size = (0, 0);
@@ -104,6 +113,10 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
             };
             win.on_event(&ev);
             match &ev {
+                Event::ClipboardChanged { entries, .. } => {
+                    cx.clipboard.receive(prism_client::proto::clipboard_text(entries));
+                    cx.file_clipboard = prism_client::proto::clipboard_files(entries);
+                }
                 Event::FocusChanged { focused, .. } => {
                     cx.focused = *focused;
                     win.dirty = true;
@@ -112,6 +125,9 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
                     if app.close_requested(&mut cx) {
                         cx.quit = true;
                     }
+                }
+                Event::FileDrop { window, path, x, y } if *window == win.id => {
+                    if app.file_drop(path, *x, *y, &mut cx) { win.dirty = true; }
                 }
                 Event::Error { message, .. } => eprintln!("{name}: PRISM error: {message}"),
                 _ => {}
@@ -124,6 +140,16 @@ pub fn run_app(name: &str, spec: WindowSpec, app: &mut dyn App) -> i32 {
             if let Some((_, ui)) = adapter.translate(&ev) {
                 if app.event(ui, &mut cx) {
                     win.dirty = true;
+                }
+                if let Some(text) = cx.clipboard.take_changed() {
+                    let entry = prism_client::proto::clipboard_text_entry(text);
+                    let _ = conn.send(&prism_client::Request::ClipboardSet { entries: vec![entry] }, &[]);
+                }
+                if let Some(entries) = cx.clipboard_entries.take() {
+                    let _ = conn.send(&prism_client::Request::ClipboardSet { entries }, &[]);
+                }
+                if let Some(path) = cx.drag_file.take() {
+                    let _ = conn.send(&prism_client::Request::FileDrag { window: win.id, path }, &[]);
                 }
             }
         }
@@ -243,6 +269,15 @@ pub fn load_apps_from(path: &str) -> Vec<AppEntry> {
         }
     }
     apps
+}
+
+/// The text of every installed application's `.app` file (for readers of
+/// keys `AppEntry` does not keep, such as `Handles=`).
+pub fn load_app_texts() -> Vec<String> {
+    let Ok(dir) = fs::read_dir(APP_DIR) else { return Vec::new() };
+    let mut names: Vec<String> = dir.map(|e| String::from(e.file_name())).filter(|n| n.ends_with(".app")).collect();
+    names.sort();
+    names.iter().filter_map(|n| fs::read_to_string(format!("{APP_DIR}/{n}")).ok()).collect()
 }
 
 pub fn load_app(path: &str) -> Option<AppEntry> {

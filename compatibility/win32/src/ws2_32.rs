@@ -19,6 +19,9 @@ const INVALID_SOCKET: u64 = u64::MAX;
 const SOCKET_ERROR: i32 = -1;
 const AF_INET: u16 = 2;
 const AF_INET6: i32 = 23;
+const AI_PASSIVE: i32 = 1;
+const AI_NUMERICHOST: i32 = 4;
+const AI_NUMERICSERV: i32 = 8;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOL_SOCKET: i32 = 0xFFFF;
@@ -403,12 +406,12 @@ extern "win64" fn setsockopt(s: u64, level: i32, name: i32, val: *const u8, len:
     })())
 }
 
-/// The options OSyx can report: the socket type, the pending error (OSyx
-/// reports errors on the failing call, so none is ever pending) and the
-/// fixed behaviours setsockopt accepts.
+/// The options OSyx can report: the socket type, the pending connect error
+/// (a failed non-blocking connect is otherwise only visible on the next
+/// call) and the fixed behaviours setsockopt accepts.
 extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *mut i32) -> i32 {
     result((|| {
-        let (_, stream) = fd(s)?;
+        let (fd, stream) = fd(s)?;
         let v: u32 = match (level, name) {
             (SOL_SOCKET, SO_TYPE) => {
                 if stream {
@@ -417,7 +420,12 @@ extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *
                     SOCK_DGRAM as u32
                 }
             }
-            (SOL_SOCKET, SO_ERROR | SO_REUSEADDR | SO_KEEPALIVE) => 0,
+            // A non-blocking connect reports its failure through SO_ERROR.
+            (SOL_SOCKET, SO_ERROR) => {
+                let code = os_sys::sock_ctl(fd, net::ctl::ERROR, 0).unwrap_or(0);
+                Errno::from_raw(code).map_or(0, wsa)
+            }
+            (SOL_SOCKET, SO_REUSEADDR | SO_KEEPALIVE) => 0,
             (IPPROTO_TCP, TCP_NODELAY) if stream => 1,
             _ => return Err(WSAENOPROTOOPT),
         };
@@ -436,13 +444,23 @@ extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *
 extern "win64" fn ioctlsocket(s: u64, cmd: u32, arg: *mut u32) -> i32 {
     result((|| {
         let (fd, _) = fd(s)?;
-        if cmd != FIONBIO || arg.is_null() {
+        if arg.is_null() {
             return Err(WSAEINVAL);
         }
-        // SAFETY: the caller's argument.
-        let on = unsafe { *arg } != 0;
-        os_sys::sock_ctl(fd, net::ctl::NONBLOCK, on as u64).map_err(wsa)?;
-        SOCKETS.lock().unwrap().get_mut(&s).ok_or(WSAENOTSOCK)?.nonblocking = on;
+        match cmd {
+            FIONBIO => {
+                // SAFETY: the caller's argument.
+                let on = unsafe { *arg } != 0;
+                os_sys::sock_ctl(fd, net::ctl::NONBLOCK, on as u64).map_err(wsa)?;
+                SOCKETS.lock().unwrap().get_mut(&s).ok_or(WSAENOTSOCK)?.nonblocking = on;
+            }
+            FIONREAD => {
+                let n = os_sys::sock_ctl(fd, net::ctl::AVAILABLE, 0).map_err(wsa)?;
+                // SAFETY: the caller's 4-byte out argument.
+                unsafe { core::ptr::write_unaligned(arg, n as u32) };
+            }
+            _ => return Err(WSAEINVAL),
+        }
         Ok(())
     })())
 }
@@ -660,15 +678,11 @@ extern "win64" fn getaddrinfo(node: *const u8, service: *const u8, hints: *const
     }
     // SAFETY: NULL or NUL-terminated strings.
     let (n, svc) = unsafe { (crate::path::ansi_to_string(node), crate::path::ansi_to_string(service)) };
-    let port: u16 = match svc.as_deref().map(str::parse) {
-        None => 0,
-        Some(Ok(p)) => p,
-        Some(Err(_)) => return WSATRY_AGAIN as i32, // named services: not supported
-    };
-    let (mut socktype, mut proto) = (0i32, 0i32);
+    let (mut flags, mut socktype, mut proto) = (0i32, 0i32, 0i32);
     if !hints.is_null() {
         // SAFETY: the caller's ADDRINFOA hints.
         unsafe {
+            flags = teb::get(hints as u64, 0);
             let family: i32 = teb::get(hints as u64, 4);
             if family != 0 && family != AF_INET as i32 {
                 return WSAEAFNOSUPPORT as i32;
@@ -677,11 +691,29 @@ extern "win64" fn getaddrinfo(node: *const u8, service: *const u8, hints: *const
             proto = teb::get(hints as u64, 12);
         }
     }
+    let port: u16 = match svc.as_deref() {
+        None => 0,
+        Some(s) => match s.parse() {
+            Ok(p) => p,
+            // A named service needs the services database, which OSyx has not.
+            Err(_) if flags & AI_NUMERICSERV == 0 => return WSATRY_AGAIN as i32,
+            Err(_) => return WSAHOST_NOT_FOUND as i32,
+        },
+    };
+    if flags & AI_NUMERICHOST != 0 {
+        if let Some(name) = n.as_deref() {
+            if parse_ipv4(name).is_none() {
+                return WSAHOST_NOT_FOUND as i32;
+            }
+        }
+    }
     let addrs = match n {
         Some(n) => match resolve(&n) {
             Ok(a) => a,
             Err(e) => return e as i32,
         },
+        // AI_PASSIVE without a node means "any local address".
+        None if flags & AI_PASSIVE != 0 => alloc::vec![[0, 0, 0, 0]],
         None => alloc::vec![[127, 0, 0, 1]],
     };
     let mut head = 0u64;
@@ -732,7 +764,7 @@ extern "win64" fn WSASocketW(af: i32, kind: i32, proto: i32, info: *const u8, gr
 
 const FIONREAD: u32 = 0x4004_667F;
 
-/// WSAIoctl: FIONBIO only, synchronously. Extension functions
+/// WSAIoctl: FIONBIO and FIONREAD only, synchronously. Extension functions
 /// (SIO_GET_EXTENSION_FUNCTION_POINTER: ConnectEx, AcceptEx, ...) need
 /// overlapped I/O and are reported unsupported, so callers fall back.
 #[allow(clippy::too_many_arguments)]
@@ -741,18 +773,18 @@ extern "win64" fn WSAIoctl(
     code: u32,
     input: *const u8,
     in_len: u32,
-    _output: *mut u8,
-    _out_len: u32,
+    output: *mut u8,
+    out_len: u32,
     returned: *mut u32,
     overlapped: *mut u8,
     completion: u64,
 ) -> i32 {
     result((|| {
-        fd(s)?;
+        let (fd, _) = fd(s)?;
         if !overlapped.is_null() || completion != 0 {
             return Err(WSAEOPNOTSUPP);
         }
-        match code {
+        let written = match code {
             FIONBIO => {
                 if input.is_null() || in_len < 4 {
                     return Err(WSAEFAULT);
@@ -762,13 +794,22 @@ extern "win64" fn WSAIoctl(
                 if ioctlsocket(s, FIONBIO, &mut v) != 0 {
                     return Err(teb::last_error());
                 }
+                0
             }
-            FIONREAD => return Err(WSAEOPNOTSUPP),
+            FIONREAD => {
+                if output.is_null() || out_len < 4 {
+                    return Err(WSAEFAULT);
+                }
+                let n = os_sys::sock_ctl(fd, net::ctl::AVAILABLE, 0).map_err(wsa)?;
+                // SAFETY: the caller's 4-byte output buffer.
+                unsafe { core::ptr::write_unaligned(output as *mut u32, n as u32) };
+                4
+            }
             _ => return Err(WSAEINVAL),
-        }
+        };
         if !returned.is_null() {
             // SAFETY: the caller's out count.
-            unsafe { *returned = 0 };
+            unsafe { *returned = written };
         }
         Ok(())
     })())

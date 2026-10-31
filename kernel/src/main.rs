@@ -40,6 +40,7 @@ mod ipc;
 mod irq;
 mod live;
 mod mem;
+mod media;
 mod modules;
 mod net;
 mod object;
@@ -178,7 +179,7 @@ pub unsafe extern "C" fn _start(info: *const BootInfo) -> ! {
     // enabled for user code (the kernel itself is soft-float).
     unsafe {
         core::arch::asm!("mov rax, cr0", "or rax, 0x10000", "mov cr0, rax", out("rax") _);
-        cpu::enable_sse();
+        cpu::enable_sse(0);
     }
 
     log_memory_map(boot.memory_map());
@@ -247,6 +248,7 @@ pub unsafe extern "C" fn _start(info: *const BootInfo) -> ! {
     let nics = net::init(&pci_devices, boot);
     kprintln!("net: {} interface(s)", nics);
     vfs::start_writeback();
+    filecache::start_readahead();
     // Compressed memory for cold pages; `swap.off` turns it off.
     if !boot.has_option("swap.off") {
         process::start_swap();
@@ -410,6 +412,9 @@ fn log_subsystems() {
     }
     for line in drivers::xhci::status() {
         kprintln!("usb: {}", line);
+    }
+    for line in drivers::i2c::status() {
+        kprintln!("i2c: {}", line);
     }
     kprintln!("input: {} events in total", input::total_events());
     for (vector, n) in irq::counts() {

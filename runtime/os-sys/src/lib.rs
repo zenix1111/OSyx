@@ -182,6 +182,17 @@ mod imp {
         decode(syscall1(nr::SET_FS_BASE, base as u64)).map(|_| ())
     }
 
+    /// Sets the FS base that 32-bit compatibility-mode code sees at
+    /// `fs:[0x18]` (the 32-bit TEB); 0 removes it and restores the calling
+    /// thread's 64-bit FS base. `base` must be page-aligned and below 4 GiB.
+    ///
+    /// A non-zero base takes effect immediately (FS is loaded from the
+    /// descriptor), so 64-bit code in the same thread regains its TLS with
+    /// [`set_fs_base`]; the WoW64 bridge flips the two at each mode crossing.
+    pub fn set_fs32_base(base: usize) -> Result<(), Errno> {
+        decode(syscall1(nr::SET_FS32_BASE, base as u64)).map(|_| ())
+    }
+
     /// The calling thread's kernel id. OSyx Std stores it in its TCB at
     /// `fs:[8]` (after the self pointer at `fs:[0]`); the system call is only
     /// needed for threads whose TCB is missing or not filled in yet.
@@ -222,7 +233,60 @@ mod imp {
 
     /// Maps `len` bytes (rounded up to pages) of zeroed memory.
     pub fn map(len: usize, prot: u64) -> Result<*mut u8, Errno> {
+        if let Some(p) = map_low(len, prot, 4096) {
+            return p;
+        }
         decode(syscall2(nr::MAP, len as u64, prot)).map(|a| a as *mut u8)
+    }
+
+    /// Next address [`map`] and [`map_ex`] try in low mode; 0 = off.
+    static LOW_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// End (exclusive) of the low window.
+    /// Below 2 GiB, so sign-extended LPARAM-style values keep pointers intact.
+    const LOW_END: u64 = 0x8000_0000;
+
+    /// From now on, memory placed by [`map`] and [`map_ex`] without
+    /// `MAP_FIXED` lies in `[start, 2 GiB)`: a process running 32-bit code
+    /// (WoW64) hands pointers to it, so its heap must be addressable there.
+    pub fn set_low_map(start: usize) {
+        LOW_NEXT.store(start as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`set_low_map`] is in effect.
+    pub fn low_map() -> bool {
+        LOW_NEXT.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Low mode: the first free run at or above the cursor, found with
+    /// `MAP_FIXED` (the kernel refuses any address already in use).
+    fn map_low(len: usize, prot: u64, align: u64) -> Option<Result<*mut u8, Errno>> {
+        use core::sync::atomic::Ordering;
+        let start = LOW_NEXT.load(Ordering::Relaxed);
+        if start == 0 {
+            return None;
+        }
+        let size = (len as u64).next_multiple_of(4096);
+        let mut at = start.next_multiple_of(align);
+        let mut wrapped = false;
+        loop {
+            if at + size > LOW_END {
+                if wrapped {
+                    return Some(Err(Errno::NoMemory));
+                }
+                wrapped = true;
+                at = 0x5000_0000u64.next_multiple_of(align);
+                continue;
+            }
+            match decode(syscall4(nr::MAP_EX, at, size, prot, osyx_abi::MAP_FIXED)) {
+                Ok(a) => {
+                    // Leave a page free after each run, as the kernel does.
+                    LOW_NEXT.store(a + size + 4096, Ordering::Relaxed);
+                    return Some(Ok(a as *mut u8));
+                }
+                Err(Errno::AlreadyExists) => at = (at + 0x10000).next_multiple_of(align),
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 
     /// Unmaps a region returned by [`map`] (the whole region, same length).
@@ -707,6 +771,12 @@ mod imp {
     /// Anonymous zeroed memory, optionally at a fixed address
     /// (`MAP_FIXED`) or 64 KiB aligned (`MAP_ALIGN_64K`).
     pub fn map_ex(addr: usize, len: usize, prot: u64, flags: u64) -> Result<*mut u8, Errno> {
+        if flags & osyx_abi::MAP_FIXED == 0 {
+            let align = if flags & osyx_abi::MAP_ALIGN_64K != 0 { 0x10000 } else { 4096 };
+            if let Some(p) = map_low(len, prot, align) {
+                return p;
+            }
+        }
         decode(syscall4(nr::MAP_EX, addr as u64, len as u64, prot, flags)).map(|a| a as *mut u8)
     }
 

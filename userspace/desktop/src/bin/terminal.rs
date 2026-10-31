@@ -375,8 +375,20 @@ impl App for Terminal {
         self.rows = (h.saturating_sub(2 * PAD) / ch).max(3) as usize;
     }
 
-    fn event(&mut self, ev: Ui, _cx: &mut Ctx) -> bool {
+    fn event(&mut self, ev: Ui, cx: &mut Ctx) -> bool {
         match ev {
+            Ui::Key(k) if k.down && k.ctrl() && k.key == key::V => {
+                if let Some(text) = cx.clipboard.text() {
+                    // Keep pasted newlines from executing commands implicitly.
+                    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                    self.input.insert_str(self.cursor, &text);
+                    self.cursor += text.len();
+                    self.scroll = 0;
+                    true
+                } else {
+                    false
+                }
+            }
             Ui::Key(k) => self.key(k),
             Ui::Wheel { dy, .. } => {
                 let before = self.scroll;

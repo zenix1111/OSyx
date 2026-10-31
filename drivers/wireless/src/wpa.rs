@@ -4,7 +4,7 @@
 //! and sends the frames it returns; the keys it reports go to the chip,
 //! which does the CCMP encryption itself.
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes128;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
@@ -69,7 +69,7 @@ pub fn pmk_from_passphrase(passphrase: &str, ssid: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
-    let mut m = <HmacSha1 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut m = <HmacSha1 as hmac::digest::KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     for p in parts {
         m.update(p);
     }

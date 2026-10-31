@@ -1117,6 +1117,128 @@ extern "win64" fn CryptBinaryToStringW(data: *const u8, len: u32, flags: u32, ou
     1
 }
 
+const OID_EKU: &str = "2.5.29.37";
+const CRYPT_E_NO_KEY_PROPERTY: u32 = 0x8009_200b;
+
+extern "win64" fn CertNameToStrA(_encoding: u32, name_blob: *const u8, str_type: u32, psz: *mut u8, csz: u32) -> u32 {
+    if name_blob.is_null() {
+        return 0;
+    }
+    let der = unsafe {
+        let n = *(name_blob as *const u32) as usize;
+        let p = *(name_blob.add(8) as *const u64) as *const u8;
+        if p.is_null() || n == 0 {
+            &[][..]
+        } else {
+            core::slice::from_raw_parts(p, n)
+        }
+    };
+    let mut attrs = name_attrs(der);
+    if str_type & 0x0200_0000 != 0 {
+        // CERT_NAME_STR_REVERSE_FLAG
+        attrs.reverse();
+    }
+    let sep = if str_type & 0x4000_0000 != 0 {
+        "; "
+    } else if str_type & 0x0800_0000 != 0 {
+        "\r\n"
+    } else {
+        ", "
+    };
+    let kind = str_type & 0xffff;
+    let text = attrs
+        .into_iter()
+        .map(|(o, v)| match kind {
+            2 => alloc::format!("{o}={v}"),
+            3 => alloc::format!("{}={v}", attr_label(&o)),
+            _ => v,
+        })
+        .collect::<Vec<_>>()
+        .join(sep);
+    let bytes = text.as_bytes();
+    if psz.is_null() || csz == 0 {
+        return bytes.len() as u32 + 1;
+    }
+    let n = bytes.len().min(csz as usize - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), psz, n);
+        *psz.add(n) = 0;
+    }
+    n as u32 + 1
+}
+
+extern "win64" fn CertGetEnhancedKeyUsage(ctx: u64, flags: u32, usage: *mut u8, pcb_usage: *mut u32) -> i32 {
+    if pcb_usage.is_null() {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    let Some(der) = context_der(ctx) else {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let Ok(cert) = parse_cert(&der) else {
+        return fail(ASN1, 0);
+    };
+    // CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG = 2: OSyx stores no extended cert properties.
+    if flags == 2 {
+        unsafe { *pcb_usage = 16 };
+        return fail(CRYPT_E_NOT_FOUND, 0);
+    }
+    let mut oids = Vec::new();
+    if let Some(ext) = cert.extensions.iter().find(|e| e.0 == OID_EKU) {
+        if let Ok((seq, _)) = tlv(&ext.2) {
+            for item in items(seq.body).unwrap_or_default() {
+                if item.tag == OID {
+                    oids.push(oid_string(item.body));
+                }
+            }
+        }
+    }
+    let mut b = Block::new(16);
+    b.put32(0, oids.len() as u32);
+    if !oids.is_empty() {
+        let arr = b.reserve(8 * oids.len());
+        b.fixups.push((8, arr));
+        for (i, oid) in oids.iter().enumerate() {
+            let mut s = oid.clone().into_bytes();
+            s.push(0);
+            b.point(arr + 8 * i, &s);
+        }
+    }
+    put_param(usage, pcb_usage, b)
+}
+
+extern "win64" fn CertFindChainInStore(
+    _store: u64,
+    _encoding: u32,
+    _find_flags: u32,
+    _find_type: u32,
+    _find_para: *const u8,
+    _prev_chain: u64,
+) -> u64 {
+    fail(CRYPT_E_NOT_FOUND, 0)
+}
+
+extern "win64" fn CryptAcquireCertificatePrivateKey(
+    _cert: u64,
+    _flags: u32,
+    _parameters: u64,
+    key: *mut u64,
+    spec: *mut u32,
+    caller_free: *mut i32,
+) -> i32 {
+    unsafe {
+        if !key.is_null() {
+            *key = 0;
+        }
+        if !spec.is_null() {
+            *spec = 0;
+        }
+        if !caller_free.is_null() {
+            *caller_free = 0;
+        }
+    }
+    fail(CRYPT_E_NO_KEY_PROPERTY, 0)
+}
+
 pub fn exports() -> Vec<(&'static str, u64)> {
     export_table![
         CryptQueryObject,
@@ -1130,6 +1252,10 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         CertDuplicateCertificateContext,
         CertFreeCertificateContext,
         CertGetNameStringW,
+        CertNameToStrA,
+        CertGetEnhancedKeyUsage,
+        CertFindChainInStore,
+        CryptAcquireCertificatePrivateKey,
         CryptBinaryToStringW,
     ]
 }

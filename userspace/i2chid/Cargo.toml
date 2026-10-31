@@ -1,0 +1,12 @@
+[package]
+name = "osyx-i2chid"
+description = "HID over I2C device discovery from ACPI for i2chidd: AML evaluation of ids, _CRS, _DSM and controller timing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+osyx-battery = { path = "../battery" }
+osyx-i2c = { path = "../../drivers/i2c" }
+aml = { path = "../../third_party/aml" }
+spinning_top = "0.3.0"

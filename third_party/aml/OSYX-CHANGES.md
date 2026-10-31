@@ -12,3 +12,15 @@ Changes for OSyx (`src/lib.rs`):
   adapters (`_PSR`) usually read their fields from the EC.
 - Region spaces the crate does not support return
   `AmlError::FieldInvalidAccessSize` instead of `unimplemented!()`.
+- Operators firmware battery and EC methods use but 0.16.4 lacked:
+  `Subtract`, `Multiply`, `Divide`, `Mod`, `Or`, `XOr`, `NAnd`, `NOr`, `Not`,
+  `LNot`, `SizeOf`, `Index` and `DerefOf` (`Index` returns the element by
+  value, so `DerefOf` passes it through).
+- `Index` as a store target (`Store(x, Index(PKG, 2))`, the usual way a
+  firmware method fills the `_BST` package), for named objects and locals
+  holding packages (`Target::Index`).
+- Package elements may be locals and arguments of the running method
+  (`Package () { Local0, Local1 }`), taken by value.
+- An `If` without `Else` at the very end of a block (`If (a) { If (b) {
+  Return (x) } }`, the shape of every `_DSM`) no longer fails with
+  `UnexpectedEndOfStream`: the end of the stream means "no `Else`".

@@ -794,7 +794,7 @@ fn fast_blit(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i3
     })
 }
 
-extern "win64" fn BitBlt(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, rop: u32) -> Bool {
+pub(super) extern "win64" fn BitBlt(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, rop: u32) -> Bool {
     if !matches!(rop & !0x40000000, 0xcc0020 | 0x42 | 0xff0062) || w < 0 || h < 0 {
         return fail(ERROR_NOT_SUPPORTED, FALSE);
     }

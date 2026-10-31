@@ -373,10 +373,8 @@ extern "win64" fn StringFromIID(g: *const u8, out: *mut u64) -> u32 {
 
 // ---- drag and drop, the OLE clipboard -------------------------------------------------------
 //
-// Drop targets are registered per window. OSyx has no drag sources between
-// windows, so nothing is ever dropped on them, and a drag this process
-// starts ends at once as cancelled. The OLE clipboard holds the data object
-// last set in this process.
+// Drop targets are registered per window. Native file drops are delivered
+// on the target window thread. Win32-origin drags are not implemented yet.
 
 const DRAGDROP_E_NOTREGISTERED: u32 = 0x8004_0100;
 const DRAGDROP_E_ALREADYREGISTERED: u32 = 0x8004_0101;
@@ -445,6 +443,54 @@ extern "win64" fn DoDragDrop(data: u64, source: u64, _ok: u32, effect: *mut u32)
     // SAFETY: the caller's DWORD.
     unsafe { *effect = 0 }; // DROPEFFECT_NONE
     DRAGDROP_S_CANCEL
+}
+
+/// Drops are dispatched on the window's message thread, outside user32's lock.
+static FILE_DROPS: Mutex<BTreeMap<u64, (u64, String, i32, i32)>> = Mutex::new(BTreeMap::new());
+static NEXT_FILE_DROP: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn queue_file_drop(hwnd: u64, path: String, x: i32, y: i32) -> u64 {
+    let mut drops = FILE_DROPS.lock().unwrap();
+    if drops.len() >= 32 { return 0; }
+    let token = NEXT_FILE_DROP.fetch_add(1, Ordering::Relaxed) as u64;
+    drops.insert(token, (hwnd, path, x, y));
+    token
+}
+
+pub(crate) fn dispatch_file_drop(hwnd: u64, token: u64) {
+    let Some((owner, path, x, y)) = FILE_DROPS.lock().unwrap().remove(&token) else { return };
+    if owner != hwnd { return; }
+    let target = {
+        let targets = DROP_TARGETS.lock().unwrap();
+        let Some(&target) = targets.get(&hwnd) else { return };
+        com_call(target, 1);
+        target
+    };
+    // DROPFILES with a double-NUL-terminated UTF-16 Windows path.
+    let mut bytes = alloc::vec![0u8; 20];
+    bytes[0..4].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+    for unit in crate::path::to_windows(&path).encode_utf16().chain([0, 0]) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let data = make_data_object(alloc::vec![proto::ClipEntry { format: CF_HDROP, name: None, data: bytes }]);
+    let point = (x as u32 as u64) | ((y as u32 as u64) << 32);
+    let mut effect = 1u32; // DROPEFFECT_COPY: the source retains its file.
+    // SAFETY: a registered IDropTarget and our live IDataObject, invoked
+    // on the window's thread after releasing the user32 lock. POINTL is 8 bytes.
+    unsafe {
+        let vtbl = *(target as *const *const u64);
+        let enter: extern "win64" fn(u64, u64, u32, u64, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(3));
+        let leave: extern "win64" fn(u64) -> u32 = core::mem::transmute(*vtbl.add(5));
+        let drop_: extern "win64" fn(u64, u64, u32, u64, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(6));
+        if enter(target, data, 0, point, &mut effect) == S_OK && effect != 0 {
+            drop_(target, data, 0, point, &mut effect);
+        } else {
+            leave(target);
+        }
+    }
+    DataRelease(data);
+    com_call(target, 2);
 }
 
 /// The data object's formats are rendered to bytes now: other processes get
@@ -887,6 +933,620 @@ extern "win64" fn EnumClone(this: u64, out: *mut u64) -> u32 {
     S_OK
 }
 
+// ---- HGLOBAL stream, agile references, marshaler ---------------------------------------
+
+const STG_E_INVALIDFUNCTION: u32 = 0x8003_0001;
+const STG_E_INVALIDPOINTER: u32 = 0x8003_0009;
+/// {0c733a30-2a1c-11ce-ade5-00aa0044773d}
+const IID_ISEQUENTIALSTREAM: [u8; 16] = [0x30, 0x3a, 0x73, 0x0c, 0x1c, 0x2a, 0xce, 0x11, 0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d];
+/// {0000000c-0000-0000-C000-000000000046}
+const IID_ISTREAM: [u8; 16] = [0x0c, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+/// {C03F6A43-65A4-9818-987E-E0B810D2A6F2}
+const IID_IAGILEREFERENCE: [u8; 16] = [0x43, 0x6a, 0x3f, 0xc0, 0xa4, 0x65, 0x18, 0x98, 0x98, 0x7e, 0xe0, 0xb8, 0x10, 0xd2, 0xa6, 0xf2];
+/// {00000003-0000-0000-C000-000000000046}
+const IID_IMARSHAL: [u8; 16] = [0x03, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+
+#[repr(C)]
+struct StreamVtbl {
+    query_interface: extern "win64" fn(u64, *const [u8; 16], *mut u64) -> u32,
+    add_ref: extern "win64" fn(u64) -> u32,
+    release: extern "win64" fn(u64) -> u32,
+    read: extern "win64" fn(u64, *mut u8, u32, *mut u32) -> u32,
+    write: extern "win64" fn(u64, *const u8, u32, *mut u32) -> u32,
+    seek: extern "win64" fn(u64, i64, u32, *mut u64) -> u32,
+    set_size: extern "win64" fn(u64, u64) -> u32,
+    copy_to: extern "win64" fn(u64, u64, u64, *mut u64, *mut u64) -> u32,
+    commit: extern "win64" fn(u64, u32) -> u32,
+    revert: extern "win64" fn(u64) -> u32,
+    lock_region: extern "win64" fn(u64, u64, u64, u32) -> u32,
+    unlock_region: extern "win64" fn(u64, u64, u64, u32) -> u32,
+    stat: extern "win64" fn(u64, *mut u8, u32) -> u32,
+    clone: extern "win64" fn(u64, *mut u64) -> u32,
+}
+
+struct StreamShared {
+    hglobal: u64,
+    size: usize,
+    delete_on_release: bool,
+}
+
+#[repr(C)]
+struct MemStream {
+    vtbl: &'static StreamVtbl,
+    refs: AtomicU32,
+    shared: alloc::sync::Arc<Mutex<StreamShared>>,
+    pos: Mutex<u64>,
+}
+
+static STREAM_VTBL: StreamVtbl = StreamVtbl {
+    query_interface: StreamQueryInterface,
+    add_ref: StreamAddRef,
+    release: StreamRelease,
+    read: StreamRead,
+    write: StreamWrite,
+    seek: StreamSeek,
+    set_size: StreamSetSize,
+    copy_to: StreamCopyTo,
+    commit: StreamCommit,
+    revert: StreamRevert,
+    lock_region: StreamLock,
+    unlock_region: StreamLock,
+    stat: StreamStat,
+    clone: StreamClone,
+};
+
+fn stream<'a>(this: u64) -> &'a MemStream {
+    unsafe { &*(this as *const MemStream) }
+}
+
+impl Drop for StreamShared {
+    fn drop(&mut self) {
+        if self.delete_on_release && self.hglobal != 0 {
+            kernel32::global_free(self.hglobal);
+        }
+    }
+}
+
+impl StreamShared {
+    fn resize(&mut self, new_size: usize) -> bool {
+        if new_size <= kernel32::heap_size(self.hglobal) {
+            if new_size > self.size && self.hglobal != 0 {
+                unsafe { core::ptr::write_bytes((self.hglobal as *mut u8).add(self.size), 0, new_size - self.size) };
+            }
+            self.size = new_size;
+            return true;
+        }
+        let Some(new_h) = kernel32::heap_alloc(new_size.max(1), true) else { return false };
+        if self.hglobal != 0 && self.size > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(self.hglobal as *const u8, new_h as *mut u8, self.size) };
+        }
+        if self.hglobal != 0 {
+            kernel32::global_free(self.hglobal);
+        }
+        self.hglobal = new_h;
+        self.size = new_size;
+        true
+    }
+}
+
+extern "win64" fn StreamQueryInterface(this: u64, riid: *const [u8; 16], out: *mut u64) -> u32 {
+    if riid.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        if *riid == IID_IUNKNOWN || *riid == IID_ISEQUENTIALSTREAM || *riid == IID_ISTREAM {
+            StreamAddRef(this);
+            *out = this;
+            return S_OK;
+        }
+        *out = 0;
+    }
+    E_NOINTERFACE
+}
+
+extern "win64" fn StreamAddRef(this: u64) -> u32 {
+    stream(this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+extern "win64" fn StreamRelease(this: u64) -> u32 {
+    let left = stream(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut MemStream) });
+    }
+    left
+}
+
+extern "win64" fn StreamRead(this: u64, pv: *mut u8, cb: u32, pcb_read: *mut u32) -> u32 {
+    if pv.is_null() && cb != 0 {
+        return STG_E_INVALIDPOINTER;
+    }
+    let s = stream(this);
+    let shared = s.shared.lock().unwrap();
+    let mut pos = s.pos.lock().unwrap();
+    let avail = shared.size.saturating_sub(*pos as usize);
+    let n = (cb as usize).min(avail);
+    if n > 0 {
+        unsafe { core::ptr::copy_nonoverlapping((shared.hglobal as *const u8).add(*pos as usize), pv, n) };
+        *pos += n as u64;
+    }
+    if !pcb_read.is_null() {
+        unsafe { *pcb_read = n as u32 };
+    }
+    S_OK
+}
+
+extern "win64" fn StreamWrite(this: u64, pv: *const u8, cb: u32, pcb_written: *mut u32) -> u32 {
+    if pv.is_null() && cb != 0 {
+        return STG_E_INVALIDPOINTER;
+    }
+    let s = stream(this);
+    let mut shared = s.shared.lock().unwrap();
+    let mut pos = s.pos.lock().unwrap();
+    let end = (*pos as usize).checked_add(cb as usize).unwrap_or(usize::MAX);
+    if end == usize::MAX || (end > shared.size && !shared.resize(end)) {
+        return E_OUTOFMEMORY;
+    }
+    if cb > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(pv, (shared.hglobal as *mut u8).add(*pos as usize), cb as usize) };
+        *pos = end as u64;
+    }
+    if !pcb_written.is_null() {
+        unsafe { *pcb_written = cb };
+    }
+    S_OK
+}
+
+extern "win64" fn StreamSeek(this: u64, delta: i64, origin: u32, new_pos: *mut u64) -> u32 {
+    let s = stream(this);
+    let size = s.shared.lock().unwrap().size as i128;
+    let mut pos = s.pos.lock().unwrap();
+    let base: i128 = match origin {
+        0 => 0,
+        1 => *pos as i128,
+        2 => size,
+        _ => return STG_E_INVALIDFUNCTION,
+    };
+    let next = base + delta as i128;
+    if next < 0 || next > u64::MAX as i128 {
+        return STG_E_INVALIDFUNCTION;
+    }
+    *pos = next as u64;
+    if !new_pos.is_null() {
+        unsafe { *new_pos = *pos };
+    }
+    S_OK
+}
+
+extern "win64" fn StreamSetSize(this: u64, new_size: u64) -> u32 {
+    let Ok(sz) = usize::try_from(new_size) else { return E_OUTOFMEMORY };
+    if stream(this).shared.lock().unwrap().resize(sz) { S_OK } else { E_OUTOFMEMORY }
+}
+
+extern "win64" fn StreamCopyTo(this: u64, dst: u64, cb: u64, pcb_read: *mut u64, pcb_written: *mut u64) -> u32 {
+    if dst == 0 {
+        return STG_E_INVALIDPOINTER;
+    }
+    let bytes = {
+        let s = stream(this);
+        let shared = s.shared.lock().unwrap();
+        let mut pos = s.pos.lock().unwrap();
+        let avail = shared.size.saturating_sub(*pos as usize);
+        let n = (cb.min(usize::MAX as u64) as usize).min(avail);
+        let slice = if n > 0 {
+            unsafe { core::slice::from_raw_parts((shared.hglobal as *const u8).add(*pos as usize), n) }.to_vec()
+        } else {
+            Vec::new()
+        };
+        *pos += n as u64;
+        slice
+    };
+    let mut written = 0u32;
+    let hr = if bytes.is_empty() {
+        S_OK
+    } else {
+        unsafe {
+            let vtbl = *(dst as *const *const u64);
+            let write_fn: extern "win64" fn(u64, *const u8, u32, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(4));
+            write_fn(dst, bytes.as_ptr(), bytes.len() as u32, &mut written)
+        }
+    };
+    if !pcb_read.is_null() {
+        unsafe { *pcb_read = bytes.len() as u64 };
+    }
+    if !pcb_written.is_null() {
+        unsafe { *pcb_written = written as u64 };
+    }
+    hr
+}
+
+extern "win64" fn StreamCommit(_this: u64, _flags: u32) -> u32 {
+    S_OK
+}
+
+extern "win64" fn StreamRevert(_this: u64) -> u32 {
+    S_OK
+}
+
+extern "win64" fn StreamLock(_this: u64, _off: u64, _cb: u64, _kind: u32) -> u32 {
+    STG_E_INVALIDFUNCTION
+}
+
+extern "win64" fn StreamStat(this: u64, stat: *mut u8, _flags: u32) -> u32 {
+    if stat.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    let size = stream(this).shared.lock().unwrap().size as u64;
+    unsafe {
+        core::ptr::write_bytes(stat, 0, 80);
+        *(stat.add(8) as *mut u32) = 2; // STGTY_STREAM
+        *(stat.add(16) as *mut u64) = size;
+    }
+    S_OK
+}
+
+extern "win64" fn StreamClone(this: u64, out: *mut u64) -> u32 {
+    if out.is_null() {
+        return STG_E_INVALIDPOINTER;
+    }
+    let s = stream(this);
+    let pos = *s.pos.lock().unwrap();
+    let cloned = Box::into_raw(Box::new(MemStream {
+        vtbl: &STREAM_VTBL,
+        refs: AtomicU32::new(1),
+        shared: s.shared.clone(),
+        pos: Mutex::new(pos),
+    })) as u64;
+    unsafe { *out = cloned };
+    S_OK
+}
+
+extern "win64" fn CreateStreamOnHGlobal(hglobal: u64, delete_on_release: i32, out: *mut u64) -> u32 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let (h, size) = if hglobal == 0 {
+        let Some(p) = kernel32::heap_alloc(1, true) else {
+            unsafe { *out = 0 };
+            return E_OUTOFMEMORY;
+        };
+        (p, 0)
+    } else {
+        (hglobal, kernel32::heap_size(hglobal))
+    };
+    let stm = Box::into_raw(Box::new(MemStream {
+        vtbl: &STREAM_VTBL,
+        refs: AtomicU32::new(1),
+        shared: alloc::sync::Arc::new(Mutex::new(StreamShared {
+            hglobal: h,
+            size,
+            delete_on_release: delete_on_release != 0,
+        })),
+        pos: Mutex::new(0),
+    })) as u64;
+    unsafe { *out = stm };
+    S_OK
+}
+
+extern "win64" fn GetHGlobalFromStream(stm: u64, out: *mut u64) -> u32 {
+    if stm == 0 || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let vtbl = unsafe { *(stm as *const usize) };
+    if vtbl != &STREAM_VTBL as *const StreamVtbl as usize {
+        unsafe { *out = 0 };
+        return E_INVALIDARG;
+    }
+    let h = stream(stm).shared.lock().unwrap().hglobal;
+    unsafe { *out = h };
+    S_OK
+}
+
+extern "win64" fn OleDuplicateData(src: u64, _cf_format: u16, _flags: u32) -> u64 {
+    if src == 0 {
+        return 0;
+    }
+    let size = kernel32::heap_size(src);
+    if size == 0 {
+        return 0;
+    }
+    let Some(dst) = kernel32::heap_alloc(size, true) else { return 0 };
+    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size) };
+    dst
+}
+
+extern "win64" fn OleQueryLinkFromData(data: u64) -> u32 {
+    if data == 0 { E_INVALIDARG } else { S_FALSE }
+}
+
+#[repr(C)]
+struct AgileVtbl {
+    query_interface: extern "win64" fn(u64, *const [u8; 16], *mut u64) -> u32,
+    add_ref: extern "win64" fn(u64) -> u32,
+    release: extern "win64" fn(u64) -> u32,
+    resolve: extern "win64" fn(u64, *const u8, *mut u64) -> u32,
+}
+
+#[repr(C)]
+struct AgileRef {
+    vtbl: &'static AgileVtbl,
+    refs: AtomicU32,
+    target: u64,
+}
+
+static AGILE_VTBL: AgileVtbl = AgileVtbl {
+    query_interface: AgileQueryInterface,
+    add_ref: AgileAddRef,
+    release: AgileRelease,
+    resolve: AgileResolve,
+};
+
+fn agile<'a>(this: u64) -> &'a AgileRef {
+    unsafe { &*(this as *const AgileRef) }
+}
+
+extern "win64" fn AgileQueryInterface(this: u64, riid: *const [u8; 16], out: *mut u64) -> u32 {
+    if riid.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        if *riid == IID_IUNKNOWN || *riid == IID_IAGILEREFERENCE {
+            AgileAddRef(this);
+            *out = this;
+            return S_OK;
+        }
+        *out = 0;
+    }
+    E_NOINTERFACE
+}
+
+extern "win64" fn AgileAddRef(this: u64) -> u32 {
+    agile(this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+extern "win64" fn AgileRelease(this: u64) -> u32 {
+    let left = agile(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        let a = unsafe { Box::from_raw(this as *mut AgileRef) };
+        com_call(a.target, 2);
+    }
+    left
+}
+
+extern "win64" fn AgileResolve(this: u64, riid: *const u8, out: *mut u64) -> u32 {
+    if riid.is_null() || out.is_null() {
+        return E_INVALIDARG;
+    }
+    let target = agile(this).target;
+    unsafe {
+        let vtbl = *(target as *const *const u64);
+        let qi: QueryInterface = core::mem::transmute(*vtbl);
+        qi(target, riid, out)
+    }
+}
+
+extern "win64" fn RoGetAgileReference(options: u32, riid: *const u8, unk: u64, out: *mut u64) -> u32 {
+    if riid.is_null() || unk == 0 || out.is_null() || options > 1 {
+        if !out.is_null() {
+            unsafe { *out = 0 };
+        }
+        return E_INVALIDARG;
+    }
+    let mut checked = 0u64;
+    let hr = unsafe {
+        let vtbl = *(unk as *const *const u64);
+        let qi: QueryInterface = core::mem::transmute(*vtbl);
+        qi(unk, riid, &mut checked)
+    };
+    if hr != S_OK || checked == 0 {
+        unsafe { *out = 0 };
+        return if hr != S_OK { hr } else { E_NOINTERFACE };
+    }
+    let obj = Box::into_raw(Box::new(AgileRef {
+        vtbl: &AGILE_VTBL,
+        refs: AtomicU32::new(1),
+        target: checked,
+    })) as u64;
+    unsafe { *out = obj };
+    S_OK
+}
+
+#[repr(C)]
+struct FtmVtbl {
+    query_interface: extern "win64" fn(u64, *const [u8; 16], *mut u64) -> u32,
+    add_ref: extern "win64" fn(u64) -> u32,
+    release: extern "win64" fn(u64) -> u32,
+    get_unmarshal_class: extern "win64" fn(u64, *const u8, u64, u32, u64, u32, *mut [u8; 16]) -> u32,
+    get_marshal_size_max: extern "win64" fn(u64, *const u8, u64, u32, u64, u32, *mut u32) -> u32,
+    marshal_interface: extern "win64" fn(u64, u64, *const u8, u64, u32, u64, u32) -> u32,
+    unmarshal_interface: extern "win64" fn(u64, u64, *const u8, *mut u64) -> u32,
+    release_marshal_data: extern "win64" fn(u64, u64) -> u32,
+    disconnect_object: extern "win64" fn(u64, u32) -> u32,
+}
+
+/// CLSID_InProcFreeMarshaler {0000033A-0000-0000-C000-000000000046}
+const CLSID_FTM: [u8; 16] = [0x3a, 0x03, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+
+#[repr(C)]
+struct FreeThreadedMarshaler {
+    vtbl: &'static FtmVtbl,
+    refs: AtomicU32,
+    outer: u64,
+}
+
+static FTM_VTBL: FtmVtbl = FtmVtbl {
+    query_interface: FtmQueryInterface,
+    add_ref: FtmAddRef,
+    release: FtmRelease,
+    get_unmarshal_class: FtmGetUnmarshalClass,
+    get_marshal_size_max: FtmGetMarshalSizeMax,
+    marshal_interface: FtmMarshalInterface,
+    unmarshal_interface: FtmUnmarshalInterface,
+    release_marshal_data: FtmReleaseMarshalData,
+    disconnect_object: FtmDisconnectObject,
+};
+
+fn ftm<'a>(this: u64) -> &'a FreeThreadedMarshaler {
+    unsafe { &*(this as *const FreeThreadedMarshaler) }
+}
+
+extern "win64" fn FtmQueryInterface(this: u64, riid: *const [u8; 16], out: *mut u64) -> u32 {
+    if riid.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    unsafe {
+        if *riid == IID_IUNKNOWN || *riid == IID_IMARSHAL {
+            FtmAddRef(this);
+            *out = this;
+            return S_OK;
+        }
+        *out = 0;
+    }
+    E_NOINTERFACE
+}
+
+extern "win64" fn FtmAddRef(this: u64) -> u32 {
+    ftm(this).refs.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+extern "win64" fn FtmRelease(this: u64) -> u32 {
+    let left = ftm(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut FreeThreadedMarshaler) });
+    }
+    left
+}
+
+extern "win64" fn FtmGetUnmarshalClass(_this: u64, _riid: *const u8, _pv: u64, ctx: u32, _reserved: u64, _flags: u32, cid: *mut [u8; 16]) -> u32 {
+    if cid.is_null() {
+        return E_POINTER;
+    }
+    // MSHCTX_INPROC = 3, MSHCTX_CROSSCTX = 4
+    if ctx != 3 && ctx != 4 {
+        return E_NOTIMPL;
+    }
+    unsafe { *cid = CLSID_FTM };
+    S_OK
+}
+
+extern "win64" fn FtmGetMarshalSizeMax(_this: u64, _riid: *const u8, _pv: u64, ctx: u32, _reserved: u64, _flags: u32, size: *mut u32) -> u32 {
+    if size.is_null() {
+        return E_POINTER;
+    }
+    if ctx != 3 && ctx != 4 {
+        return E_NOTIMPL;
+    }
+    unsafe { *size = 8 };
+    S_OK
+}
+
+extern "win64" fn FtmMarshalInterface(_this: u64, stm: u64, _riid: *const u8, pv: u64, ctx: u32, _reserved: u64, _flags: u32) -> u32 {
+    if stm == 0 || pv == 0 {
+        return E_POINTER;
+    }
+    if ctx != 3 && ctx != 4 {
+        return E_NOTIMPL;
+    }
+    com_call(pv, 1);
+    let bytes = pv.to_le_bytes();
+    let mut written = 0u32;
+    unsafe {
+        let vtbl = *(stm as *const *const u64);
+        let write_fn: extern "win64" fn(u64, *const u8, u32, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(4));
+        write_fn(stm, bytes.as_ptr(), 8, &mut written)
+    }
+}
+
+extern "win64" fn FtmUnmarshalInterface(_this: u64, stm: u64, riid: *const u8, out: *mut u64) -> u32 {
+    if stm == 0 || riid.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    let mut bytes = [0u8; 8];
+    let mut read = 0u32;
+    let hr = unsafe {
+        let vtbl = *(stm as *const *const u64);
+        let read_fn: extern "win64" fn(u64, *mut u8, u32, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(3));
+        read_fn(stm, bytes.as_mut_ptr(), 8, &mut read)
+    };
+    if hr != S_OK || read != 8 {
+        unsafe { *out = 0 };
+        return E_FAIL;
+    }
+    let pv = u64::from_le_bytes(bytes);
+    let hr = unsafe {
+        let vtbl = *(pv as *const *const u64);
+        let qi: QueryInterface = core::mem::transmute(*vtbl);
+        qi(pv, riid, out)
+    };
+    com_call(pv, 2);
+    hr
+}
+
+extern "win64" fn FtmReleaseMarshalData(_this: u64, stm: u64) -> u32 {
+    if stm == 0 {
+        return E_POINTER;
+    }
+    let mut bytes = [0u8; 8];
+    let mut read = 0u32;
+    let hr = unsafe {
+        let vtbl = *(stm as *const *const u64);
+        let read_fn: extern "win64" fn(u64, *mut u8, u32, *mut u32) -> u32 = core::mem::transmute(*vtbl.add(3));
+        read_fn(stm, bytes.as_mut_ptr(), 8, &mut read)
+    };
+    if hr == S_OK && read == 8 {
+        let pv = u64::from_le_bytes(bytes);
+        if pv != 0 {
+            com_call(pv, 2);
+        }
+    }
+    S_OK
+}
+
+extern "win64" fn FtmDisconnectObject(_this: u64, _reserved: u32) -> u32 {
+    S_OK
+}
+
+extern "win64" fn CoCreateFreeThreadedMarshaler(outer: u64, out: *mut u64) -> u32 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let obj = Box::into_raw(Box::new(FreeThreadedMarshaler {
+        vtbl: &FTM_VTBL,
+        refs: AtomicU32::new(1),
+        outer,
+    })) as u64;
+    unsafe { *out = obj };
+    S_OK
+}
+
+static CHANNEL_HOOKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+extern "win64" fn CoRegisterChannelHook(uuid: *const u8, hook: u64) -> u32 {
+    if uuid.is_null() || hook == 0 {
+        return E_INVALIDARG;
+    }
+    com_call(hook, 1);
+    CHANNEL_HOOKS.lock().unwrap().push(hook);
+    S_OK
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn StgCreateStorageEx(
+    _name: *const u16,
+    _mode: u32,
+    _stgfmt: u32,
+    _attrs: u32,
+    _options: u64,
+    _security: u64,
+    _riid: *const u8,
+    out: *mut u64,
+) -> u32 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    unsafe { *out = 0 };
+    STG_E_INVALIDFUNCTION
+}
+
 pub fn exports() -> Vec<(&'static str, u64)> {
     let mut e = export_table![
         CoTaskMemAlloc,
@@ -918,7 +1578,15 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         OleGetClipboard,
         OleFlushClipboard,
         OleIsCurrentClipboard,
-        ReleaseStgMedium
+        ReleaseStgMedium,
+        CreateStreamOnHGlobal,
+        GetHGlobalFromStream,
+        OleDuplicateData,
+        OleQueryLinkFromData,
+        RoGetAgileReference,
+        CoCreateFreeThreadedMarshaler,
+        CoRegisterChannelHook,
+        StgCreateStorageEx
     ];
     e.push(("PropVariantClear", crate::propsys::PropVariantClear as *const () as u64));
     e

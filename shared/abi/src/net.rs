@@ -12,7 +12,7 @@ pub const SOCK_PING: u64 = 3;
 
 /// `send`/`recv` flags.
 pub const MSG_DONTWAIT: u64 = 1;
-/// `recv`: return data but leave it queued (UDP/ping: not supported).
+/// `recv`: return data but leave it queued (ping sockets: not supported).
 pub const MSG_PEEK: u64 = 2;
 
 /// `sock_ctl` operations.
@@ -36,6 +36,12 @@ pub mod ctl {
     pub const RESET_ON_CLOSE: u64 = 9;
     /// arg: connect timeout in nanoseconds (0 = the TCP default).
     pub const CONNECT_TIMEOUT: u64 = 10;
+    /// Pending connection error as an `Errno` number (0 = none): the SYN
+    /// failed after a non-blocking `connect` returned `WouldBlock`.
+    pub const ERROR: u64 = 11;
+    /// Bytes ready to read without blocking: queued TCP data or the size
+    /// of the next UDP datagram (0 if none). Winsock FIONREAD.
+    pub const AVAILABLE: u64 = 12;
 }
 
 /// TCP states reported by `ctl::STATE` and `NetSocket::state`.

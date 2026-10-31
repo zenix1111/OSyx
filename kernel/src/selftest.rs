@@ -37,7 +37,7 @@ macro_rules! ensure {
 }
 
 pub fn run(boot: &BootData) -> Summary {
-    let tests: [(&str, &dyn Fn() -> TestResult); 26] = [
+    let tests: [(&str, &dyn Fn() -> TestResult); 28] = [
         ("boot memory map", &|| memory_map(boot)),
         ("frame allocator", &frame_allocator),
         ("page map/unmap", &map_unmap),
@@ -53,6 +53,7 @@ pub fn run(boot: &BootData) -> Summary {
         ("sleep and join", &sleep_join),
         ("FPU/SSE state per thread", &fpu_state),
         ("FS base per thread", &fs_base),
+        ("32-bit compatibility segments", &compat_segments),
         ("PCI enumeration", &pci_scan),
         ("block device I/O", &block_io),
         ("VFS on tmpfs: files and directories", &crate::selftest_fs::tmpfs_files),
@@ -64,6 +65,7 @@ pub fn run(boot: &BootData) -> Summary {
         ("concurrent writers (tmpfs, FAT32, ext4)", &crate::selftest_fs::concurrent),
         ("program loader: search path, permissions, bad images", &crate::selftest_fs::program_loader),
         ("kernel file reads: whole device firmware", &firmware_read),
+        ("HID over I2C: controller, protocol, input core (simulated)", &crate::drivers::i2c::selftest),
     ];
     let mut s = Summary { passed: 0, failed: 0 };
     for (name, t) in tests.iter() {
@@ -384,6 +386,8 @@ fn sleep_join() -> TestResult {
 
 static FPU_OK: [core::sync::atomic::AtomicBool; 2] =
     [core::sync::atomic::AtomicBool::new(false), core::sync::atomic::AtomicBool::new(false)];
+static AVX_OK: [core::sync::atomic::AtomicBool; 2] =
+    [core::sync::atomic::AtomicBool::new(false), core::sync::atomic::AtomicBool::new(false)];
 
 /// Loads xmm0..xmm3 with a per-thread pattern, spins across several time
 /// slices (other threads run and load their own patterns), then checks the
@@ -425,7 +429,51 @@ fn fpu_state() -> TestResult {
     sched::join(b);
     ensure!(FPU_OK[0].load(Ordering::Relaxed), "thread A lost its XMM registers");
     ensure!(FPU_OK[1].load(Ordering::Relaxed), "thread B lost its XMM registers");
+    if crate::arch::cpu::fpu_has_avx() {
+        let a = sched::spawn_kernel("avx-a", avx_worker, 0, 0x3333_0000_0000_0000);
+        let b = sched::spawn_kernel("avx-b", avx_worker, 1, 0x4444_0000_0000_0000);
+        sched::join(a);
+        sched::join(b);
+        ensure!(AVX_OK[0].load(Ordering::Relaxed), "thread A lost its YMM upper halves");
+        ensure!(AVX_OK[1].load(Ordering::Relaxed), "thread B lost its YMM upper halves");
+    } else {
+        kprintln!("[test]   AVX not enabled; YMM switch check skipped");
+    }
     Ok(())
+}
+
+/// Same as [`fpu_worker`], but for the YMM upper halves that only XSAVE
+/// preserves. Runs only when the kernel enabled AVX.
+fn avx_worker(slot: u64, seed: u64) {
+    use core::sync::atomic::Ordering;
+    let pattern = [seed; 4];
+    let mut out = [0u64; 16];
+    // SAFETY: AVX is enabled; the asm touches only ymm0-3 and the given GPR.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{p}]", "vmovdqu ymm1, [{p}]",
+            "vmovdqu ymm2, [{p}]", "vmovdqu ymm3, [{p}]",
+            p = in(reg) pattern.as_ptr(),
+        );
+    }
+    let end = Deadline::after_ticks(8);
+    while !end.expired() {
+        core::hint::spin_loop();
+    }
+    // SAFETY: as above; writes four u64 into `out` and clears the upper state.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu [{o}], ymm0", "vmovdqu [{o} + 32], ymm1",
+            "vmovdqu [{o} + 64], ymm2", "vmovdqu [{o} + 96], ymm3",
+            "vzeroupper",
+            o = in(reg) out.as_mut_ptr(),
+        );
+    }
+    let ok = out.iter().all(|&v| v == seed);
+    if !ok {
+        kprintln!("[test]   avx worker {slot}: expected {:#x}.., got {:x?}", seed, out);
+    }
+    AVX_OK[slot as usize].store(ok, Ordering::Relaxed);
 }
 
 static FS_OK: [core::sync::atomic::AtomicBool; 2] =
@@ -456,6 +504,65 @@ fn fs_base() -> TestResult {
     let after = unsafe { cpu::rdmsr(0xC000_0100) };
     ensure!(after == mine, "kmain's FS base changed from {mine:#x} to {after:#x}");
     Ok(())
+}
+
+/// 32-bit compatibility segments: the descriptors installed in the GDT, the
+/// per-thread FS32 base switch and the IRET frame that enters compatibility
+/// mode. The ring-3 jump itself is the M4 bridge's job.
+fn compat_segments() -> TestResult {
+    use osyx_abi::wow64;
+    const TEB: u64 = 0x7FFD_F000;
+
+    let code = crate::arch::gdt::descriptor(7);
+    ensure!(code == wow64::code32_descriptor(), "GDT entry 7 is {code:#x}, not the 32-bit code descriptor");
+    ensure!(wow64::descriptor_d(code) && !wow64::descriptor_l(code), "entry 7 is not 32-bit code");
+    ensure!((wow64::descriptor_access(code) & 0x60) == 0x60, "entry 7 is not DPL 3");
+    ensure!((wow64::descriptor_access(code) & 0x18) == 0x18, "entry 7 is not a code segment");
+    ensure!(wow64::descriptor_base(crate::arch::gdt::descriptor(8)) == 0, "entry 8 has a base before any set");
+    // SAFETY: IA32_FS_BASE exists on every x86-64 CPU.
+    let prior = unsafe { cpu::rdmsr(0xC000_0100) };
+
+    sched::set_current_fs32_base(TEB);
+    let fs = crate::arch::gdt::descriptor(8);
+    ensure!(wow64::descriptor_base(fs) == TEB as u32, "entry 8 base {:#x} after set", wow64::descriptor_base(fs));
+    ensure!((wow64::descriptor_access(fs) & 0x10) != 0, "entry 8 is not a data segment");
+    let sel = fs_selector();
+    ensure!(sel == wow64::USER_FS32, "FS selector {sel:#x} after set");
+    // The descriptor load must have replaced the one hidden FS base, which is
+    // what compatibility-mode code reads at fs:[0x18].
+    // SAFETY: as above.
+    let hidden = unsafe { cpu::rdmsr(0xC000_0100) };
+    ensure!(hidden == TEB, "hidden FS base {hidden:#x}, not the descriptor base");
+
+    let frame = wow64::CompatIretFrame::new(0x0040_1000, 0x7FFE_0000).ok_or("compat IRET frame rejected")?;
+    ensure!(frame.cs == 0x3B && frame.ss == 0x1B, "frame selectors {:#x}/{:#x}", frame.cs, frame.ss);
+    ensure!(frame.rflags == 0x202, "frame rflags {:#x}", frame.rflags);
+    kprintln!(
+        "wow64: CS32 {:#x} desc {code:#x}, FS32 {:#x} base {:#x} (FS selector {:#x}, hidden base {hidden:#x}), iret rip {:#x} cs {:#x} rsp {:#x} ss {:#x}",
+        wow64::USER_CS32,
+        wow64::USER_FS32,
+        TEB,
+        sel,
+        frame.rip,
+        frame.cs,
+        frame.rsp,
+        frame.ss
+    );
+
+    sched::set_current_fs32_base(0);
+    ensure!(wow64::descriptor_base(crate::arch::gdt::descriptor(8)) == 0, "entry 8 base not cleared");
+    // SAFETY: as above.
+    let restored = unsafe { cpu::rdmsr(0xC000_0100) };
+    ensure!(restored == prior, "FS base {restored:#x} after clear, was {prior:#x}");
+    Ok(())
+}
+
+/// The FS selector currently loaded (reads the visible part only).
+fn fs_selector() -> u16 {
+    let sel: u16;
+    // SAFETY: reading a segment register has no side effects.
+    unsafe { core::arch::asm!("mov {sel:x}, fs", sel = out(reg) sel, options(nomem, nostack, preserves_flags)) };
+    sel
 }
 
 fn pci_scan() -> TestResult {

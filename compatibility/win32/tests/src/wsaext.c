@@ -50,6 +50,26 @@ void __stdcall start(void) {
     check("inet_ntop(::1)", inet_ntop(AF_INET6, &a6, text, sizeof text) != NULL && str_eq(text, "::1"));
     check("inet_ntop into a short buffer fails", inet_ntop(AF_INET6, &a6, text, 3) == NULL);
 
+    /* getaddrinfo hints flags. */
+    struct addrinfo hints = {0};
+    struct addrinfo *ai = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_flags = AI_NUMERICHOST;
+    check("getaddrinfo(AI_NUMERICHOST) rejects a host name",
+          getaddrinfo("localhost", "80", &hints, &ai) != 0 && ai == NULL);
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    check("... and accepts a dotted quad and numeric port",
+          getaddrinfo("127.0.0.1", "80", &hints, &ai) == 0 && ai != NULL);
+    if (ai) { freeaddrinfo(ai); ai = NULL; }
+    hints.ai_flags = AI_NUMERICSERV;
+    check("getaddrinfo(AI_NUMERICSERV) rejects a service name",
+          getaddrinfo("127.0.0.1", "http", &hints, &ai) != 0 && ai == NULL);
+    hints.ai_flags = AI_PASSIVE;
+    check("getaddrinfo(AI_PASSIVE) without a node is 0.0.0.0",
+          getaddrinfo(NULL, "8080", &hints, &ai) == 0 && ai != NULL &&
+          ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr == 0);
+    if (ai) { freeaddrinfo(ai); ai = NULL; }
+
     /* WSASocketW + WSAIoctl(FIONBIO) + WSASendMsg over loopback UDP. */
     SOCKET r = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED);
     SOCKET w = WSASocketW(AF_INET, SOCK_DGRAM, 0, NULL, 0, 0);
@@ -73,6 +93,12 @@ void __stdcall start(void) {
     m.dwBufferCount = 2;
     DWORD sent = 0;
     check("WSASendMsg gathers two buffers", WSASendMsg(w, &m, 0, &sent, NULL, NULL) == 0 && sent == 11);
+    DWORD avail = 0;
+    got = 0;
+    check("WSAIoctl(FIONREAD) reports the queued datagram",
+          WSAIoctl(r, FIONREAD, NULL, 0, &avail, sizeof avail, &got, NULL, NULL) == 0 && got == 4 && avail == 11);
+    avail = 0;
+    check("ioctlsocket(FIONREAD) reports it too", ioctlsocket(r, FIONREAD, &avail) == 0 && avail == 11);
     on = 0;
     WSAIoctl(r, FIONBIO, &on, sizeof on, NULL, 0, &got, NULL, NULL);
     check("... into one datagram", recv(r, buf, sizeof buf, 0) == 11 && mem_eq(buf, "hello, msg!", 11));
