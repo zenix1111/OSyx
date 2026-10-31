@@ -63,6 +63,8 @@ int osyx_bsd_wifi_join(struct ifnet *ifp, const uint8_t *ssid, size_t ssid_len, 
 
 	if (ssid_len > IEEE80211_NWID_LEN)
 		return EINVAL;
+	if (pass != NULL && pass[0] != 0 && (strlen(pass) < 8 || strlen(pass) > 63))
+		return EINVAL;
 	/* net80211 then logs authentication, association and the handshake. */
 	ifp->if_flags |= IFF_DEBUG;
 	memset(&ifr, 0, sizeof(ifr));
@@ -75,9 +77,6 @@ int osyx_bsd_wifi_join(struct ifnet *ifp, const uint8_t *ssid, size_t ssid_len, 
 	if (e != 0 && e != ENETRESET)
 		return e;
 	if (pass != NULL && pass[0] != 0) {
-		size_t plen = strlen(pass);
-		if (plen < 8 || plen > 63)
-			return EINVAL;
 		struct ieee80211_wpaparams wpa;
 		memset(&wpa, 0, sizeof(wpa));
 		strlcpy(wpa.i_name, ifp->if_xname, sizeof(wpa.i_name));
@@ -96,6 +95,20 @@ int osyx_bsd_wifi_join(struct ifnet *ifp, const uint8_t *ssid, size_t ssid_len, 
 		pbkdf2_sha1(pass, ssid, ssid_len, psk.i_psk);
 		e = ifp->if_ioctl(ifp, SIOCS80211WPAPSK, (caddr_t)&psk);
 		explicit_bzero(&psk, sizeof(psk));
+		if (e != 0 && e != ENETRESET)
+			return e;
+	} else {
+		/* Drop the previous WPA settings before joining an open network. */
+		struct ieee80211_wpaparams wpa;
+		struct ieee80211_wpapsk psk;
+		memset(&wpa, 0, sizeof(wpa));
+		strlcpy(wpa.i_name, ifp->if_xname, sizeof(wpa.i_name));
+		e = ifp->if_ioctl(ifp, SIOCS80211WPAPARMS, (caddr_t)&wpa);
+		if (e != 0 && e != ENETRESET)
+			return e;
+		memset(&psk, 0, sizeof(psk));
+		strlcpy(psk.i_name, ifp->if_xname, sizeof(psk.i_name));
+		e = ifp->if_ioctl(ifp, SIOCS80211WPAPSK, (caddr_t)&psk);
 		if (e != 0 && e != ENETRESET)
 			return e;
 	}

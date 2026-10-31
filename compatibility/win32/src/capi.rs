@@ -263,13 +263,13 @@ impl Blocks {
 }
 
 #[derive(Clone)]
-struct Md5 {
+pub(crate) struct Md5 {
     s: [u32; 4],
     b: Blocks,
 }
 
 impl Md5 {
-    fn new() -> Md5 {
+    pub(crate) fn new() -> Md5 {
         Md5 { s: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476], b: Blocks::new() }
     }
 
@@ -297,12 +297,12 @@ impl Md5 {
         }
     }
 
-    fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         let s = &mut self.s;
         self.b.update(data, |m| Md5::block(s, m));
     }
 
-    fn finish(mut self) -> [u8; 16] {
+    pub(crate) fn finish(mut self) -> [u8; 16] {
         let s = &mut self.s;
         self.b.finish(false, |m| Md5::block(s, m));
         let mut out = [0u8; 16];
@@ -324,13 +324,13 @@ const MD5_K: [u32; 64] = [
 ];
 
 #[derive(Clone)]
-struct Sha1 {
+pub(crate) struct Sha1 {
     s: [u32; 5],
     b: Blocks,
 }
 
 impl Sha1 {
-    fn new() -> Sha1 {
+    pub(crate) fn new() -> Sha1 {
         Sha1 { s: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0], b: Blocks::new() }
     }
 
@@ -362,12 +362,12 @@ impl Sha1 {
         }
     }
 
-    fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         let s = &mut self.s;
         self.b.update(data, |m| Sha1::block(s, m));
     }
 
-    fn finish(mut self) -> [u8; 20] {
+    pub(crate) fn finish(mut self) -> [u8; 20] {
         let s = &mut self.s;
         self.b.finish(true, |m| Sha1::block(s, m));
         let mut out = [0u8; 20];

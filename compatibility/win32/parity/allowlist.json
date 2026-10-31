@@ -1,0 +1,32 @@
+{
+  "comment": "Functions whose constant result is the correct Windows behaviour on OSyx, each with the reason. The scanner counts them as implemented and lists them in the report; a function not named here that returns a constant is reported as a stub.",
+  "entries": {
+    "IsDebuggerPresent": "OSyx has no debugger interface for Win32 processes, so no process is ever being debugged and FALSE is the exact answer",
+    "GdiFlush": "drawing reaches PRISM in order already (see the comment at the function), so there is no batch to flush",
+    "CallNextHookEx": "hooks are never installed (SetWindowsHookExW fails), so there is no next hook: 0 is the result at the end of an empty chain",
+    "InSendMessage": "window procedures run on the sender's thread here, so none is ever handling a message sent from another thread: FALSE is exact",
+    "InSendMessageEx": "as InSendMessage: ISMEX_NOSEND (0) is the answer when no cross-thread send is being handled",
+    "ReplyMessage": "as InSendMessage: Windows fails with FALSE when the procedure is not handling a message sent from another thread",
+    "NotifyWinEvent": "SetWinEventHook never installs a hook, so there is no listener to notify",
+    "IsAppThemed": "OSyx has no visual styles: this is what Windows answers with themes off",
+    "IsThemeActive": "OSyx has no visual styles: this is what Windows answers with themes off",
+    "OpenThemeData": "OSyx has no visual styles: Windows returns NULL when no theme is active and callers fall back to classic drawing",
+    "SHChangeNotify": "SHChangeNotifyRegister is not provided, so no listener can exist and a notification has nobody to reach",
+    "SetOaNoCache": "the BSTR allocator of OSyx has no cache, so there is nothing to switch off",
+    "Commit": "IPropertyStore in memory (propsys.rs) has no backing file: committing has nothing to write",
+    "DnsFree": "DnsQuery never returns records, so there is nothing to free",
+    "FaceReleaseFontTable": "tables point into the face's file data, which lives as long as the face (see the comment at the function)",
+    "StreamReleaseFileFragment": "fragments point into the stream's byte buffer, which lives as long as the stream",
+    "loader_ref": "the local font file loader is a process-wide singleton: references do nothing, by design of IDWriteFontFileLoader",
+    "IsGUIThread": "every thread of a winrun process can use USER at once (its message queue is made on first use), as on Windows once user32 is loaded",
+    "GetKeyboardLayout": "OSyx has one keyboard layout (US, HKL 0x04090409) for every thread, so that is the answer for any thread id",
+    "UiaClientsAreListening": "OSyx has no UI Automation client, so nobody is listening",
+    "UiaReturnRawElementProvider": "with no UI Automation client no WM_GETOBJECT is answered: 0 is the not-handled result",
+    "UiaRaiseAutomationEvent": "with no listening client an event has nobody to reach; Windows returns S_OK then",
+    "UiaRaiseAutomationPropertyChangedEvent": "with no listening client a change has nobody to reach; Windows returns S_OK then",
+    "singleton_ref": "COM AddRef/Release of static objects: the count never changes, 1 is the Windows result for a static singleton",
+    "StreamCommit": "a memory stream has nothing to flush or roll back: Windows returns S_OK (probed)",
+    "StreamRevert": "a memory stream has nothing to flush or roll back: Windows returns S_OK (probed)",
+    "FtmDisconnectObject": "the free-threaded marshaler keeps no per-client state, so there is nothing to disconnect; Windows returns S_OK"
+  }
+}

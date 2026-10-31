@@ -728,6 +728,10 @@ extern "win64" fn RegEnumKeyExW(
     ERROR_SUCCESS
 }
 
+extern "win64" fn RegEnumKeyW(hkey: u64, index: u32, name: *mut u16, mut name_len: u32) -> u32 {
+    RegEnumKeyExW(hkey, index, name, &mut name_len, core::ptr::null(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut())
+}
+
 /// Values in name order (Windows keeps insertion order; neither is
 /// documented).
 #[allow(clippy::too_many_arguments)]
@@ -961,23 +965,77 @@ extern "win64" fn RegRenameKey(hkey: u64, sub: *const u16, new_name: *const u16)
     ERROR_SUCCESS
 }
 
-/// Kernel Transaction Manager transactions are not available (see
-/// ktmw32), so no transacted key can be created.
+/// Removes the key a rolled-back transaction created, if it is still there
+/// and has no subkeys (children made later by others are theirs).
+pub(crate) fn undo_create(hive: usize, path: &str) {
+    let mut r = REG.lock().unwrap();
+    let Some(d) = r.hives.get_mut(hive) else { return };
+    let lower = path.to_lowercase();
+    let child = alloc::format!("{lower}\\");
+    if d.keys.keys().any(|k| k.starts_with(&child)) {
+        return;
+    }
+    if d.keys.remove(&lower).is_some() {
+        let h = if hive == Hive::Machine as usize { Hive::Machine } else { Hive::User };
+        let _ = save(h, &r.hives[hive]);
+        changed(&mut r, h, path, REG_NOTIFY_CHANGE_NAME);
+    }
+}
+
+/// RegCreateKeyTransactedW: RegCreateKeyExW whose new keys the transaction
+/// remembers, so that a rollback removes them again. The handle must be an
+/// active transaction.
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn RegCreateKeyTransactedW(
-    _hkey: u64,
-    _sub: *const u16,
-    _reserved: u32,
-    _class: *const u16,
-    _options: u32,
-    _sam: u32,
-    _attributes: u64,
-    _out: *mut u64,
-    _disposition: *mut u32,
-    _transaction: u64,
-    _extended: u64,
+    hkey: u64,
+    sub: *const u16,
+    reserved: u32,
+    class: *const u16,
+    options: u32,
+    sam: u32,
+    attributes: u64,
+    out: *mut u64,
+    disposition: *mut u32,
+    transaction: u64,
+    extended: u64,
 ) -> u32 {
-    ERROR_NOT_SUPPORTED
+    let tx = match crate::ktm::active(transaction) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if extended != 0 {
+        return ERROR_INVALID_PARAMETER;
+    }
+    // The keys on the path that do not exist yet, outermost first.
+    let new_keys: Vec<(usize, String)> = {
+        let mut r = REG.lock().unwrap();
+        match resolve(&mut r, hkey) {
+            Ok((hive, base, _)) => {
+                // SAFETY: the caller's string.
+                let sub_name = unsafe { ws(sub) };
+                let mut missing = Vec::new();
+                let mut path = base.clone();
+                for part in sub_name.split('\\').filter(|p| !p.is_empty()) {
+                    path = match join(&path, part) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    if !r.hives[hive as usize].keys.contains_key(&path.to_lowercase()) {
+                        missing.push((hive as usize, path.clone()));
+                    }
+                }
+                missing
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+    let rc = RegCreateKeyExW(hkey, sub, reserved, class, options, sam, attributes, out, disposition);
+    if rc == ERROR_SUCCESS {
+        for (hive, path) in new_keys {
+            tx.record(crate::ktm::Undo::RegistryKey(hive, path));
+        }
+    }
+    rc
 }
 
 /// Changes made by this process signal the event (asynchronous form) or
@@ -1028,6 +1086,7 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         RegDisablePredefinedCache,
         RegDisablePredefinedCacheEx,
         RegEnumKeyExW,
+        RegEnumKeyW,
         RegEnumValueW,
         RegQueryInfoKeyW,
         RegDeleteTreeW,

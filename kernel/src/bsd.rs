@@ -57,6 +57,8 @@ extern "C" {
 
 const WIFI_CONF: &str = "/etc/osyx/wifi.conf";
 const WIFI_STATUS: &str = "/run/wifi.status";
+#[cfg(osyx_bsd)]
+const WIFI_RECONNECT: &str = "/run/wifi.reconnect";
 /// Networks that connected once: `ssid<TAB>passphrase` lines, most recent
 /// first. Written by the kernel only, readable by root only.
 const WIFI_KNOWN: &str = "/etc/osyx/wifi-known.conf";
@@ -233,6 +235,7 @@ pub fn after_mount() {
 fn service_thread(_: u64, _: u64) {
     let mut last_conf: Option<(i64, u64)> = None;
     let mut last_state = String::new();
+    let mut last_reconnect = None;
     let mut watch = JoinWatch::default();
     let mut memory = WifiMemory::default();
     let mut media: Vec<(u64, u64)> = Vec::new();
@@ -246,7 +249,7 @@ fn service_thread(_: u64, _: u64) {
         let now = interrupts::ticks();
         if now >= next_wifi {
             next_wifi = now + crate::arch::timer::ms_to_ticks(2000);
-            wifi_housekeeping(&mut last_conf, &mut last_state, &mut watch, &mut memory);
+            wifi_housekeeping(&mut last_conf, &mut last_reconnect, &mut last_state, &mut watch, &mut memory);
             log_wired_media(&mut media);
         }
         crate::arch::timer::sleep_ms(1);
@@ -305,6 +308,9 @@ struct JoinWatch {
     /// Joins applied so far: `/run/wifi.status` says "join N", so the
     /// desktop can tell the outcome of its own attempt from an older one.
     joins: u64,
+    /// Previously successful credentials should be retried after transient failures.
+    trusted: bool,
+    last_error: Option<String>,
 }
 
 /// Saved networks and the attempt in progress (across joins).
@@ -383,13 +389,17 @@ fn wifi_join(nic: &BsdNic, ssid: &str, pass: &str, watch: &mut JoinWatch, memory
         unsafe { osyx_bsd_wifi_join(nic.ifp as *mut c_void, ssid.as_ptr(), ssid.len(), p.as_ptr()) }
     };
     p.fill(0);
-    *watch = JoinWatch { joins: watch.joins + 1, ..JoinWatch::default() };
+    let trusted = memory.passphrase(ssid) == Some(pass);
+    *watch = JoinWatch { joins: watch.joins + 1, trusted, ..JoinWatch::default() };
     memory.target = Some((String::from(ssid), String::from(pass)));
     memory.saved = false;
     memory.last_join = interrupts::ticks().max(1);
     match e {
         0 => kprintln!("bsd: {}: joining \"{}\" ({why})", nic.name, ssid),
-        e => kprintln!("bsd: {}: cannot join \"{}\" (error {})", nic.name, ssid, e),
+        e => {
+            watch.last_error = Some(alloc::format!("Join failed (error {e})"));
+            kprintln!("bsd: {}: cannot join \"{}\" (error {})", nic.name, ssid, e);
+        }
     }
 }
 
@@ -399,7 +409,7 @@ fn wifi_join(nic: &BsdNic, ssid: &str, pass: &str, watch: &mut JoinWatch, memory
 /// network in range when nothing is connected, and refreshes
 /// `/run/wifi.status`; changes of the association state go to the log.
 #[cfg(osyx_bsd)]
-fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String, watch: &mut JoinWatch, memory: &mut WifiMemory) {
+fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_reconnect: &mut Option<(i64, u64)>, last_state: &mut String, watch: &mut JoinWatch, memory: &mut WifiMemory) {
     let Some(nic) = NICS.lock().iter().find(|n| n.wireless.load(Ordering::Relaxed)).cloned() else { return };
     if !WIFI_READY.load(Ordering::Acquire) {
         return;
@@ -428,6 +438,18 @@ fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String
             }
         }
     }
+    // A separate request file avoids overwriting saved Wi-Fi credentials.
+    let reconnect = crate::vfs::stat(&cx, WIFI_RECONNECT).ok().map(|s| (s.mtime_ns, s.size));
+    if reconnect.is_some() && reconnect != *last_reconnect {
+        *last_reconnect = reconnect;
+        let target = memory.target.clone().or_else(|| memory.known.first().cloned());
+        if let Some((ssid, pass)) = target {
+            memory.rejected.retain(|s| *s != ssid);
+            wifi_join(&nic, &ssid, &pass, watch, memory, "reconnect requested");
+        } else {
+            watch.last_error = Some(String::from("No saved network to reconnect"));
+        }
+    }
     let mut buf = alloc::vec![0u8; 8192];
     let n = {
         let _g = BIG_LOCK.lock();
@@ -450,9 +472,10 @@ fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String
         Some("yes") => watch.keyless_since = None,
         Some(_) => match watch.keyless_since {
             None => watch.keyless_since = Some(now),
-            Some(since) if !watch.wrong_password && now.saturating_sub(since) >= crate::arch::timer::ms_to_ticks(HANDSHAKE_LIMIT_MS) => {
+            Some(since) if !watch.trusted && !memory.saved && !watch.wrong_password && now.saturating_sub(since) >= crate::arch::timer::ms_to_ticks(HANDSHAKE_LIMIT_MS) => {
                 kprintln!("bsd: {}: the WPA handshake does not finish: wrong password", nic.name);
                 watch.wrong_password = true;
+                watch.last_error = Some(String::from("WPA handshake failed; check password"));
             }
             Some(_) => {}
         },
@@ -476,6 +499,10 @@ fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String
             memory.known.insert(0, (ssid.clone(), pass));
             memory.save();
             memory.saved = true;
+            watch.trusted = true;
+            watch.wrong_password = false;
+            watch.last_error = None;
+            memory.rejected.retain(|r| *r != ssid);
             memory.tried.clear();
             kprintln!("bsd: {}: \"{}\" saved", nic.name, ssid);
         }
@@ -502,6 +529,9 @@ fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String
             memory.tried.clear();
             pick = best(memory, &[]);
         }
+        if pick.is_none() {
+            pick = memory.target.as_ref().filter(|(s, _)| memory.passphrase(s).is_some() && !memory.rejected.contains(s)).map(|(s, _)| s.clone());
+        }
         if let Some(ssid) = pick {
             let pass = String::from(memory.passphrase(&ssid).unwrap_or(""));
             memory.tried.push(ssid.clone());
@@ -511,6 +541,9 @@ fn wifi_housekeeping(last_conf: &mut Option<(i64, u64)>, last_state: &mut String
     buf.extend_from_slice(alloc::format!("join {}\n", watch.joins).as_bytes());
     if watch.wrong_password {
         buf.extend_from_slice(b"error wrong-password\n");
+    }
+    if let Some(error) = &watch.last_error {
+        buf.extend_from_slice(alloc::format!("last_error {error}\n").as_bytes());
     }
     for (ssid, _) in &memory.known {
         buf.extend_from_slice(alloc::format!("known\t{ssid}\n").as_bytes());

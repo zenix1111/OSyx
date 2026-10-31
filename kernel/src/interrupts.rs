@@ -233,6 +233,10 @@ extern "C" fn osyx_interrupt_dispatch(f: &mut TrapFrame) {
             crate::smp::set_hold_kind(crate::smp::HOLD_TIMER);
             crate::process::finish_current_thread(0);
         }
+        // A thread suspended while it ran user code stops at the first tick.
+        if from_user {
+            crate::sched::park_if_suspended();
+        }
         return;
     }
     // Device MSIs: their handlers only take spinlocks and wake a driver

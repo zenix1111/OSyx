@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b13">
+  <meta name="description" content="Meet OSyx, an open-source x86-64 operating system built from scratch in Rust.">
+  <meta property="og:title" content="OSyx — an operating system from scratch">
+  <meta property="og:description" content="A new open-source operating system with its own kernel, desktop, and Windows compatibility layer.">
+  <meta property="og:image" content="assets/desktop.jpg">
+  <title>OSyx — An operating system from scratch</title>
+  <link rel="icon" href="assets/logo.png">
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="header">
+    <div class="nav wrap">
+      <a class="brand" href="#top" aria-label="OSyx home"><img src="assets/logo.png" alt=""><span>OSyx<span class="brand-dot">.</span></span></a>
+      <nav aria-label="Main navigation"><a href="#about">About</a><a href="#inside">Inside OSyx</a><a href="#winparity">Win Parity</a><a href="#get-started">Get started</a></nav>
+      <a class="nav-github" href="https://github.com/OSyxSoftware/OSyx">GitHub <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <main id="main">
+    <section class="hero wrap" id="top">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="status-dot"></span> OPEN SOURCE <span class="slash">/</span> ACTIVELY DEVELOPED</div>
+        <h1>A different kind<br>of <span>starting point.</span></h1>
+        <p class="lead">A new operating system, built from scratch in Rust. Explore what happens when you start from the kernel and build your way up.</p>
+        <div class="actions"><a class="button primary" href="https://github.com/OSyxSoftware/OSyx/releases/latest">Get OSyx <span aria-hidden="true">↗</span></a><a class="button secondary" href="https://github.com/OSyxSoftware/OSyx">Explore the source <span aria-hidden="true">→</span></a></div>
+        <div class="hero-meta"><span id="release-label">LATEST RELEASE</span><span class="meta-divider"></span><span>x86-64 · UEFI</span></div>
+      </div>
+      <div class="hero-visual" aria-label="OSyx desktop screenshot">
+        <div class="screen"><div class="screen-top"><div class="dots"><i></i><i></i><i></i></div><span>OSYX / DESKTOP</span><span class="screen-right">● LIVE SYSTEM</span></div><img src="assets/desktop.jpg" alt="OSyx desktop showing the Files and System Information windows" fetchpriority="high"><div class="screen-bottom"><span>BUILT FROM THE GROUND UP</span><span>01 — 04</span></div></div>
+        <div class="floating-tag"><span class="tag-icon">✳</span><span>INDEPENDENT BY DESIGN<br><strong>Built in Rust</strong></span></div>
+      </div>
+    </section>
+    <div class="ticker"><div class="wrap ticker-inner"><span>AN OPERATING SYSTEM IN PROGRESS</span><span class="ticker-star">✳</span><span>OPEN SOURCE, FROM THE GROUND UP</span><span class="ticker-star">✳</span><span>BUILT FOR THE CURIOUS</span></div></div>
+    <section class="section wrap intro" id="about"><div class="section-label"><span>01</span> THE IDEA</div><div><h2>Not a distribution.<br><em>A new foundation.</em></h2></div><div class="intro-copy"><p>OSyx is an independent x86-64 operating system with its own bootloader, kernel, file systems, network stack, compositor, and desktop.</p><p>It’s an ongoing project for people who want to see how a system comes together — and help shape what it becomes.</p><a class="text-link" href="https://github.com/OSyxSoftware/OSyx/blob/main/docs/overview.md">Read the overview <span>↗</span></a></div></section>
+    <section class="section inside" id="inside"><div class="wrap"><div class="section-heading"><div><div class="section-label"><span>02</span> WHAT'S INSIDE</div><h2>Built layer by layer<span class="blue">.</span></h2></div><p>From the first boot to the desktop, each piece has a place.</p></div><div class="feature-list">
+      <article class="feature"><span class="feature-number">01 / CORE</span><div><h3>Its own foundation</h3><p>A UEFI boot manager and a Rust kernel with memory management, scheduling, and drivers.</p></div><span class="feature-icon">⌘</span></article>
+      <article class="feature"><span class="feature-number">02 / DESKTOP</span><div><h3>A desktop called PRISM</h3><p>A compositor, taskbar, launcher, and native tools for working with files and system settings.</p></div><span class="feature-icon">▧</span></article>
+      <article class="feature"><span class="feature-number">03 / COMPATIBILITY</span><div><h3>Windows, in progress</h3><p>The winrun compatibility layer runs a subset of Windows programs. Support is evolving; not every application works yet.</p></div><span class="feature-icon">◈</span></article>
+      <article class="feature"><span class="feature-number">04 / CONNECTIVITY</span><div><h3>Connected from within</h3><p>A native network stack, Ethernet, Wi-Fi support, and signed system updates.</p></div><span class="feature-icon">⌁</span></article>
+    </div></div></section>
+    <section class="section wrap winparity" id="winparity"><div class="section-heading"><div><div class="section-label"><span>03</span> WIN PARITY</div><h2>Windows compatibility,<br><em>measured.</em></h2></div><p>How much of the Windows API winrun covers, counted against the export tables of a real Windows install. Nothing here is estimated.</p></div>
+      <div class="parity-cards" id="parity-cards" aria-live="polite"><div class="parity-card"><span class="parity-key">x64 COVERAGE</span><strong>–</strong><small>loading</small></div></div>
+      <div class="parity-tables" id="parity-tables"></div>
+      <p class="parity-note" id="parity-note">Coverage is the share of Windows' exports that exist in OSyx as real code (implemented or partial); stubs, error-only functions and unknown never count. Behavioural parity counts only functions exercised by a passing test. <a class="text-link" href="https://github.com/OSyxSoftware/OSyx/blob/main/docs/win-parity.md">How it is measured <span>↗</span></a></p></section>
+    <section class="section wrap gallery"><div class="section-heading"><div><div class="section-label"><span>04</span> A CLOSER LOOK</div><h2>Make yourself<br><em>at home.</em></h2></div><p>The real OSyx desktop, tools, and setup — captured from the project.</p></div><div class="gallery-grid"><figure class="gallery-main"><img src="assets/launcher.jpg" alt="OSyx launcher and Files window" loading="lazy"><figcaption><span>01 / THE DESKTOP</span><span>Launcher &amp; Files ↗</span></figcaption></figure><figure><img src="assets/terminal.jpg" alt="AXIS Terminal on the OSyx desktop" loading="lazy"><figcaption><span>02 / THE TERMINAL</span><span>AXIS Terminal ↗</span></figcaption></figure><figure><img src="assets/installer.jpg" alt="OSyx Setup installer window" loading="lazy"><figcaption><span>03 / GETTING STARTED</span><span>OSyx Setup ↗</span></figcaption></figure></div></section>
+    <section class="section get-started" id="get-started"><div class="wrap get-grid"><div><div class="section-label"><span>05</span> TRY IT OUT</div><h2>Curiosity looks<br><em>good on you.</em></h2><p>Try the live system on an x86-64 UEFI computer or explore it in QEMU. OSyx is actively developed, so check the project documentation for current hardware support.</p><a class="button primary" href="https://github.com/OSyxSoftware/OSyx/releases/latest">View latest release <span aria-hidden="true">↗</span></a></div><div class="steps"><div class="step"><span>01</span><div><h3>Get the image</h3><p>Download the live USB image from the latest release.</p></div></div><div class="step"><span>02</span><div><h3>Write &amp; boot</h3><p>Write the image to a USB drive, then boot it with UEFI and Secure Boot off.</p></div></div><div class="step"><span>03</span><div><h3>Explore OSyx</h3><p>Try the live desktop. If you choose to install, Setup will erase the disk you select.</p></div></div><p class="step-note">Writing an image erases the target USB drive. Check the <a href="https://github.com/OSyxSoftware/OSyx#try-it">README</a> before you begin.</p></div></div></section>
+    <section class="section wrap closing"><div class="section-label"><span>06</span> OPEN BY NATURE</div><div class="closing-inner"><div><h2>There’s more<br><em>to build.</em></h2><p>OSyx is free software, made in the open. Follow the work, report an issue, or contribute a little piece of the future.</p><div class="actions"><a class="button secondary" href="https://github.com/OSyxSoftware/OSyx/blob/main/CONTRIBUTING.md">Contribute <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/OSyxSoftware/OSyx/issues">Open an issue <span>↗</span></a></div></div><div class="closing-mark" aria-hidden="true">OS<span>y</span>x<span>.</span></div></div></section>
+  </main>
+  <footer><div class="wrap footer-inner"><div><a class="brand footer-brand" href="#top"><span>OSyx<span class="brand-dot">.</span></span></a><p>An independent operating system.<br>Made for the curious.</p></div><div class="footer-links"><div><span>EXPLORE</span><a href="https://github.com/OSyxSoftware/OSyx">GitHub</a><a href="https://github.com/OSyxSoftware/OSyx/releases">Releases</a><a href="https://github.com/OSyxSoftware/OSyx/blob/main/docs/roadmap.md">Roadmap</a></div><div><span>SUPPORT</span><a href="https://github.com/sponsors/v3nn7">GitHub Sponsors</a><a href="https://ko-fi.com/v3nn7">Ko-fi</a><a href="https://github.com/OSyxSoftware/OSyx/blob/main/LICENSE">GPL-3.0-or-later</a></div></div></div><div class="wrap footer-bottom"><span>© OSyx contributors</span><span>MADE IN THE OPEN <span class="blue">✳</span></span></div></footer>
+</body>
+</html>

@@ -1,0 +1,76 @@
+; kernel32 import stubs for the 32-bit test fixtures (hello32.exe, api32.exe, thread32.exe).
+; The i686 ABI decorates stdcall references (_GetStdHandle@4, and the
+; dllimport pointers __imp__GetStdHandle@4), but the OSyx loader resolves
+; imports by undecorated name, so the import table must carry the plain
+; names. ld.lld's stdcall fixup maps the decorated references onto these
+; plain stubs and prints "Resolving ... by linking to ..." for each.
+; Built once per run with:
+;   lld-link /lib /def:kernel32_x86.def /machine:x86 /out:kernel32_x86.lib
+LIBRARY kernel32.dll
+EXPORTS
+    GetStdHandle
+    WriteFile
+    ExitProcess
+    lstrcmpiA
+    lstrlenW
+    MulDiv
+    GetTickCount
+    GetCommandLineW
+    GlobalAlloc
+    GlobalFree
+    GetPrivateProfileStringW
+    WritePrivateProfileStringW
+    DeleteFileW
+    CreateFileW
+    ReadFile
+    CloseHandle
+    CreateThread
+    CreateProcessW
+    GetExitCodeProcess
+    WaitForSingleObject
+    GetExitCodeThread
+    Sleep
+    GetModuleHandleW
+    LoadLibraryExW
+    GetProcAddress
+    GetLastError
+    GetFileAttributesW
+    LocalFree
+    FreeLibrary
+    CreateDirectoryW
+    RemoveDirectoryW
+    HeapCreate
+    HeapDestroy
+    HeapAlloc
+    HeapFree
+    HeapSize
+    HeapValidate
+    HeapLock
+    HeapUnlock
+    HeapReAlloc
+    GetProcessHeap
+    GetProcessHeaps
+    InitializeCriticalSection
+    EnterCriticalSection
+    LeaveCriticalSection
+    DeleteCriticalSection
+    TryEnterCriticalSection
+    DisableThreadLibraryCalls
+    SetLastError
+    GetFileSizeEx
+    SetFilePointerEx
+    GetSystemTime
+    SystemTimeToFileTime
+    VerSetConditionMask
+    VerifyVersionInfoW
+    GlobalReAlloc
+    CreateFileMappingW
+    MapViewOfFile
+    UnmapViewOfFile
+    CreatePipe
+    InterlockedIncrement
+    InterlockedDecrement
+    InterlockedExchange
+    InterlockedExchangeAdd
+    InterlockedCompareExchange
+    InterlockedCompareExchange64

@@ -27,11 +27,19 @@ bench = false
 os-std = { path = "../../runtime/os-std" }
 os-sys = { path = "../../runtime/os-sys" }
 osyx-abi = { path = "../../shared/abi" }
-aml = { path = "../../third_party/aml" }
+osyx-battery = { path = "../battery" }
+osyx-i2c = { path = "../../drivers/i2c" }
+osyx-i2chid = { path = "../i2chid" }
 
 [[bin]]
 name = "batteryd"
 path = "src/bin/batteryd.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "i2chidd"
+path = "src/bin/i2chidd.rs"
 test = false
 bench = false
 

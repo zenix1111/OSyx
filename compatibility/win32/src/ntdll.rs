@@ -600,17 +600,133 @@ extern "win64" fn NtDeviceIoControlFile(h: u64, _e: u64, _apc: u64, _ctx: u64, _
     STATUS_INVALID_DEVICE_REQUEST
 }
 
-/// OSyx has no NT object namespace with directories to open.
+const STATUS_NO_MORE_ENTRIES: NtStatus = 0x8000_001A;
+const STATUS_OBJECT_PATH_SYNTAX_BAD: NtStatus = 0xC000_003B;
+const STATUS_ACCESS_VIOLATION: NtStatus = 0xC000_0005;
+const STATUS_MORE_ENTRIES: NtStatus = 0x0000_0105;
+const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023;
+const DIRECTORY_QUERY: u32 = 1;
+
+/// The object namespace OSyx offers: the root, holding `BaseNamedObjects`,
+/// which holds the named events, mutexes, semaphores, timers and sections
+/// of the process.
+fn directory_path(name: &str) -> Option<&'static str> {
+    match name.trim_end_matches('\\').to_ascii_lowercase().as_str() {
+        "" => Some("\\"),
+        "\\basenamedobjects" => Some("\\BaseNamedObjects"),
+        _ => None,
+    }
+}
+
+/// NtOpenDirectoryObject(&handle, access, &OBJECT_ATTRIBUTES): opens `\\` or
+/// `\\BaseNamedObjects` (also relative to an open directory).
 extern "win64" fn NtOpenDirectoryObject(handle: *mut u64, _access: u32, oa: u64) -> NtStatus {
     if handle.is_null() || oa == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    STATUS_OBJECT_NAME_NOT_FOUND
+    // SAFETY: an OBJECT_ATTRIBUTES: RootDirectory at 8, ObjectName at 16.
+    let (root, name_ptr) = unsafe { (core::ptr::read_unaligned((oa + 8) as *const u64), core::ptr::read_unaligned((oa + 16) as *const u64)) };
+    if name_ptr == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: a UNICODE_STRING: Length at 0, Buffer at 8.
+    let name = unsafe {
+        let len = core::ptr::read_unaligned(name_ptr as *const u16) as usize / 2;
+        let buf = core::ptr::read_unaligned((name_ptr + 8) as *const u64) as *const u16;
+        if buf.is_null() { String::new() } else { String::from_utf16_lossy(core::slice::from_raw_parts(buf, len)) }
+    };
+    let full = if root != 0 {
+        let Some(Object::Directory(d)) = objects::get(root) else { return STATUS_INVALID_HANDLE };
+        alloc::format!("{}\\{}", d.path.trim_end_matches('\\'), name)
+    } else {
+        if !name.starts_with('\\') {
+            return STATUS_OBJECT_PATH_SYNTAX_BAD;
+        }
+        name
+    };
+    let Some(path) = directory_path(&full) else { return STATUS_OBJECT_NAME_NOT_FOUND };
+    // SAFETY: the caller's out pointer.
+    unsafe { *handle = objects::insert(Object::Directory(alloc::sync::Arc::new(objects::DirectoryObj { path: String::from(path) }))) };
+    0
 }
 
+/// The (name, type) entries of a directory.
+fn directory_entries(path: &str) -> Vec<(String, &'static str)> {
+    if path == "\\" {
+        alloc::vec![(String::from("BaseNamedObjects"), "Directory")]
+    } else {
+        objects::named_objects()
+    }
+}
+
+/// NtQueryDirectoryObject: an array of OBJECT_DIRECTORY_INFORMATION (a name
+/// and a type name, both UNICODE_STRINGs) ended by a zero entry, then the
+/// strings. `ctx` is the index of the next entry: it counts up as entries
+/// are returned and `restart` sets it back to 0. STATUS_MORE_ENTRIES means
+/// more remain after those that fit, STATUS_NO_MORE_ENTRIES that none are
+/// left, STATUS_BUFFER_TOO_SMALL that not even one fits (`ret` has the size
+/// that one needs).
 #[allow(clippy::too_many_arguments)]
-extern "win64" fn NtQueryDirectoryObject(_h: u64, _buf: u64, _len: u32, _single: u8, _restart: u8, _ctx: *mut u32, _ret: *mut u32) -> NtStatus {
-    STATUS_INVALID_HANDLE
+extern "win64" fn NtQueryDirectoryObject(h: u64, buf: u64, len: u32, single: u8, restart: u8, ctx: *mut u32, ret: *mut u32) -> NtStatus {
+    let Some(Object::Directory(dir)) = objects::get(h) else { return STATUS_INVALID_HANDLE };
+    if ctx.is_null() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let entries = directory_entries(&dir.path);
+    // SAFETY: the caller's context word.
+    let start = if restart != 0 { 0 } else { unsafe { *ctx } } as usize;
+    if start >= entries.len() {
+        // SAFETY: the caller's context word.
+        unsafe { *ctx = start as u32 };
+        return STATUS_NO_MORE_ENTRIES;
+    }
+    // Bytes of one entry's strings, with their NULs, and the fixed part: the
+    // entries so far plus the terminating zero entry.
+    let strings = |e: &(String, &'static str)| (e.0.encode_utf16().count() + 1) * 2 + (e.1.encode_utf16().count() + 1) * 2;
+    let want = if single != 0 { 1 } else { entries.len() - start };
+    let mut fit = 0usize;
+    let mut need = 32usize;
+    for e in entries[start..].iter().take(want) {
+        let next = need + 32 + strings(e);
+        if next > len as usize && fit > 0 {
+            break;
+        }
+        need = next;
+        fit += 1;
+        if next > len as usize {
+            break;
+        }
+    }
+    if buf == 0 || need > len as usize {
+        if !ret.is_null() {
+            // SAFETY: the caller's out pointer.
+            unsafe { *ret = need as u32 };
+        }
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    let mut text = buf + 32 * (fit as u64 + 1);
+    // SAFETY: the caller's buffer holds `len` bytes, of which `need` are used.
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 32 * (fit + 1));
+        for (i, e) in entries[start..start + fit].iter().enumerate() {
+            let at = buf + 32 * i as u64;
+            for (k, s) in [(0u64, e.0.as_str()), (16, e.1)] {
+                let units: Vec<u16> = s.encode_utf16().collect();
+                let bytes = units.len() * 2;
+                core::ptr::copy_nonoverlapping(units.as_ptr() as *const u8, text as *mut u8, bytes);
+                core::ptr::write_unaligned((text + bytes as u64) as *mut u16, 0);
+                core::ptr::write_unaligned((at + k) as *mut u16, bytes as u16);
+                core::ptr::write_unaligned((at + k + 2) as *mut u16, bytes as u16 + 2);
+                core::ptr::write_unaligned((at + k + 8) as *mut u64, text);
+                text += bytes as u64 + 2;
+            }
+        }
+        *ctx = (start + fit) as u32;
+        if !ret.is_null() {
+            *ret = need as u32;
+        }
+    }
+    if start + fit < entries.len() && single == 0 { STATUS_MORE_ENTRIES } else { 0 }
 }
 
 /// SystemBasicInformation (0) and SystemProcessorPerformanceInformation

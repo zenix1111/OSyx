@@ -1,0 +1,9 @@
+[package]
+name = "osyx-i2c"
+description = "Hardware-independent I2C and HID-over-I2C building blocks: DesignWare controller, HID protocol, report decoding, ACPI resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+osyx-usb = { path = "../usb" }

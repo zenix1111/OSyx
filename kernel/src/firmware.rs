@@ -40,6 +40,23 @@ fn port_reserved(port: u16) -> bool {
     matches!(port, 0x20..=0x21 | 0xA0..=0xA1 | 0x40..=0x43 | 0x60 | 0x64 | 0x70..=0x71 | 0x3F8..=0x3FF | 0xCF8..=0xCFF | 0xF4)
 }
 
+/// Whether `[start, start + len)` overlaps RAM the kernel owns.
+pub fn overlaps_kernel_ram(start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else { return true };
+    KERNEL_RAM.lock().iter().any(|&(s, e)| start < e && end > s)
+}
+
+/// `buf`, `len`: an encoded `osyx_i2c::spec` description (at most
+/// `spec::MAX_BYTES`); returns the number of devices the kernel claimed.
+fn i2c_hid(buf: u64, len: u64) -> Result<u64, Errno> {
+    if len == 0 || len > osyx_i2c::spec::MAX_BYTES as u64 {
+        return Err(Errno::InvalidArgument);
+    }
+    let mut bytes = alloc::vec![0u8; len as usize];
+    crate::fixup::copy_from_user(&mut bytes, buf)?;
+    crate::drivers::i2c::register(&bytes).map(|n| n as u64)
+}
+
 fn width_ok(width: u64) -> bool {
     matches!(width, 1 | 2 | 4 | 8)
 }
@@ -54,6 +71,7 @@ pub fn syscall(code: u64, a: u64, b: u64, c: u64, d: u64) -> Result<u64, Errno> 
         op::PORT => port(a, b, c, d != 0),
         op::PHYS => phys(a, b, c, d != 0),
         op::PCI => pci(a, b, c, d),
+        op::I2C_HID => i2c_hid(a, b),
         _ => Err(Errno::InvalidArgument),
     }
 }
@@ -103,7 +121,7 @@ fn phys(addr: u64, width: u64, value: u64, write: bool) -> Result<u64, Errno> {
         return Err(Errno::InvalidArgument);
     }
     let end = addr.checked_add(width).ok_or(Errno::InvalidArgument)?;
-    if KERNEL_RAM.lock().iter().any(|&(s, e)| addr < e && end > s) {
+    if overlaps_kernel_ram(addr, end - addr) {
         return Err(Errno::PermissionDenied);
     }
     let page = addr & !(crate::mem::PAGE_SIZE - 1);

@@ -584,7 +584,18 @@ extern "win64" fn UpdateProcThreadAttribute(list: *mut AttributeList, flags: u32
     1
 }
 
-extern "win64" fn DeleteProcThreadAttributeList(_list: *mut AttributeList) {}
+/// The list holds no resource of its own; deleting it leaves it unusable
+/// (no capacity), so a later UpdateProcThreadAttribute fails instead of
+/// writing into a list its owner has given up.
+extern "win64" fn DeleteProcThreadAttributeList(list: *mut AttributeList) {
+    if !list.is_null() {
+        // SAFETY: a list the caller initialised.
+        unsafe {
+            (*list).capacity = 0;
+            (*list).used = 0;
+        }
+    }
+}
 
 // ---- job objects -----------------------------------------------------------------
 

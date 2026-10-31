@@ -17,6 +17,11 @@ use os_std::sync::Mutex;
 /// Wall-clock time the process started (ns since 1970), set by init_process.
 static START_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Real-time clock (ns since the Unix epoch) when the process started.
+pub(crate) fn process_start_ns() -> u64 {
+    START_NS.load(Ordering::Relaxed)
+}
+
 pub fn mark_start() {
     START_NS.store(os_sys::clock(osyx_abi::CLOCK_REALTIME).unwrap_or(0), Ordering::Relaxed);
 }
@@ -281,14 +286,36 @@ pub fn is_bad_read(p: u64, len: usize) -> bool {
     !readable(last)
 }
 
-/// Windows Error Reporting is not part of OSyx: there is no out-of-process
-/// crash handler to register with.
-extern "win64" fn WerRegisterRuntimeExceptionModule(_dll: *const u16, _context: u64) -> u32 {
-    0x8000_4001 // E_NOTIMPL
+// ---- Windows Error Reporting runtime exception modules ------------------------------------
+//
+// WerRegisterRuntimeExceptionModule records a (module path, context) pair
+// for the process; WerUnregisterRuntimeExceptionModule removes the same
+// pair. The list is what Windows keeps: OSyx has no out-of-process crash
+// handler, so a registered module is never loaded after a crash.
+
+const E_INVALIDARG_HR: u32 = 0x8007_0057;
+const HR_FILE_NOT_FOUND: u32 = 0x8007_0002;
+
+static WER_MODULES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+extern "win64" fn WerRegisterRuntimeExceptionModule(dll: *const u16, context: u64) -> u32 {
+    // SAFETY: a NUL-terminated module path or NULL.
+    let Some(path) = (unsafe { kernel32::sw(dll) }) else { return E_INVALIDARG_HR };
+    WER_MODULES.lock().unwrap().push((path, context));
+    0 // S_OK
 }
 
-extern "win64" fn WerUnregisterRuntimeExceptionModule(_dll: *const u16, _context: u64) -> u32 {
-    0x8000_4001
+extern "win64" fn WerUnregisterRuntimeExceptionModule(dll: *const u16, context: u64) -> u32 {
+    // SAFETY: a NUL-terminated module path or NULL.
+    let Some(path) = (unsafe { kernel32::sw(dll) }) else { return E_INVALIDARG_HR };
+    let mut list = WER_MODULES.lock().unwrap();
+    match list.iter().position(|(p, c)| *c == context && p.eq_ignore_ascii_case(&path)) {
+        Some(i) => {
+            list.remove(i);
+            0 // S_OK
+        }
+        None => HR_FILE_NOT_FOUND,
+    }
 }
 
 // ---- SearchPath -------------------------------------------------------------------
@@ -751,19 +778,42 @@ extern "win64" fn GetProcessHandleCount(process: u64, out: *mut u32) -> i32 {
     1
 }
 
-/// Every heap handle shares one allocator; the process heap stands for it.
+/// The process heap, then the heaps made by HeapCreate. Returns how many
+/// there are; at most `n` handles are written.
 extern "win64" fn GetProcessHeaps(n: u32, out: *mut u64) -> u32 {
-    if n >= 1 && !out.is_null() {
-        // SAFETY: the caller's array of `n` handles.
-        unsafe { *out = kernel32::process_heap() };
+    let all = crate::heaps::all();
+    if !out.is_null() {
+        for (i, h) in all.iter().take(n as usize).enumerate() {
+            // SAFETY: the caller's array of `n` handles (4 bytes each for a
+            // 32-bit caller).
+            unsafe {
+                if crate::wow64::is_active() { *(out as *mut u32).add(i) = *h as u32 } else { *out.add(i) = *h }
+            }
+        }
     }
-    1
+    all.len() as u32
 }
 
-/// HeapCompatibilityInformation (LFH) and terminate-on-corruption would
-/// promise allocator behaviour the shared allocator does not have.
-extern "win64" fn HeapSetInformation(_heap: u64, _class: u32, _info: u64, _len: usize) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+const HEAP_COMPATIBILITY_INFORMATION: u32 = 0;
+const HEAP_ENABLE_TERMINATION_ON_CORRUPTION: u32 = 1;
+
+/// Both classes of Windows are hints: the low-fragmentation setting (a
+/// ULONG, 0, 1 or 2) and terminate-on-corruption (heap NULL or any heap, no
+/// data). The shared allocator has one behaviour, so a valid hint is
+/// accepted; any other class or size is ERROR_INVALID_PARAMETER.
+extern "win64" fn HeapSetInformation(_heap: u64, class: u32, info: u64, len: usize) -> i32 {
+    match class {
+        HEAP_ENABLE_TERMINATION_ON_CORRUPTION if len == 0 => 1,
+        HEAP_COMPATIBILITY_INFORMATION if len == 4 && info != 0 => {
+            // SAFETY: the caller passes a ULONG of `len` bytes.
+            if unsafe { *(info as *const u32) } <= 2 {
+                1
+            } else {
+                fail(ERROR_INVALID_PARAMETER, 0)
+            }
+        }
+        _ => fail(ERROR_INVALID_PARAMETER, 0),
+    }
 }
 
 const HANDLE_FLAG_INHERIT: u32 = 1;
@@ -801,10 +851,116 @@ extern "win64" fn GetHandleInformation(h: u64, flags: *mut u32) -> i32 {
     1
 }
 
-/// ThreadMemoryPriority, absolute CPU priority, dynamic code policy and
-/// power throttling have no counterpart in the OSyx scheduler.
-extern "win64" fn SetThreadInformation(_thread: u64, _class: u32, _info: u64, _len: u32) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+// ---- thread information ----------------------------------------------------------------------
+//
+// SetThreadInformation / GetThreadInformation keep the values per thread id
+// and answer a query with what was set. The OSyx scheduler has no page
+// priority, absolute CPU priority or power throttling to apply them to;
+// that is the same position as a Windows machine ignoring a hint.
+
+const THREAD_MEMORY_PRIORITY: u32 = 0;
+const THREAD_ABSOLUTE_CPU_PRIORITY: u32 = 1;
+const THREAD_DYNAMIC_CODE_POLICY: u32 = 2;
+const THREAD_POWER_THROTTLING: u32 = 3;
+const MEMORY_PRIORITY_NORMAL: u32 = 5;
+const POWER_THROTTLING_EXECUTION_SPEED: u32 = 1;
+const ERROR_BAD_LENGTH_W: u32 = 24;
+
+#[derive(Clone, Copy)]
+struct ThreadInfo {
+    memory: u32,
+    absolute: u32,
+    dynamic_code: u32,
+    throttle_control: u32,
+    throttle_state: u32,
+}
+
+const THREAD_INFO_DEFAULT: ThreadInfo = ThreadInfo { memory: MEMORY_PRIORITY_NORMAL, absolute: 0, dynamic_code: 0, throttle_control: 0, throttle_state: 0 };
+
+static THREAD_INFO: Mutex<alloc::collections::BTreeMap<u32, ThreadInfo>> = Mutex::new(alloc::collections::BTreeMap::new());
+
+fn thread_tid(h: u64) -> Option<u32> {
+    if h == objects::CURRENT_THREAD || matches!(objects::get(h), Some(objects::Object::Thread(_))) {
+        Some(kernel32::GetThreadId(h))
+    } else {
+        None
+    }
+}
+
+/// The byte size of each information class.
+fn thread_info_size(class: u32) -> Option<u32> {
+    match class {
+        THREAD_MEMORY_PRIORITY | THREAD_ABSOLUTE_CPU_PRIORITY | THREAD_DYNAMIC_CODE_POLICY => Some(4),
+        THREAD_POWER_THROTTLING => Some(12),
+        _ => None,
+    }
+}
+
+extern "win64" fn SetThreadInformation(thread: u64, class: u32, info: u64, len: u32) -> i32 {
+    let Some(tid) = thread_tid(thread) else { return fail(ERROR_INVALID_HANDLE, 0) };
+    let Some(size) = thread_info_size(class) else { return fail(ERROR_INVALID_PARAMETER, 0) };
+    if info == 0 {
+        return fail(ERROR_NOACCESS, 0);
+    }
+    if len != size {
+        return fail(ERROR_BAD_LENGTH_W, 0);
+    }
+    // SAFETY: the caller's information block of `len` bytes.
+    let word = |i: u64| unsafe { core::ptr::read_unaligned((info + i * 4) as *const u32) };
+    let mut all = THREAD_INFO.lock().unwrap();
+    let slot = all.entry(tid).or_insert(THREAD_INFO_DEFAULT);
+    match class {
+        THREAD_MEMORY_PRIORITY => {
+            if word(0) > MEMORY_PRIORITY_NORMAL {
+                return fail(ERROR_INVALID_PARAMETER, 0);
+            }
+            slot.memory = word(0);
+        }
+        THREAD_ABSOLUTE_CPU_PRIORITY => slot.absolute = word(0),
+        THREAD_DYNAMIC_CODE_POLICY => {
+            if word(0) > 1 {
+                return fail(ERROR_INVALID_PARAMETER, 0);
+            }
+            slot.dynamic_code = word(0);
+        }
+        _ => {
+            // THREAD_POWER_THROTTLING_STATE: Version (1), ControlMask, StateMask.
+            let (version, control, state) = (word(0), word(1), word(2));
+            if version != 1 || control & !POWER_THROTTLING_EXECUTION_SPEED != 0 || state & !control != 0 {
+                return fail(ERROR_INVALID_PARAMETER, 0);
+            }
+            slot.throttle_control = control;
+            slot.throttle_state = state;
+        }
+    }
+    1
+}
+
+extern "win64" fn GetThreadInformation(thread: u64, class: u32, info: u64, len: u32) -> i32 {
+    let Some(tid) = thread_tid(thread) else { return fail(ERROR_INVALID_HANDLE, 0) };
+    if !matches!(class, THREAD_MEMORY_PRIORITY | THREAD_POWER_THROTTLING) {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    let size = thread_info_size(class).unwrap_or(0);
+    if info == 0 {
+        return fail(ERROR_NOACCESS, 0);
+    }
+    if len != size {
+        return fail(ERROR_BAD_LENGTH_W, 0);
+    }
+    let cur = THREAD_INFO.lock().unwrap().get(&tid).copied().unwrap_or(THREAD_INFO_DEFAULT);
+    // SAFETY: the caller's information block of `len` bytes.
+    unsafe {
+        let out = info as *mut u32;
+        if class == THREAD_MEMORY_PRIORITY {
+            core::ptr::write_unaligned(out, cur.memory);
+        } else {
+            core::ptr::write_unaligned(out, 1);
+            core::ptr::write_unaligned(out.add(1), cur.throttle_control);
+            core::ptr::write_unaligned(out.add(2), cur.throttle_state);
+        }
+    }
+    1
 }
 
 // PROCESS_MITIGATION_POLICY classes reported as they are on OSyx: data
@@ -996,6 +1152,8 @@ extern "win64" fn NtQueryObject(h: u64, class: u32, buf: *mut u8, len: u32, ret:
         2 => {
             let name = match o {
                 objects::Object::File(_) | objects::Object::Console(_) | objects::Object::Null | objects::Object::Pipe(_) => "File",
+                objects::Object::Directory(_) => "Directory",
+                objects::Object::Transaction(_) => "Transaction",
                 objects::Object::Thread(_) => "Thread",
                 objects::Object::Event(_) => "Event",
                 objects::Object::KeyedEvent(_) => "KeyedEvent",
@@ -1063,6 +1221,7 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         GetProcessHandleCount,
         GetProcessHeaps,
         HeapSetInformation,
+        GetThreadInformation,
         SetHandleInformation,
         GetHandleInformation,
         SetThreadInformation,

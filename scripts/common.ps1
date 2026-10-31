@@ -223,7 +223,9 @@ function Get-QemuArgs([string]$SerialLog, [switch]$Headless, [int]$MemoryMiB = 5
     if (-not $Script:QemuBinary) { throw 'qemu-system-x86_64 not found (run scripts/check-env.ps1)' }
     if (-not $Script:Ovmf) { throw 'OVMF (edk2-x86_64-code.fd) not found' }
     $accelArgs = @()
-    $cpuModel = 'qemu64,+nx'
+    # TCG qemu64 needs xsaveopt for CR4.OSXSAVE to work; without it the guest
+    # hangs entering the kernel. AVX exercises the XSAVE context-switch path.
+    $cpuModel = 'qemu64,+nx,+xsave,+xsaveopt,+avx'
     if ($Accel -eq 'whpx' -or ($Accel -eq 'auto' -and (Test-Whpx))) {
         $accelArgs = @('-accel', 'whpx')
         $cpuModel = 'host'

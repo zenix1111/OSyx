@@ -499,6 +499,62 @@ pub fn replace_in(root: u64, va: u64, pa: u64, flags: Flags) -> Result<u64, MapE
     Ok(old & ADDR_MASK)
 }
 
+/// The present user pages mapped in `root`, lowest first, at most `limit`
+/// of them, and their total number. Each entry is the page-aligned address
+/// with the leaf's protection in the low bits: bit 0 writable, bit 1
+/// executable. A 2 MiB or 1 GiB page is listed as the 4 KiB pages it covers.
+pub fn user_pages(root: u64, limit: usize) -> (alloc::vec::Vec<u64>, u64) {
+    let _g = PAGING.lock();
+    let mut out = alloc::vec::Vec::new();
+    let mut total = 0u64;
+    let mut note = |va: u64, count: u64, leaf: u64, out: &mut alloc::vec::Vec<u64>| {
+        let prot = (leaf & WRITABLE != 0) as u64 | ((leaf & NO_EXEC == 0) as u64) << 1;
+        for k in 0..count {
+            if out.len() >= limit {
+                break;
+            }
+            out.push((va + (k << 12)) | prot);
+        }
+        total += count;
+    };
+    // SAFETY (all reads): page table pages reachable through the HHDM.
+    for i4 in 0..256u64 {
+        let e4 = unsafe { *table(root).add(i4 as usize) };
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        for i3 in 0..512u64 {
+            let e3 = unsafe { *table(e4 & ADDR_MASK).add(i3 as usize) };
+            if e3 & PRESENT == 0 || e3 & USER == 0 {
+                continue;
+            }
+            let base3 = (i4 << 39) | (i3 << 30);
+            if e3 & HUGE != 0 {
+                note(base3, 1 << 18, e3, &mut out);
+                continue;
+            }
+            for i2 in 0..512u64 {
+                let e2 = unsafe { *table(e3 & ADDR_MASK).add(i2 as usize) };
+                if e2 & PRESENT == 0 || e2 & USER == 0 {
+                    continue;
+                }
+                let base2 = base3 | (i2 << 21);
+                if e2 & HUGE != 0 {
+                    note(base2, 512, e2, &mut out);
+                    continue;
+                }
+                for i1 in 0..512u64 {
+                    let e1 = unsafe { *table(e2 & ADDR_MASK).add(i1 as usize) };
+                    if e1 & PRESENT != 0 && e1 & USER != 0 {
+                        note(base2 | (i1 << 12), 1, e1, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    (out, total)
+}
+
 /// Walks the page tables of `root` (handling 2 MiB / 1 GiB pages).
 pub fn translate_in(root: u64, va: u64) -> Option<Translation> {
     if !is_canonical(va) {

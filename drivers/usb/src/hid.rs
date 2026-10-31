@@ -155,6 +155,12 @@ pub struct Field {
     pub usage: u16,
     pub logical_min: i32,
     pub logical_max: i32,
+    /// Physical range and unit (HID items Physical Minimum/Maximum, Unit,
+    /// Unit Exponent); all zero when the descriptor does not give them.
+    pub physical_min: i32,
+    pub physical_max: i32,
+    pub unit: u32,
+    pub unit_exponent: i8,
     pub relative: bool,
 }
 
@@ -201,6 +207,10 @@ struct Globals {
     page: u16,
     logical_min: i32,
     logical_max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i8,
     report_size: u32,
     report_count: u32,
     report_id: u8,
@@ -299,6 +309,10 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Result<Vec<Field>, ParseError> {
                             usage,
                             logical_min: g.logical_min,
                             logical_max: g.logical_max,
+                            physical_min: g.physical_min,
+                            physical_max: g.physical_max,
+                            unit: g.unit,
+                            unit_exponent: g.unit_exponent,
                             relative,
                         });
                     }
@@ -333,6 +347,14 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Result<Vec<Field>, ParseError> {
                 // Logical Maximum is unsigned when the minimum is not negative.
                 g.logical_max = if g.logical_min >= 0 { uval as i32 } else { sval };
             }
+            (1, 0x3) => g.physical_min = sval,
+            (1, 0x4) => g.physical_max = if g.physical_min >= 0 { uval as i32 } else { sval },
+            (1, 0x5) => {
+                // Unit Exponent: a signed nibble.
+                let n = (uval & 0xF) as i8;
+                g.unit_exponent = if n > 7 { n - 16 } else { n };
+            }
+            (1, 0x6) => g.unit = uval,
             (1, 0x7) => g.report_size = uval,
             (1, 0x8) => {
                 if uval == 0 || uval > 255 {
@@ -415,6 +437,12 @@ impl MouseLayout {
         } else {
             report
         };
+        self.decode_data(data)
+    }
+
+    /// Decodes the data of a report whose id byte (if any) is already
+    /// removed and checked.
+    pub fn decode_data(&self, data: &[u8]) -> Result<MouseReport, ReportError> {
         let x = self.x.read(data).ok_or(ReportError::Truncated)?;
         let y = self.y.read(data).ok_or(ReportError::Truncated)?;
         let mut buttons = 0;
@@ -609,7 +637,7 @@ mod tests {
 
     #[test]
     fn field_extraction_bounds() {
-        let f = Field { report_id: 0, offset: 4, size: 8, page: 1, usage: 0x30, logical_min: -127, logical_max: 127, relative: true };
+        let f = Field { report_id: 0, offset: 4, size: 8, page: 1, usage: 0x30, logical_min: -127, logical_max: 127, physical_min: 0, physical_max: 0, unit: 0, unit_exponent: 0, relative: true };
         assert_eq!(f.read(&[0xF0, 0x0F]), Some(-1));
         assert_eq!(f.read(&[0xF0]), None);
         let unsigned = Field { logical_min: 0, ..f };

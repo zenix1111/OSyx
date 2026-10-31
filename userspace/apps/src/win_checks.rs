@@ -1,5 +1,5 @@
-//! Windows compatibility checks (`init win,<tcp>,<udp>`): the PE32+ test
-//! programs in /opt/wintests (built from compatibility/win32/tests/src by
+//! Windows compatibility checks (`init win,<tcp>,<udp>`): the PE32+ and PE32
+//! test programs in /opt/wintests (built from compatibility/win32/tests/src by
 //! scripts/build-wintests.ps1) run under /bin/winrun. Each program prints
 //! its own checks to the log and exits with its failure count; the GUI
 //! program runs inside a PRISM session started here.
@@ -38,6 +38,13 @@ pub fn run_all(t: &mut Tests, tcp: u16, udp: u16) {
     t.check("kernel32 console program: TEB/PEB, last error, modules (target B)", || {
         run("hello.exe", &["first arg", "second"]) == Some(0)
     });
+    // 32-bit PE32 image: the loader maps it and i386 code runs; it exits 7.
+    t.check("PE32 32-bit program: i386 code runs and exits 7", || run("hello32.exe", &[]) == Some(7));
+    // 32-bit calls through the bridge signatures; exit code = failures.
+    t.check("PE32 32-bit program: kernel32, INI files and registry through the bridge", || run("api32.exe", &[]) == Some(0));
+    t.check("PE32 32-bit program: CreateThread, 32-bit start routines and concurrent bridge calls", || {
+        run("thread32.exe", &[]) == Some(0)
+    });
     t.check("Windows file I/O on OSyx file systems (target C)", || run("fileio.exe", &[]) == Some(0));
     t.check("Windows volume, device and adapter inventory", || run("sysadmin.exe", &[]) == Some(0));
     t.check("Windows file version resources and queries", || run("version.exe", &[]) == Some(0));
@@ -47,6 +54,8 @@ pub fn run_all(t: &mut Tests, tcp: u16, udp: u16) {
     t.check("structured exception handling, unwinding, consolidation and FLS", || run("seh.exe", &[]) == Some(0));
     t.check("newer Win32: files, NLS, thread pool, processes, jobs, shlwapi, WinRT", || run("platform.exe", &[]) == Some(0));
     t.check("shell32 known folders and the ole32 task allocator", || run("shell.exe", &[]) == Some(0));
+    t.check("bcrypt hashes and random, secur32, shfolder, winspool, uiautomationcore, oleacc and msvcrt libraries", || run("newlibs.exe", &[]) == Some(0));
+    t.check("heaps, critical sections, thread library calls, foreground window and attribute lists", || run("stubfix.exe", &[]) == Some(0));
     t.check("winmm timers at the kernel tick resolution", || run("winmm.exe", &[]) == Some(0));
     t.check("object security, ACLs, AccessCheck, restricted tokens and the event log", || run("sandbox.exe", &[]) == Some(0));
     t.check("US keyboard layout, key mapping and keyboard state", || run("keyboard.exe", &[]) == Some(0));
@@ -106,6 +115,7 @@ pub fn run_all(t: &mut Tests, tcp: u16, udp: u16) {
     t.check("Win32 GUI window through PRISM (target E)", || {
         prism.is_ok() && run("gui.exe", &[]) == Some(0)
     });
+    t.check("PE32 window, child controls and paint through PRISM", || prism.is_ok() && run("gui32.exe", &[]) == Some(0));
     // These create windows too.
     t.check("OLE apartments, GUID strings, drag-drop registration and the OLE clipboard", || {
         prism.is_ok() && run("ole2.exe", &[]) == Some(0)

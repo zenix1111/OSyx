@@ -202,6 +202,13 @@ impl Filesystem for Ext4Volume {
         self.fs.lock().rename(Self::ino(sdir)?, sname, Self::ino(ddir)?, dname).map_err(errno)
     }
 
+    fn link(&self, dir: u64, name: &str, target: u64) -> Result<()> {
+        if self.read_only {
+            return Err(Errno::ReadOnly);
+        }
+        self.fs.lock().link(Self::ino(dir)?, name, Self::ino(target)?).map_err(errno)
+    }
+
     fn set_mode(&self, ino: u64, mode: u32) -> Result<()> {
         if self.read_only {
             return Err(Errno::ReadOnly);

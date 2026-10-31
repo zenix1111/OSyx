@@ -66,6 +66,10 @@ impl Filesystem for TmpfsVolume {
         self.fs.lock().unlink(dir, name)
     }
 
+    fn link(&self, dir: u64, name: &str, target: u64) -> Result<()> {
+        self.fs.lock().link(dir, name, target)
+    }
+
     fn rmdir(&self, dir: u64, name: &str) -> Result<()> {
         self.fs.lock().rmdir(dir, name)
     }

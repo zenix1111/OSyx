@@ -135,6 +135,16 @@ where
                         .map(move |then_branch| Ok((predicate_arg.as_bool()?, then_branch)))
                 })
                 .then(choice!(
+                    // An `If` that ends its block (the usual last statement of
+                    // a `_DSM` function branch) has no `Else` to look for: the
+                    // end of the stream is not an error here.
+                    |input: &'a [u8], context| -> ParseResult<'a, 'c, &[u8]> {
+                        if input.is_empty() {
+                            Ok((input, context, &[]))
+                        } else {
+                            Err((input, context, Propagate::Err(AmlError::WrongParser)))
+                        }
+                    },
                     opcode(opcode::DEF_ELSE_OP)
                         .then(comment_scope(
                             DebugVerbosity::AllScopes,

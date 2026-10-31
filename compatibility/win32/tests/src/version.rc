@@ -19,3 +19,8 @@ BEGIN
   VALUE "Translation", 0x0409, 1200
  END
 END
+STRINGTABLE
+BEGIN
+ 3 "String three"
+ 19 "Nineteen"
+END

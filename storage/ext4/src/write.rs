@@ -19,7 +19,8 @@
 //!   mount if the machine stops before that.
 //! * Only extent-mapped files are written. Adding entries to hashed
 //!   (`dir_index`) directories is refused (`Unsupported`); extent trees are
-//!   kept at depth 0 or 1 (up to 4 leaves).
+//!   kept at depth 0, 1 or 2 (up to 4 index blocks, each with a full page of
+//!   leaves).
 
 use crate::dir::{entries, has_tail, TAIL};
 use crate::inode::{Inode, FL_EXTENTS, FL_INDEX, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
@@ -680,7 +681,14 @@ impl<D: BlockDevice> Ext4<D> {
         Ok((out, tree))
     }
 
-    /// Writes `list` back as an extent tree of depth 0 or 1.
+    /// Allocates one block for an extent tree node.
+    fn tree_block(&mut self, goal: u64, inode: &mut Inode) -> Result<u64> {
+        let (b, _) = self.alloc_blocks(goal, 1)?;
+        inode.blocks_512 += self.sb.block_size as u64 / 512;
+        Ok(b)
+    }
+
+    /// Writes `list` back as an extent tree of depth 0, 1 or 2.
     fn store_extents(&mut self, inode: &mut Inode, list: Vec<Ext>, old_tree: Vec<u64>) -> Result<()> {
         // Merge neighbours and split oversized extents.
         let mut merged: Vec<Ext> = Vec::with_capacity(list.len());
@@ -702,13 +710,19 @@ impl<D: BlockDevice> Ext4<D> {
             flat.push(e);
         }
         let bs = self.sb.block_size as usize;
-        let per_leaf = (bs - 12) / 12;
+        let per_node = (bs - 12) / 12;
         let put_extent = |b: &mut [u8], i: usize, e: &Ext| {
             let o = 12 + 12 * i;
             put32(b, o, e.lblk as u32);
             put16(b, o + 4, if e.uninit { e.len as u16 + 32768 } else { e.len as u16 });
             put16(b, o + 6, (e.phys >> 32) as u16);
             put32(b, o + 8, e.phys as u32);
+        };
+        let put_index = |b: &mut [u8], i: usize, first: u32, blk: u64| {
+            let o = 12 + 12 * i;
+            put32(b, o, first);
+            put32(b, o + 4, blk as u32);
+            put16(b, o + 8, (blk >> 32) as u16);
         };
         let header = |b: &mut [u8], entries: usize, max: usize, depth: u16| {
             put16(b, 0, EXTENT_MAGIC);
@@ -718,57 +732,79 @@ impl<D: BlockDevice> Ext4<D> {
             put32(b, 8, 0);
         };
         let mut root = [0u8; 60];
-        let mut tree_blocks: Vec<u64> = Vec::new();
+        let mut reuse = old_tree.clone();
         if flat.len() <= 4 {
             header(&mut root, flat.len(), 4, 0);
             for (i, e) in flat.iter().enumerate() {
                 put_extent(&mut root, i, e);
             }
-        } else {
-            let leaves = flat.len().div_ceil(per_leaf);
-            if leaves > 4 {
-                return Err(Error::Unsupported("file too fragmented for a depth-1 extent tree"));
-            }
-            let mut reuse = old_tree.clone();
-            header(&mut root, leaves, 4, 1);
-            let seed = inode.csum_seed(self.csum_seed);
-            for (li, chunk) in flat.chunks(per_leaf).enumerate() {
-                let blk = match reuse.pop() {
-                    Some(b) => b,
-                    None => {
-                        let goal = chunk[0].phys;
-                        let (b, _) = self.alloc_blocks(goal, 1)?;
-                        inode.blocks_512 += bs as u64 / 512;
-                        b
-                    }
-                };
-                let mut b = vec![0u8; bs];
-                header(&mut b, chunk.len(), per_leaf, 0);
-                for (i, e) in chunk.iter().enumerate() {
-                    put_extent(&mut b, i, e);
-                }
-                if self.sb.metadata_csum() {
-                    let tail = 12 + 12 * per_leaf;
-                    let c = crc::crc32c(seed, &b[..tail]);
-                    put32(&mut b, tail, c);
-                }
-                self.tx_put(blk, b);
-                let o = 12 + 12 * li;
-                put32(&mut root, o, chunk[0].lblk as u32);
-                put32(&mut root, o + 4, blk as u32);
-                put16(&mut root, o + 8, (blk >> 32) as u16);
-                tree_blocks.push(blk);
-            }
             for b in reuse {
                 self.free_blocks(b, 1)?;
                 inode.blocks_512 -= bs as u64 / 512;
             }
+            inode.block = root;
+            return Ok(());
         }
-        if flat.len() <= 4 {
-            for b in old_tree {
-                self.free_blocks(b, 1)?;
-                inode.blocks_512 -= bs as u64 / 512;
+        let leaves = flat.len().div_ceil(per_node);
+        if leaves > 4 * per_node {
+            return Err(Error::Unsupported("file too fragmented for a depth-2 extent tree"));
+        }
+        let seed = inode.csum_seed(self.csum_seed);
+        let mut leaf_blocks: Vec<(u32, u64)> = Vec::with_capacity(leaves);
+        for chunk in flat.chunks(per_node) {
+            let blk = match reuse.pop() {
+                Some(b) => b,
+                None => self.tree_block(chunk[0].phys, inode)?,
+            };
+            let mut b = vec![0u8; bs];
+            header(&mut b, chunk.len(), per_node, 0);
+            for (i, e) in chunk.iter().enumerate() {
+                put_extent(&mut b, i, e);
             }
+            if self.sb.metadata_csum() {
+                let tail = 12 + 12 * per_node;
+                let c = crc::crc32c(seed, &b[..tail]);
+                put32(&mut b, tail, c);
+            }
+            self.tx_put(blk, b);
+            leaf_blocks.push((chunk[0].lblk as u32, blk));
+        }
+        if leaf_blocks.len() <= 4 {
+            header(&mut root, leaf_blocks.len(), 4, 1);
+            for (i, &(first, blk)) in leaf_blocks.iter().enumerate() {
+                put_index(&mut root, i, first, blk);
+            }
+        } else {
+            let mut index_blocks: Vec<(u32, u64)> = Vec::new();
+            for group in leaf_blocks.chunks(per_node) {
+                let blk = match reuse.pop() {
+                    Some(b) => b,
+                    None => self.tree_block(group[0].1, inode)?,
+                };
+                let mut b = vec![0u8; bs];
+                header(&mut b, group.len(), per_node, 1);
+                for (i, &(first, child)) in group.iter().enumerate() {
+                    put_index(&mut b, i, first, child);
+                }
+                if self.sb.metadata_csum() {
+                    let tail = 12 + 12 * per_node;
+                    let c = crc::crc32c(seed, &b[..tail]);
+                    put32(&mut b, tail, c);
+                }
+                self.tx_put(blk, b);
+                index_blocks.push((group[0].0, blk));
+            }
+            if index_blocks.len() > 4 {
+                return Err(Error::Unsupported("file too fragmented for a depth-2 extent tree"));
+            }
+            header(&mut root, index_blocks.len(), 4, 2);
+            for (i, &(first, blk)) in index_blocks.iter().enumerate() {
+                put_index(&mut root, i, first, blk);
+            }
+        }
+        for b in reuse {
+            self.free_blocks(b, 1)?;
+            inode.blocks_512 -= bs as u64 / 512;
         }
         inode.block = root;
         Ok(())
@@ -1239,6 +1275,39 @@ impl<D: BlockDevice> Ext4<D> {
             parent.ctime = now;
             fs.put_inode(&mut parent)?;
             Ok(ino)
+        })
+    }
+
+    /// Gives the existing non-directory inode `target` a second name `name`
+    /// in `dir` (a hard link).
+    pub fn link(&mut self, dir: u32, name: &str, target: u32) -> Result<()> {
+        validate_name(name)?;
+        self.op(|fs| {
+            let mut parent = fs.dir_tx(dir)?;
+            if parent.links == 0 {
+                return Err(Error::NotFound);
+            }
+            if fs.find_entry(&parent, name).is_ok() {
+                return Err(Error::AlreadyExists);
+            }
+            let mut inode = fs.tx_inode(target)?;
+            if inode.is_dir() {
+                return Err(Error::IsADirectory);
+            }
+            if inode.links == 0 {
+                return Err(Error::NotFound);
+            }
+            if inode.links >= MAX_LINKS {
+                return Err(Error::NoSpace);
+            }
+            inode.links += 1;
+            inode.ctime = fs.now();
+            fs.put_inode(&mut inode)?;
+            fs.add_entry(&mut parent, name, target, ft_of(inode.mode))?;
+            let now = fs.now();
+            parent.mtime = now;
+            parent.ctime = now;
+            fs.put_inode(&mut parent)
         })
     }
 

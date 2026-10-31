@@ -197,70 +197,199 @@ pub fn exports() -> Vec<(&'static str, u64)> {
 
 // ---- imm32 ----------------------------------------------------------------------------------
 
-extern "win64" fn ImmGetContext(_hwnd: u64) -> u64 {
-    0 // no input context
-}
 
-extern "win64" fn ImmReleaseContext(_hwnd: u64, _himc: u64) -> Bool {
-    TRUE
-}
+
+
 
 extern "win64" fn ImmAssociateContextEx(hwnd: u64, _himc: u64, _flags: u32) -> Bool {
     crate::user32::is_window(hwnd) as Bool
 }
 
-extern "win64" fn ImmGetDefaultIMEWnd(_hwnd: u64) -> u64 {
-    0
-}
+
 
 /// No layout is an IME: no properties, description or IME file.
-extern "win64" fn ImmGetProperty(_hkl: u64, _index: u32) -> u32 {
-    0
-}
 
-extern "win64" fn ImmGetDescriptionW(_hkl: u64, _buf: *mut u16, _len: u32) -> u32 {
-    0
-}
 
-extern "win64" fn ImmGetIMEFileNameW(_hkl: u64, _buf: *mut u16, _len: u32) -> u32 {
-    0
-}
+
+
+
 
 /// Every remaining call takes an input context, and there never is one.
-extern "win64" fn ImmGetOpenStatus(_himc: u64) -> Bool {
-    FALSE
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---- imm32: input contexts -------------------------------------------------
+// OSyx has no input method editor: every window can have a default input
+// context (closed, nothing being composed) and the keyboard layout has no IME.
+// The context keeps the state applications set on it.
+
+const HKL_US: u64 = 0x0409_0409;
+const IMM_ERROR_GENERAL: i32 = -2;
+
+struct InputContext {
+    wnd: u64,
+    open: bool,
+    composition_window: [u8; 28],
+    font: [u8; 92],
+    candidates: [[u8; 32]; 4],
 }
 
-extern "win64" fn ImmSetOpenStatus(_himc: u64, _open: Bool) -> Bool {
-    FALSE
+static CONTEXTS: Mutex<BTreeMap<u64, InputContext>> = Mutex::new(BTreeMap::new());
+
+fn with_context<R>(himc: u64, f: impl FnOnce(&mut InputContext) -> R) -> Option<R> {
+    CONTEXTS.lock().unwrap().get_mut(&himc).map(f)
 }
 
-extern "win64" fn ImmNotifyIME(_himc: u64, _action: u32, _index: u32, _value: u32) -> Bool {
-    FALSE
+/// The default input context of a window, made on first use.
+extern "win64" fn ImmGetContext(hwnd: u64) -> u64 {
+    if !crate::user32::is_window(hwnd) {
+        return fail(1400, 0); // ERROR_INVALID_WINDOW_HANDLE
+    }
+    let himc = 0x4000_0000 | hwnd;
+    CONTEXTS.lock().unwrap().entry(himc).or_insert(InputContext { wnd: hwnd, open: false, composition_window: [0; 28], font: [0; 92], candidates: [[0; 32]; 4] });
+    himc
 }
 
-extern "win64" fn ImmGetCompositionStringW(_himc: u64, _index: u32, _buf: *mut u8, _len: u32) -> i32 {
+/// Releasing NULL succeeds, as on Windows; otherwise the context must be the
+/// window's.
+extern "win64" fn ImmReleaseContext(hwnd: u64, himc: u64) -> i32 {
+    if himc == 0 {
+        return 1;
+    }
+    with_context(himc, |c| c.wnd == hwnd).unwrap_or(false) as i32
+}
+
+extern "win64" fn ImmGetOpenStatus(himc: u64) -> i32 {
+    with_context(himc, |c| c.open).unwrap_or(false) as i32
+}
+
+extern "win64" fn ImmSetOpenStatus(himc: u64, open: i32) -> i32 {
+    with_context(himc, |c| c.open = open != 0).is_some() as i32
+}
+
+/// COMPOSITIONFORM (28 bytes: style, point, rectangle).
+extern "win64" fn ImmSetCompositionWindow(himc: u64, form: *const u8) -> i32 {
+    if form.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's COMPOSITIONFORM.
+    let bytes = unsafe { core::ptr::read_unaligned(form as *const [u8; 28]) };
+    with_context(himc, |c| c.composition_window = bytes).is_some() as i32
+}
+
+/// CANDIDATEFORM (32 bytes: index, style, point, rectangle); the index
+/// (0..3) says which candidate window it describes.
+extern "win64" fn ImmSetCandidateWindow(himc: u64, form: *const u8) -> i32 {
+    if form.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's CANDIDATEFORM.
+    let bytes = unsafe { core::ptr::read_unaligned(form as *const [u8; 32]) };
+    let index = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if index >= 4 {
+        return 0;
+    }
+    with_context(himc, |c| c.candidates[index] = bytes).is_some() as i32
+}
+
+/// LOGFONTW (92 bytes).
+extern "win64" fn ImmSetCompositionFontW(himc: u64, font: *const u8) -> i32 {
+    if font.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's LOGFONTW.
+    let bytes = unsafe { core::ptr::read_unaligned(font as *const [u8; 92]) };
+    with_context(himc, |c| c.font = bytes).is_some() as i32
+}
+
+extern "win64" fn ImmGetCompositionFontW(himc: u64, font: *mut u8) -> i32 {
+    if font.is_null() {
+        return 0;
+    }
+    match with_context(himc, |c| c.font) {
+        Some(bytes) => {
+            // SAFETY: the caller's LOGFONTW.
+            unsafe { core::ptr::write_unaligned(font as *mut [u8; 92], bytes) };
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Nothing is ever being composed: every known string index has length 0,
+/// an unknown index or context is IMM_ERROR_GENERAL.
+fn composition_length(himc: u64, index: u32) -> i32 {
+    const KNOWN: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000;
+    if himc == 0 {
+        return 0; // as on Windows
+    }
+    if index == 0 || index & !KNOWN != 0 || with_context(himc, |_| ()).is_none() {
+        return IMM_ERROR_GENERAL;
+    }
     0
 }
 
-extern "win64" fn ImmGetCompositionStringA(_himc: u64, _index: u32, _buf: *mut u8, _len: u32) -> i32 {
+extern "win64" fn ImmGetCompositionStringW(himc: u64, index: u32, _buf: *mut u8, _len: u32) -> i32 {
+    composition_length(himc, index)
+}
+
+extern "win64" fn ImmGetCompositionStringA(himc: u64, index: u32, _buf: *mut u8, _len: u32) -> i32 {
+    composition_length(himc, index)
+}
+
+/// NI_COMPOSITIONSTR (0x15) with CPS_COMPLETE (1) or CPS_CANCEL (4) has
+/// nothing to complete or cancel and succeeds; other requests are refused.
+extern "win64" fn ImmNotifyIME(himc: u64, action: u32, index: u32, _value: u32) -> i32 {
+    (with_context(himc, |_| ()).is_some() && action == 0x15 && matches!(index, 1 | 4)) as i32
+}
+
+/// The IME window of a window: there is none.
+extern "win64" fn ImmGetDefaultIMEWnd(hwnd: u64) -> u64 {
+    if !crate::user32::is_window(hwnd) {
+        return fail(1400, 0);
+    }
     0
 }
 
-extern "win64" fn ImmSetCompositionWindow(_himc: u64, _form: *const u8) -> Bool {
-    FALSE
+/// The only keyboard layout (US) has no IME: no properties, no name, no file.
+fn ime_free_layout(hkl: u64) -> bool {
+    hkl == HKL_US
 }
 
-extern "win64" fn ImmSetCandidateWindow(_himc: u64, _form: *const u8) -> Bool {
-    FALSE
+extern "win64" fn ImmGetProperty(hkl: u64, _index: u32) -> u32 {
+    if !ime_free_layout(hkl) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    0
 }
 
-extern "win64" fn ImmGetCompositionFontW(_himc: u64, _font: *mut u8) -> Bool {
-    FALSE
+extern "win64" fn ImmGetDescriptionW(hkl: u64, _buf: *mut u16, _len: u32) -> u32 {
+    if !ime_free_layout(hkl) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    0
 }
 
-extern "win64" fn ImmSetCompositionFontW(_himc: u64, _font: *const u8) -> Bool {
-    FALSE
+extern "win64" fn ImmGetIMEFileNameW(hkl: u64, _buf: *mut u16, _len: u32) -> u32 {
+    if !ime_free_layout(hkl) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    0
 }
 
 pub fn imm32_exports() -> Vec<(&'static str, u64)> {

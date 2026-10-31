@@ -1,0 +1,138 @@
+{
+  "generated": "2026-10-31T11:47:16Z",
+  "commit": "66c3eb445c",
+  "windows": "10.0.26100.9711",
+  "x64": {
+    "reference_exports": 20632,
+    "coverage": 13.2,
+    "strict": 12.5,
+    "behaviour": 7.7,
+    "implemented": 2586,
+    "partial": 145,
+    "stubs": 0,
+    "unsupported": 8,
+    "unknown": 0,
+    "missing": 17893,
+    "dlls": [
+      {
+        "dll": "ntdll.dll",
+        "total": 2522,
+        "coverage": 3.6,
+        "behaviour": 0.9
+      },
+      {
+        "dll": "ucrtbase.dll",
+        "total": 2484,
+        "coverage": 20.4,
+        "behaviour": 9.5
+      },
+      {
+        "dll": "kernelbase.dll",
+        "total": 2037,
+        "coverage": 19.6,
+        "behaviour": 14.1
+      },
+      {
+        "dll": "kernel32.dll",
+        "total": 1698,
+        "coverage": 26.0,
+        "behaviour": 18.0
+      },
+      {
+        "dll": "msvcrt.dll",
+        "total": 1330,
+        "coverage": 26.8,
+        "behaviour": 11.8
+      },
+      {
+        "dll": "user32.dll",
+        "total": 1050,
+        "coverage": 26.3,
+        "behaviour": 14.7
+      },
+      {
+        "dll": "gdi32.dll",
+        "total": 995,
+        "coverage": 8.5,
+        "behaviour": 7.5
+      },
+      {
+        "dll": "advapi32.dll",
+        "total": 853,
+        "coverage": 13.7,
+        "behaviour": 11.0
+      }
+    ]
+  },
+  "x86": {
+    "reference_exports": 20647,
+    "coverage": 2.2,
+    "strict": 2.1,
+    "behaviour": 1.1,
+    "implemented": 426,
+    "partial": 25,
+    "stubs": 0,
+    "unsupported": 1,
+    "unknown": 0,
+    "missing": 20195,
+    "dlls": [
+      {
+        "dll": "ucrtbase.dll",
+        "total": 2542,
+        "coverage": 0.5,
+        "behaviour": 0.1
+      },
+      {
+        "dll": "ntdll.dll",
+        "total": 2523,
+        "coverage": 0.2,
+        "behaviour": 0.0
+      },
+      {
+        "dll": "kernelbase.dll",
+        "total": 2037,
+        "coverage": 5.9,
+        "behaviour": 3.1
+      },
+      {
+        "dll": "kernel32.dll",
+        "total": 1670,
+        "coverage": 7.7,
+        "behaviour": 3.9
+      },
+      {
+        "dll": "msvcrt.dll",
+        "total": 1440,
+        "coverage": 0.9,
+        "behaviour": 0.2
+      },
+      {
+        "dll": "user32.dll",
+        "total": 1043,
+        "coverage": 8.5,
+        "behaviour": 3.9
+      },
+      {
+        "dll": "gdi32.dll",
+        "total": 995,
+        "coverage": 0.9,
+        "behaviour": 0.2
+      },
+      {
+        "dll": "advapi32.dll",
+        "total": 853,
+        "coverage": 3.9,
+        "behaviour": 2.6
+      }
+    ]
+  },
+  "tests": {
+    "programs": 48,
+    "checks_ok": 2583,
+    "checks_fail": 1
+  },
+  "profiles": {
+    "steam": 91.0,
+    "zen": 98.1
+  }
+}

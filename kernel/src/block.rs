@@ -47,6 +47,28 @@ pub trait BlockDev: Send + Sync {
     fn partition(&self) -> Option<&osyx_part::Partition> {
         None
     }
+    /// True for media that can be unplugged (USB sticks): the storage
+    /// manager mounts them under `/media` and offers to eject them.
+    fn removable(&self) -> bool {
+        false
+    }
+    /// False once the device is gone or ejected; I/O fails from then on.
+    fn present(&self) -> bool {
+        true
+    }
+    /// Vendor and product, for the media list (empty if unknown).
+    fn model(&self) -> String {
+        String::new()
+    }
+    /// The whole disk a partition lives on.
+    fn parent_name(&self) -> Option<&str> {
+        None
+    }
+    /// Prepares the device for removal: flushes its cache and stops it. The
+    /// device refuses all I/O afterwards.
+    fn eject(&self) -> Result<(), BlockError> {
+        self.flush()
+    }
 }
 
 static DEVICES: IrqSpinLock<Vec<Arc<dyn BlockDev>>> = IrqSpinLock::new(Vec::new());
@@ -136,6 +158,29 @@ pub fn devices() -> Vec<Arc<dyn BlockDev>> {
     DEVICES.lock().clone()
 }
 
+/// Removes a whole disk and its partitions from the registry and from
+/// `/dev/disks`. Open handles keep the objects alive but their I/O fails
+/// once the disk reports itself gone. Returns the names removed.
+pub fn unregister(disk: &str) -> Vec<String> {
+    let removed: Vec<Arc<dyn BlockDev>> = {
+        let mut devs = DEVICES.lock();
+        let (gone, kept): (Vec<_>, Vec<_>) = devs.drain(..).partition(|d| d.name() == disk || d.parent_name() == Some(disk));
+        *devs = kept;
+        gone
+    };
+    {
+        let mut s = SCAN.lock();
+        s.pending.retain(|d| d.name() != disk);
+    }
+    removed
+        .into_iter()
+        .map(|d| {
+            crate::devices::disk_removed(d.name());
+            String::from(d.name())
+        })
+        .collect()
+}
+
 /// Starts a driver for every supported storage controller among `pci`:
 /// virtio-blk (vda, vdb, ...), NVMe (nvme0n1, ...) and AHCI/SATA (sda, ...).
 pub fn probe(pci: &[pci::Device]) -> usize {
@@ -222,6 +267,26 @@ impl BlockDev for Partition {
     fn partition(&self) -> Option<&osyx_part::Partition> {
         Some(&self.info)
     }
+
+    fn removable(&self) -> bool {
+        self.parent.removable()
+    }
+
+    fn present(&self) -> bool {
+        self.parent.present()
+    }
+
+    fn model(&self) -> String {
+        self.parent.model()
+    }
+
+    fn parent_name(&self) -> Option<&str> {
+        Some(self.parent.name())
+    }
+
+    fn eject(&self) -> Result<(), BlockError> {
+        self.parent.eject()
+    }
 }
 
 struct Reader<'a>(&'a dyn BlockDev);
@@ -235,6 +300,16 @@ impl osyx_part::SectorReader for Reader<'_> {
     }
 }
 
+/// `vda` + 2 -> `vda2`; a disk name that ends in a digit gets a `p`
+/// (`nvme0n1p2`, `usb0p1`) so `usb1` + 1 cannot be taken for `usb11`.
+pub fn partition_name(disk: &str, number: u32) -> String {
+    if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        format!("{disk}p{number}")
+    } else {
+        format!("{disk}{number}")
+    }
+}
+
 /// Reads the GPT of one whole disk and registers its partitions.
 fn scan_disk(disk: &Arc<dyn BlockDev>) -> usize {
     let mut found = 0;
@@ -245,7 +320,7 @@ fn scan_disk(disk: &Arc<dyn BlockDev>) -> usize {
             }
             for p in t.partitions {
                 let part = Partition {
-                    name: format!("{}{}", disk.name(), p.number),
+                    name: partition_name(disk.name(), p.number),
                     parent: disk.clone(),
                     start: p.first_lba,
                     sectors: p.sectors(),
@@ -256,8 +331,42 @@ fn scan_disk(disk: &Arc<dyn BlockDev>) -> usize {
                 found += 1;
             }
         }
+        // MBR tables are read on removable disks only: a fixed disk with one
+        // (another system's) keeps being left alone.
+        Err(osyx_part::GptError::NotGpt) if disk.removable() => found += scan_mbr(disk),
         Err(osyx_part::GptError::NotGpt) => {}
         Err(e) => kprintln!("gpt {}: unusable partition table: {:?}", disk.name(), e),
+    }
+    found
+}
+
+/// Partitions of a classic MBR (what Windows writes to USB sticks), named
+/// like GPT ones: `<disk><slot>`. Only whole disks that are not themselves a
+/// volume (the sector holds no file system boot record) have any.
+fn scan_mbr(disk: &Arc<dyn BlockDev>) -> usize {
+    let mut found = 0;
+    if let Ok(entries) = osyx_part::parse_mbr(&mut Reader(&**disk)) {
+        for e in entries {
+            let info = osyx_part::Partition {
+                number: e.number,
+                type_guid: osyx_part::Guid::default(),
+                unique_guid: osyx_part::Guid::default(),
+                first_lba: e.first_lba,
+                last_lba: e.first_lba + e.sectors - 1,
+                attributes: 0,
+                name: format!("MBR type {:#04x}", e.kind),
+            };
+            let part = Partition {
+                name: partition_name(disk.name(), e.number),
+                parent: disk.clone(),
+                start: e.first_lba,
+                sectors: e.sectors,
+                info,
+            };
+            kprintln!("mbr {}: {} {} MiB, type {:#04x}", disk.name(), part.name, part.sectors >> 11, e.kind);
+            register(Arc::new(part));
+            found += 1;
+        }
     }
     found
 }
@@ -293,7 +402,7 @@ fn scan_thread(arg: u64, _: u64) {
     let disk = *unsafe { Box::from_raw(arg as *mut Arc<dyn BlockDev>) };
     let found = scan_disk(&disk);
     kprintln!("gpt {}: hot-plug scan found {} partition(s)", disk.name(), found);
-    crate::storage::mount_hotplugged(disk.name());
+    crate::media::disk_ready(&disk);
 }
 
 /// Adapter that lets a file system driver use a registered disk.
@@ -314,6 +423,24 @@ impl osyx_fat::BlockDevice for Disk {
 
     fn flush(&mut self) -> osyx_fat::Result<()> {
         self.0.flush().map_err(|_| osyx_fat::FsError::Io)
+    }
+}
+
+impl osyx_exfat::BlockDevice for Disk {
+    fn sector_count(&self) -> u64 {
+        self.0.sector_count()
+    }
+
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> osyx_exfat::Result<()> {
+        read(&*self.0, lba, buf).map_err(|_| osyx_exfat::FsError::Io)
+    }
+
+    fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> osyx_exfat::Result<()> {
+        write(&*self.0, lba, buf).map_err(|_| osyx_exfat::FsError::Io)
+    }
+
+    fn flush(&mut self) -> osyx_exfat::Result<()> {
+        self.0.flush().map_err(|_| osyx_exfat::FsError::Io)
     }
 }
 

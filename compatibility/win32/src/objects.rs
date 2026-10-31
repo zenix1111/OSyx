@@ -155,6 +155,11 @@ pub struct ThreadObj {
     pub suspended: AtomicU32,
     /// The thread's TEB (0 until it runs).
     pub teb: AtomicU64,
+    /// Real-time clock (ns since the Unix epoch) at creation and at exit
+    /// (0 while it runs), and the scheduler samples it used when it ended.
+    pub created_ns: AtomicU64,
+    pub exited_ns: AtomicU64,
+    pub final_ticks: AtomicU64,
 }
 
 /// An event's state is one word: 1 signalled, 0 not. It lives in the
@@ -351,6 +356,15 @@ pub enum Object {
     WindowStation(Arc<crate::winsta::Station>),
     Desktop(Arc<crate::winsta::DesktopObj>),
     Pipe(Arc<crate::pipes::PipeObj>),
+    /// A directory of the NT object namespace (NtOpenDirectoryObject).
+    Directory(Arc<DirectoryObj>),
+    /// A KTM transaction (CreateTransaction).
+    Transaction(Arc<crate::ktm::TransactionObj>),
+}
+
+/// An open object directory: `\\` or `\\BaseNamedObjects`.
+pub struct DirectoryObj {
+    pub path: String,
 }
 
 struct Table {
@@ -428,6 +442,8 @@ pub fn kind_name(o: &Object) -> &'static str {
         Object::WindowStation(_) => "window station",
         Object::Desktop(_) => "desktop",
         Object::Pipe(_) => "pipe",
+        Object::Directory(_) => "directory",
+        Object::Transaction(_) => "transaction",
     }
 }
 
@@ -537,7 +553,7 @@ fn ready(o: &Object, consume: bool, me: u32) -> Result<bool, u32> {
         }
         Object::Console(_) | Object::File(_) | Object::Null | Object::Pipe(_) => true,
         Object::Process(p) => p.done.load(Ordering::SeqCst),
-        Object::KeyedEvent(_) | Object::Section(_) | Object::Token(_) | Object::Port(_) | Object::Job(_) | Object::WindowStation(_) | Object::Desktop(_) => {
+        Object::KeyedEvent(_) | Object::Section(_) | Object::Token(_) | Object::Port(_) | Object::Job(_) | Object::WindowStation(_) | Object::Desktop(_) | Object::Directory(_) | Object::Transaction(_) => {
             return Err(ERROR_INVALID_HANDLE)
         }
     })
@@ -646,6 +662,26 @@ const SHARED_POLL_NS: u64 = 2_000_000;
 /// The first open object that satisfies `f`.
 pub fn find(f: impl Fn(&Object) -> bool) -> Option<Object> {
     TABLE.lock().unwrap().map.values().find(|o| f(o)).cloned()
+}
+
+/// The named objects of this process, as (name, NT type name), sorted by
+/// name: what `\\BaseNamedObjects` holds.
+pub fn named_objects() -> Vec<(String, &'static str)> {
+    let t = TABLE.lock().unwrap();
+    let mut out: Vec<(String, &'static str)> = t
+        .map
+        .values()
+        .filter_map(|o| match o {
+            Object::Event(e) => e.name.clone().map(|n| (n, "Event")),
+            Object::Timer(x) => x.name.clone().map(|n| (n, "Timer")),
+            Object::Mutex(m) => m.name.clone().map(|n| (n, "Mutant")),
+            Object::Section(x) => x.name.clone().map(|n| (n, "Section")),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 pub fn find_named(name: &str) -> Option<Object> {

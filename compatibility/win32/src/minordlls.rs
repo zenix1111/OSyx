@@ -178,16 +178,8 @@ pub fn cfgmgr32_exports() -> Vec<(&'static str, u64)> {
 
 // ---- ktmw32 ------------------------------------------------------------------------------
 
-extern "win64" fn CreateTransaction(_sa: u64, _uow: u64, _options: u32, _iso: u32, _flags: u32, _timeout: u32, _desc: *const u16) -> u64 {
-    fail(ERROR_NOT_SUPPORTED, u64::MAX)
-}
-
-extern "win64" fn CommitTransaction(_h: u64) -> i32 {
-    fail(ERROR_INVALID_HANDLE, 0)
-}
-
 pub fn ktmw32_exports() -> Vec<(&'static str, u64)> {
-    export_table![CreateTransaction, CommitTransaction]
+    crate::ktm::exports()
 }
 
 // ---- windowscodecs -------------------------------------------------------------------------
@@ -242,16 +234,16 @@ extern "win64" fn GetThemeColor(theme: u64, _part: i32, _state: i32, _property: 
 }
 
 /// Touch panning feedback needs a themed window manager.
-extern "win64" fn BeginPanningFeedback(_wnd: u64) -> u8 {
-    0
+extern "win64" fn BeginPanningFeedback(_wnd: u64) -> i32 {
+    crate::kernel32::fail(crate::error::ERROR_NOT_SUPPORTED, 0)
 }
 
-extern "win64" fn UpdatePanningFeedback(_wnd: u64, _x: i32, _y: i32, _overshoot: u8) -> u8 {
-    0
+extern "win64" fn UpdatePanningFeedback(_wnd: u64, _x: i32, _y: i32, _overshoot: i32) -> i32 {
+    crate::kernel32::fail(crate::error::ERROR_NOT_SUPPORTED, 0)
 }
 
-extern "win64" fn EndPanningFeedback(_wnd: u64, _animate: u8) -> u8 {
-    0
+extern "win64" fn EndPanningFeedback(_wnd: u64, _animate: i32) -> i32 {
+    crate::kernel32::fail(crate::error::ERROR_NOT_SUPPORTED, 0)
 }
 
 pub fn uxtheme_exports() -> Vec<(&'static str, u64)> {
@@ -382,12 +374,30 @@ extern "win64" fn InternetGetConnectedStateExA(
     crate::kernel32::TRUE
 }
 
-extern "win64" fn InternetCheckConnectionW(_url: *const u16, _flags: u32, _reserved: u32) -> crate::kernel32::Bool {
-    crate::kernel32::TRUE
+/// Whether the system has a network connection: an adapter with an
+/// address. FLAG_ICC_FORCE_CONNECTION (a connection attempt to the URL) is
+/// not supported.
+extern "win64" fn InternetCheckConnectionW(_url: *const u16, flags: u32, reserved: u32) -> crate::kernel32::Bool {
+    if reserved != 0 || flags & !1 != 0 {
+        return crate::kernel32::fail(ERROR_INVALID_PARAMETER, crate::kernel32::FALSE);
+    }
+    if flags & 1 != 0 {
+        return crate::kernel32::fail(crate::error::ERROR_NOT_SUPPORTED, crate::kernel32::FALSE);
+    }
+    if crate::iphlpapi::has_connectivity() {
+        crate::kernel32::TRUE
+    } else {
+        crate::kernel32::fail(12163, crate::kernel32::FALSE) // ERROR_INTERNET_DISCONNECTED
+    }
 }
 
-extern "win64" fn InternetAttemptConnect(_reserved: u32) -> u32 {
-    ERROR_SUCCESS
+/// ERROR_SUCCESS when a network adapter has an address, otherwise
+/// ERROR_INTERNET_DISCONNECTED.
+extern "win64" fn InternetAttemptConnect(reserved: u32) -> u32 {
+    if reserved != 0 {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if crate::iphlpapi::has_connectivity() { ERROR_SUCCESS } else { 12163 }
 }
 
 /// There is no WinINet session state to query; callers fall back to a
@@ -396,12 +406,23 @@ extern "win64" fn InternetQueryOptionW(_session: u64, _option: u32, _buffer: *mu
     crate::kernel32::fail(ERROR_INVALID_PARAMETER, crate::kernel32::FALSE)
 }
 
-extern "win64" fn InternetSetOptionW(_session: u64, _option: u32, _buffer: *const u8, _len: u32) -> crate::kernel32::Bool {
-    crate::kernel32::TRUE
+/// OSyx has no WinINet sessions: only the process-wide options (handle
+/// NULL) INTERNET_OPTION_REFRESH (37) and INTERNET_OPTION_SETTINGS_CHANGED
+/// (39) exist, and with no cached proxy or settings state they have nothing
+/// to refresh. Anything else is an invalid handle or option.
+extern "win64" fn InternetSetOptionW(session: u64, option: u32, _buffer: *const u8, _len: u32) -> crate::kernel32::Bool {
+    if session != 0 {
+        return crate::kernel32::fail(ERROR_INVALID_HANDLE, crate::kernel32::FALSE);
+    }
+    match option {
+        37 | 39 => crate::kernel32::TRUE,
+        _ => crate::kernel32::fail(12009, crate::kernel32::FALSE), // ERROR_INTERNET_INVALID_OPTION
+    }
 }
 
+/// No WinINet function here creates a handle, so every handle is invalid.
 extern "win64" fn InternetCloseHandle(_session: u64) -> crate::kernel32::Bool {
-    crate::kernel32::TRUE
+    crate::kernel32::fail(ERROR_INVALID_HANDLE, crate::kernel32::FALSE)
 }
 
 pub fn wininet_exports() -> Vec<(&'static str, u64)> {

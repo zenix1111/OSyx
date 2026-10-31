@@ -7,6 +7,7 @@
 .\scripts\build.ps1 [-Cmdline '…'] [-NoInit] [-KeepRoot] [-DebugBuild] [-Live]
 .\scripts\run-qemu.ps1 [-Cmdline '…'] [-Gdb] [-Follow] [-Headless]
 .\scripts\test.ps1 [-SkipHost] [-SkipQemu]
+.\scripts\i2c-hid-test.ps1          # HID over I2C discovery and refusal under QEMU (docs/i2c-hid.md)
 ```
 
 QEMU runs `q35`, `qemu64,+nx`, 512 MiB, OVMF from the MSYS2 QEMU package
@@ -27,6 +28,29 @@ Host tools: `osyx-fat` `mkfat32`/`fatcheck`, `osyx-part` `mkdisk`, mtools
 from MSYS2, and e2fsprogs 1.47 / sgdisk in WSL Ubuntu 24.04 (`mke2fs -d`
 for the root image and test fixtures, `e2fsck -fn`, `debugfs`, `dumpe2fs`;
 partitions are addressed inside the image file with `?offset=`).
+
+## USB media
+
+`scripts/usb-storage-test.ps1` boots the kernel with a stick on the xHCI
+controller (label PENDRIVE, MBR partition, once FAT32 and once exFAT, images
+made by `mkfat32`/`mkexfat` and `scripts/mkusbmbr.py`) and the guest program
+`init tests media` (`userspace/apps/src/media_checks.rs`): automount at
+`/media/PENDRIVE`, read and write, eject refused while a file is open, eject,
+unplug and replug through QMP (`device_del`/`device_add`), the data written
+before is still there, and the stick pulled out while a file is open (the
+kernel must survive and clean up). `scripts/desktop-test.ps1` repeats the
+plug, list, Open, Eject and pull-out through the task bar. Host tests:
+`osyx-exfat` (formatting, files, directories, renames, no-space, contiguous
+files, dirty flag), `osyx-part` (MBR), `osyx-abi` (`media`, `battery`).
+
+## Battery
+
+`osyx-battery` (host tests): the mock machine speaks the EC protocol with
+failures and time-outs; hand-assembled AML tables (batteries, adapter,
+`_BIX`, EC-backed fields, firmware arithmetic, `Store` into `Index`) run in
+the real interpreter. QEMU has no battery: `init.args=battery-demo` publishes
+a charging and then a discharging state for the task bar. The EC and the
+firmware of a real ThinkPad are not covered.
 
 ## Suite (`scripts/test.ps1`)
 
@@ -88,11 +112,9 @@ decorated exports of up to 699 bytes; limit raised to 4096), zero-length
 `RUNTIME_FUNCTION` entries (`symcryptk.dll`), and empty unwind-code arrays
 ending exactly at a section's file data (kernel-mode modules).
 
-## Not covered yet
+## Coverage limits
 
-Real hardware, other firmware, resolutions other than the default GOP choice
-(the layout itself is unit-tested for 640×480 – 3840×2160), multi-core,
-memory sizes other than 512 MiB, disk controllers other than virtio-blk,
-full or damaged volumes inside QEMU (covered by the host tests of the
-drivers), ext4 volumes written by Linux with journal checksums v3 (the
-replay path is implemented, but the fixtures' journals use no checksums).
+The recorded result above describes that particular run, not every current feature.
+Dedicated scripts cover SMP, USB hubs, networking and other paths; see scripts/.
+Real-hardware coverage is limited to selected machines and firmware. QEMU results
+do not establish compatibility with other hardware or configurations.

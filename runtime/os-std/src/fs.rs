@@ -549,6 +549,51 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     imp::readlink(path_str(path.as_ref())?).map(PathBuf::from)
 }
 
+/// The absolute path with symbolic links, `.` and `..` resolved.
+///
+/// Every component of `path` must exist. More than 40 symbolic links in one
+/// resolution is reported as [`ErrorKind::InvalidInput`].
+pub fn canonicalize<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
+    let p = path.as_ref();
+    let mut resolved = if p.is_absolute() { PathBuf::from("/") } else { crate::env::current_dir()? };
+    let mut parts = Vec::new();
+    push_parts(&mut parts, path_str(p)?);
+    let mut followed = 0;
+    while let Some(part) = parts.pop() {
+        match part.as_str() {
+            "." => {}
+            // Above the root is the root, as in POSIX.
+            ".." => {
+                resolved.pop();
+            }
+            name => {
+                let candidate = resolved.join(name);
+                if symlink_metadata(&candidate)?.file_type().is_symlink() {
+                    followed += 1;
+                    if followed > 40 {
+                        return Err(Error::new(ErrorKind::InvalidInput, "too many levels of symbolic links"));
+                    }
+                    let target = read_link(&candidate)?;
+                    if target.as_str().starts_with('/') {
+                        resolved = PathBuf::from("/");
+                    }
+                    push_parts(&mut parts, target.as_str());
+                } else {
+                    resolved = candidate;
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Queues the components of `s` so that popping yields them left to right.
+fn push_parts(parts: &mut Vec<String>, s: &str) {
+    for part in s.split('/').filter(|p| !p.is_empty()).rev() {
+        parts.push(String::from(part));
+    }
+}
+
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> Result<()> {
     imp::chmod(path_str(path.as_ref())?, perm.mode())
 }
@@ -587,6 +632,17 @@ mod tests {
         assert!(metadata(&f).unwrap().permissions().readonly());
         p.set_readonly(false);
         set_permissions(&f, p).unwrap();
+    }
+
+    #[test]
+    fn canonicalize_resolves_dots_and_requires_existence() {
+        let d = scratch("t-canon");
+        create_dir(&d.join("a")).unwrap();
+        write(d.join("a/f.txt"), "x").unwrap();
+        assert_eq!(canonicalize(d.join("a/../a/./f.txt")).unwrap().as_str(), "/t-canon/a/f.txt");
+        assert_eq!(canonicalize(&d).unwrap().as_str(), "/t-canon");
+        assert_eq!(canonicalize("/../../t-canon/a").unwrap().as_str(), "/t-canon/a");
+        assert_eq!(canonicalize(d.join("missing")).unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     #[test]
