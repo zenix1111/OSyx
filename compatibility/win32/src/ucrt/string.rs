@@ -122,6 +122,18 @@ extern "win64" fn wcslen(s: *const u16) -> usize {
     unsafe { wstr(s) }.len()
 }
 
+extern "win64" fn wcschr(s: *const u16, c: u16) -> *const u16 {
+    let mut p = s;
+    loop {
+        // SAFETY: the caller supplies a NUL-terminated wide string.
+        let ch = unsafe { *p };
+        if ch == c { return p; }
+        if ch == 0 { return core::ptr::null(); }
+        // SAFETY: the current character is not the terminator.
+        p = unsafe { p.add(1) };
+    }
+}
+
 fn bounded<T: Copy + PartialEq + Default>(s: *const T, max: usize) -> usize {
     let mut n = 0;
     // SAFETY: the caller's string is readable up to its NUL or `max`.
@@ -679,7 +691,7 @@ pub fn exports() -> Vec<(&'static str, u64)> {
     export_table![
         isupper, islower, isdigit, isxdigit, isspace, ispunct, isalpha, isalnum, isprint, isgraph, iscntrl, isblank,
         tolower, toupper, _tolower, _toupper, towlower, towupper, iswspace, iswdigit, iswalpha, iswupper, iswlower,
-        iswxdigit, iswalnum, iswpunct, iswcntrl, strlen, wcslen, strnlen, wcsnlen, __strncnt, __wcsncnt, strcmp,
+        iswxdigit, iswalnum, iswpunct, iswcntrl, strlen, wcslen, wcschr, strnlen, wcsnlen, __strncnt, __wcsncnt, strcmp,
         strncmp, wcscmp, wcsncmp, _stricmp, _strnicmp, _wcsicmp, _wcsnicmp, strcoll, wcscoll, strcpy, wcscpy, strcat,
         wcscat, strncpy, wcsncpy, strncat, wcsncat, strcpy_s, wcscpy_s, strcat_s, wcscat_s, strncpy_s, wcsncpy_s,
         strncat_s, wcsncat_s, memcpy_s, memmove_s, _strdup, _wcsdup, _strupr_s, _strlwr_s, _wcsupr_s, _wcslwr_s,

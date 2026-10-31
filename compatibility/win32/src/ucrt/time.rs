@@ -53,6 +53,15 @@ extern "win64" fn _time32(out: *mut i32) -> i32 {
     t as i32
 }
 
+/// Legacy MSVCRT `time`: 32-bit time_t on x86 and 64-bit time_t on x64.
+extern "win64" fn time(out: *mut u8) -> i64 {
+    if crate::wow64::is_active() {
+        _time32(out.cast()) as i64
+    } else {
+        _time64(out.cast())
+    }
+}
+
 /// `struct tm`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -693,6 +702,7 @@ pub fn exports() -> Vec<(&'static str, u64)> {
     export_table![
         _time64,
         _time32,
+        time,
         _gmtime64_s,
         _gmtime64,
         _mkgmtime64,

@@ -1,0 +1,1 @@
+{"arch":"x64","dll":"shfolder.dll","exports":["SHGetFolderPathA","SHGetFolderPathW"],"file_version":"10.0.26100.1","forwarded":{},"ordinal_only":[],"sha256":"13c479b1a4e2da092811ec64179eb12689eb1a5a4078c59eee890f1dfb90eb24","size":32768}

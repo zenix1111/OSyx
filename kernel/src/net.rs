@@ -331,6 +331,8 @@ pub struct SocketObj {
     recv_timeout: AtomicU64,
     send_timeout: AtomicU64,
     connect_timeout: AtomicU64,
+    /// Original size of the datagram the last `recv` returned.
+    last_msg_len: AtomicU64,
 }
 
 impl SocketObj {
@@ -374,6 +376,7 @@ fn errno(e: NetError) -> Errno {
         NetError::MessageTooLong => Errno::MessageTooLong,
         NetError::NoBuffers => Errno::NoMemory,
         NetError::Shutdown => Errno::BrokenPipe,
+        NetError::AccessDenied => Errno::PermissionDenied,
         NetError::NameNotFound => Errno::NameNotFound,
         NetError::DnsFailure => Errno::DnsFailure,
         NetError::BadSocket => Errno::BadHandle,
@@ -448,6 +451,7 @@ pub fn sys_socket(kind: u64) -> Result<u64, Errno> {
         recv_timeout: AtomicU64::new(0),
         send_timeout: AtomicU64::new(0),
         connect_timeout: AtomicU64::new(0),
+        last_msg_len: AtomicU64::new(0),
     });
     SOCKETS.lock().push(Arc::downgrade(&obj));
     process::add_object(Object::Socket(obj))
@@ -467,6 +471,14 @@ fn ensure_udp(s: &SocketObj, local: Option<Endpoint>) -> Result<u32, Errno> {
         let _ = stack_call(|st| st.udp_set_broadcast(id, true));
     }
     let mut g = s.state.lock();
+    if let Some(existing) = g.id {
+        // Another caller bound first. Release our stack socket through the
+        // network thread, outside the socket state lock.
+        drop(g);
+        CLOSING.lock().push((id, false));
+        wake();
+        return if local.is_some() { Err(Errno::InvalidArgument) } else { Ok(existing) };
+    }
     g.id = Some(id);
     g.bound = Some(ep);
     Ok(id)
@@ -543,6 +555,7 @@ pub fn sys_accept(h: u64, peer: u64) -> Result<u64, Errno> {
         recv_timeout: AtomicU64::new(0),
         send_timeout: AtomicU64::new(0),
         connect_timeout: AtomicU64::new(0),
+        last_msg_len: AtomicU64::new(0),
     });
     SOCKETS.lock().push(Arc::downgrade(&obj));
     // Readiness of the new socket.
@@ -563,7 +576,7 @@ pub fn sys_connect(h: u64, addr: u64) -> Result<u64, Errno> {
             stack_call(|st| st.udp_connect(id, remote)).map(|_| 0)
         }
         abi::SOCK_STREAM => {
-            let id = match s.id() {
+            let (id, started) = match s.id() {
                 Some(id) => {
                     // A connect already in progress (non-blocking retry).
                     if s.state.lock().listening {
@@ -572,17 +585,45 @@ pub fn sys_connect(h: u64, addr: u64) -> Result<u64, Errno> {
                     if s.state.lock().bound.is_some() {
                         stack_call(|st| st.tcp_connect_bound(id, remote))?;
                         s.state.lock().bound = None;
+                        (id, true)
+                    } else {
+                        // Nothing left to start: this socket already connected,
+                        // is still connecting, or failed.
+                        (id, false)
                     }
-                    id
                 }
                 None => {
                     let local = s.state.lock().bound;
                     let id = stack_call(|st| st.tcp_connect(local, remote))?;
-                    s.state.lock().id = Some(id);
+                    let mut g = s.state.lock();
+                    g.id = Some(id);
+                    // The stack socket now owns the local port; stop
+                    // reporting the bind reservation and never reuse it.
+                    g.bound = None;
+                    drop(g);
                     with_stack(|_| ());
-                    id
+                    (id, true)
                 }
             };
+            if !started {
+                let (state, err) = match stack_call(|st| st.tcp_state(id)) {
+                    Ok(v) => v,
+                    // The stack already forgot the failed connection.
+                    Err(Errno::BadHandle) => {
+                        s.state.lock().id = None;
+                        return Err(Errno::NotConnected);
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(e) = err {
+                    return Err(errno(e));
+                }
+                match state {
+                    osyx_net::tcp::State::SynSent | osyx_net::tcp::State::SynReceived => {}
+                    osyx_net::tcp::State::Closed => return Err(Errno::NotConnected),
+                    _ => return Err(Errno::AlreadyConnected),
+                }
+            }
             let timeout = s.connect_timeout.load(Ordering::Relaxed);
             let r = blocking(&s, WRITABLE, timeout, |st| {
                 let (state, err) = st.tcp_state(id)?;
@@ -670,6 +711,13 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
     }
     let timeout = s.recv_timeout.load(Ordering::Relaxed);
     let nonblock = flags & abi::MSG_DONTWAIT != 0;
+    let peek = flags & abi::MSG_PEEK != 0;
+    let waitall = flags & abi::MSG_WAITALL != 0;
+    // A zero-byte stream read returns at once, as on Windows; it consumes
+    // nothing and waits for nothing.
+    if len == 0 && s.kind == abi::SOCK_STREAM {
+        return Ok(0);
+    }
     let mut k = alloc::vec![0u8; len];
     let run = |op: &mut RecvOp| {
         if nonblock {
@@ -681,11 +729,25 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
     let (n, addr) = match s.kind {
         abi::SOCK_DGRAM => {
             let id = ensure_udp(&s, None)?;
-            run(&mut |st| st.udp_recv_from(id, &mut k).map(|(f, n, _)| (n, Some(to_sa(f)))))?
+            let mut total = None;
+            let r = run(&mut |st| {
+                let d = if peek { st.udp_peek_from(id, &mut k) } else { st.udp_recv_from(id, &mut k) };
+                d.map(|(f, n, len)| {
+                    total = Some(len);
+                    (n, Some(to_sa(f)))
+                })
+            })?;
+            if let Some(len) = total {
+                s.last_msg_len.store(len as u64, Ordering::Relaxed);
+            }
+            r
         }
         abi::SOCK_PING => {
+            if peek {
+                return Err(Errno::NotSupported);
+            }
             let id = s.id().ok_or(Errno::BadHandle)?;
-            run(&mut |st| match st.icmp_recv(id)? {
+            run(&mut |st| match if peek { st.icmp_peek(id)? } else { st.icmp_recv(id)? } {
                 IcmpEvent::Reply { from, seq, ttl, data } => {
                     let n = data.len().min(k.len());
                     k[..n].copy_from_slice(&data[..n]);
@@ -696,7 +758,36 @@ pub fn sys_recv(h: u64, buf: u64, len: u64, from: u64, flags: u64) -> Result<u64
         }
         abi::SOCK_STREAM => {
             let id = s.id().ok_or(Errno::NotConnected)?;
-            run(&mut |st| st.tcp_recv(id, &mut k).map(|n| (n, None)))?
+            if peek || !waitall {
+                run(&mut |st| if peek { st.tcp_peek(id, &mut k) } else { st.tcp_recv(id, &mut k) }.map(|n| (n, None)))?
+            } else {
+                // MSG_WAITALL: fill the buffer; EOF, an error or a
+                // non-blocking socket ends the wait early.
+                let mut done = 0;
+                let mut err = None;
+                while done < k.len() {
+                    let r = if nonblock {
+                        stack_call(|st| st.tcp_recv(id, &mut k[done..]))
+                    } else {
+                        blocking(&s, READABLE, timeout, |st| st.tcp_recv(id, &mut k[done..]))
+                    };
+                    match r {
+                        Ok(0) => break,
+                        Ok(n) => done += n,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    if nonblock {
+                        break;
+                    }
+                }
+                match err {
+                    Some(e) if done == 0 => return Err(e),
+                    _ => (done, None),
+                }
+            }
         }
         _ => return Err(Errno::NotSupported),
     };
@@ -748,6 +839,7 @@ pub fn sys_ctl(h: u64, op: u64, arg: u64) -> Result<u64, Errno> {
                     }
                 }
                 (abi::SOCK_DGRAM, Some(id)) if !peer => stack_call(|st| st.udp_local(id))?,
+                (abi::SOCK_DGRAM, Some(id)) => stack_call(|st| st.udp_peer(id))?,
                 (_, _) if !peer => bound.unwrap_or_default(),
                 _ => return Err(Errno::NotConnected),
             };
@@ -761,6 +853,20 @@ pub fn sys_ctl(h: u64, op: u64, arg: u64) -> Result<u64, Errno> {
             let (st, _) = stack_call(|st| st.tcp_state(id))?;
             return Ok(tcp_state_index(st));
         }
+        abi::ctl::ERROR => {
+            if s.kind != abi::SOCK_STREAM {
+                return Ok(0);
+            }
+            let Some(id) = s.id() else { return Ok(0) };
+            let err = stack_call(|st| st.tcp_take_error(id)).ok().flatten();
+            return Ok(err.map_or(0, |e| errno(e) as u64));
+        }
+        abi::ctl::AVAILABLE => {
+            // A socket that never reached the stack has nothing queued.
+            let Some(id) = s.id() else { return Ok(0) };
+            return stack_call(|st| st.recv_available(id)).map(|n| n as u64);
+        }
+        abi::ctl::LAST_MSG_LEN => return Ok(s.last_msg_len.load(Ordering::Relaxed)),
         _ => return Err(Errno::InvalidArgument),
     }
     Ok(0)

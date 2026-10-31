@@ -56,6 +56,137 @@ fn main() -> i32 {
     let args: Vec<String> = env::args().collect();
     let pid = process::id().unwrap_or(0);
     match args.get(1).map(String::as_str) {
+        Some("suspend-test") => {
+            if os_sys::resume_child(pid) != Err(osyx_abi::Errno::PermissionDenied) { return 53; }
+            let marker = "/tmp/suspended-process-test";
+            let _ = fs::remove_file(marker);
+            let stdio = [os_sys::HANDLE_NONE; 3];
+            let pid = match os_sys::spawn_stdio_suspended("/bin/worker", b"worker\0suspend-child\0", b"", stdio) {
+                Ok(pid) => pid, Err(_) => return 40,
+            };
+            thread::sleep(Duration::from_millis(40));
+            if fs::metadata(marker).is_ok() { return 41; }
+            if os_sys::resume_child(pid) != Ok(1) || os_sys::resume_child(pid) != Ok(0) { return 42; }
+            if !matches!(os_sys::wait(pid), Ok((_, 0))) || fs::metadata(marker).is_err() { return 43; }
+            let _ = fs::remove_file(marker);
+            let pid = match os_sys::spawn_stdio_suspended("/bin/worker", b"worker\0suspend-child\0", b"", stdio) {
+                Ok(pid) => pid, Err(_) => return 44,
+            };
+            if os_sys::kill(pid).is_err() || !matches!(os_sys::wait(pid), Ok((_, osyx_abi::KILLED_STATUS))) { return 45; }
+            if fs::metadata(marker).is_ok() { return 46; }
+            let pid_file = "/tmp/suspended-orphan-test";
+            let _ = fs::remove_file(pid_file);
+            if !matches!(Command::new("/bin/worker").arg("suspend-orphan").status(), Ok(s) if s.raw() == 0) { return 48; }
+            let orphan = match fs::read_to_string(pid_file).ok().and_then(|s| s.parse::<u64>().ok()) { Some(pid) => pid, None => return 49 };
+            let _ = fs::remove_file(pid_file);
+            for _ in 0..100 {
+                if matches!(os_sys::proc_info(orphan), Err(osyx_abi::Errno::NotFound)) { return 0; }
+                thread::sleep(Duration::from_millis(10));
+            }
+            return 50;
+        }
+        Some("suspend-orphan") => {
+            let pid = match os_sys::spawn_stdio_suspended("/bin/worker", b"worker\0suspend-child\0", b"", [os_sys::HANDLE_NONE; 3]) {
+                Ok(pid) => pid, Err(_) => return 51,
+            };
+            if fs::write("/tmp/suspended-orphan-test", format!("{pid}")).is_ok() { 0 } else { 52 }
+        }
+        Some("suspend-child") => {
+            thread::sleep(Duration::from_millis(50));
+            if fs::write("/tmp/suspended-process-test", b"ran").is_ok() { 0 } else { 47 }
+        }
+        Some("sandbox-broker") => {
+            use osyx_abi::sandbox::{PathRule, SpawnPolicy, MAX_PATH_RULES, PATH_EXEC, PATH_READ};
+            let invalid = SpawnPolicy { path_count: MAX_PATH_RULES + 1, ..SpawnPolicy::default() };
+            if os_std::os::raw::raw_syscall(osyx_abi::nr::SPAWN_RESTRICTED, 0, &invalid as *const _ as u64, 0)
+                != Err(osyx_abi::Errno::InvalidArgument) {
+                return 23;
+            }
+            if os_std::os::raw::raw_syscall(osyx_abi::nr::CHANNEL_PAIR, 0, 0, 0) != Err(osyx_abi::Errno::Fault) {
+                return 33;
+            }
+            let path = "/bin";
+            let rules = [PathRule { path: path.as_ptr() as u64, path_len: path.len() as u64, access: PATH_READ | PATH_EXEC }];
+            let calls: Vec<u64> = (0..256).filter(|n| *n != osyx_abi::nr::CPU_INFO).collect();
+            let pid = match os_sys::spawn_restricted("/bin/worker", b"worker\0sandbox\0", b"", &rules, &calls) {
+                Ok(pid) => pid,
+                Err(_) => return 20,
+            };
+            if !matches!(os_sys::wait(pid), Ok((_, 0))) { return 21; }
+            let (peer, endpoint) = match os_sys::channel_pair() { Ok(pair) => pair, Err(_) => return 24 };
+            let file = match os_sys::open("/bin/worker", osyx_abi::OPEN_READ, 0) { Ok(file) => file, Err(_) => return 34 };
+            if os_sys::spawn_restricted_with_channels("/bin/worker", b"worker\0exit\00\0", b"", &rules, &calls, endpoint, 0, &[file]) != Err(osyx_abi::Errno::InvalidArgument) { return 35; }
+            if os_sys::grant_child_channel(process::id().unwrap_or(0), file) != Err(osyx_abi::Errno::InvalidArgument) { return 38; }
+            let _ = os_sys::close(file);
+            if os_sys::grant_child_channel(process::id().unwrap_or(0), endpoint) != Err(osyx_abi::Errno::PermissionDenied) { return 39; }
+            let too_many = [endpoint; 33];
+            if os_sys::spawn_restricted_with_channels("/bin/worker", b"worker\0exit\00\0", b"", &rules, &calls, endpoint, 0, &too_many) != Err(osyx_abi::Errno::InvalidArgument) { return 36; }
+            if os_sys::spawn_restricted_with_channels("/bin/worker", b"worker\0exit\00\0", b"", &rules, &calls, os_sys::HANDLE_NONE, 0, &[endpoint]) != Err(osyx_abi::Errno::InvalidArgument) { return 37; }
+            if os_sys::channel_send(peer, b"request", &[]).is_err() { return 27; }
+            let pid = match os_sys::spawn_restricted_with_broker("/bin/worker", b"worker\0sandbox-channel\0", b"", &rules, &calls, endpoint) {
+                Ok(pid) => pid,
+                Err(_) => return 28,
+            };
+            let _ = os_sys::close(endpoint);
+            if !matches!(os_sys::wait(pid), Ok((_, 0))) { return 29; }
+            let mut reply = [0u8; 16];
+            if !matches!(os_sys::channel_recv(peer, &mut reply, &mut []), Ok((5, 0))) || &reply[..5] != b"reply" { return 30; }
+            let _ = os_sys::close(peer);
+            return 0;
+        }
+        Some("sandbox-channel") => {
+            if os_sys::grant_child_channel(process::id().unwrap_or(0), 3) != Err(osyx_abi::Errno::PermissionDenied) { return 40; }
+            let mut request = [0u8; 16];
+            if !matches!(os_sys::channel_recv(3, &mut request, &mut []), Ok((7, 0))) || &request[..7] != b"request" { return 31; }
+            if os_sys::channel_send(3, b"reply", &[]).is_err() { return 32; }
+            0
+        }
+        Some("sandbox") | Some("sandbox-child") | Some("sandbox-exec") => {
+            use os_std::os::raw;
+            if raw::raw_syscall(raw::nr::CPU_INFO, 0, 0, 0) != Err(raw::Errno::PermissionDenied) {
+                return 10;
+            }
+            if raw::open("/tmp/sandbox-secret", raw::OPEN_READ, 0) != Err(raw::Errno::PermissionDenied) {
+                return 11;
+            }
+            if raw::raw_syscall(raw::nr::GETTID, 0, 0, 0).is_err() {
+                return 12;
+            }
+            if raw::raw_syscall(raw::nr::KILL, u64::MAX, 0, 0) != Err(raw::Errno::PermissionDenied) {
+                return 17;
+            }
+            if raw::raw_syscall(raw::nr::CHANNEL_LISTEN, 0, 0, 0) != Err(raw::Errno::PermissionDenied)
+                || raw::raw_syscall(raw::nr::CHANNEL_CONNECT, 0, 0, 0) != Err(raw::Errno::PermissionDenied) {
+                return 18;
+            }
+            if raw::raw_syscall(raw::nr::SPAWN_RESTRICTED, 0, 0, 0) != Err(raw::Errno::PermissionDenied) {
+                return 22;
+            }
+            let file = match raw::open("/bin/worker", raw::OPEN_READ, 0) {
+                Ok(file) => file,
+                Err(_) => return 14,
+            };
+            if raw::raw_syscall(raw::nr::IMAGE_PUBLISH, file, 0, 0) != Err(raw::Errno::PermissionDenied) {
+                return 15;
+            }
+            let result = Command::new("/bin/worker").arg("exit").arg("0")
+                .spawn_stdio([file, raw::HANDLE_NONE, raw::HANDLE_NONE]);
+            if !matches!(result, Err(ref error) if error.kind() == os_std::error::ErrorKind::PermissionDenied) {
+                return 16;
+            }
+            let _ = raw::close(file);
+            if args[1] == "sandbox" {
+                return match Command::new("/bin/worker").arg("sandbox-child").status() {
+                    Ok(status) => status.raw(),
+                    Err(_) => 13,
+                };
+            }
+            if args[1] == "sandbox-child" {
+                let _ = Command::new("/bin/worker").arg("sandbox-exec").exec();
+                return 19;
+            }
+            0
+        }
         Some("exit") => arg_num(&args, 2) as i32,
         Some("spin") => {
             let ms = arg_num(&args, 2);

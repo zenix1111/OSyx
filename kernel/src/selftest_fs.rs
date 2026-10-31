@@ -31,7 +31,7 @@ fn root() -> Lookup {
 }
 
 fn user(uid: u32) -> Lookup {
-    Lookup { cred: Cred { uid, gid: uid }, cwd: String::from("/"), case_insensitive: false }
+    Lookup { cred: Cred { uid, gid: uid }, cwd: String::from("/"), case_insensitive: false, path_policy: None }
 }
 
 fn create(cx: &Lookup, p: &str, mode: u32) -> Result<OpenFile, Errno> {
@@ -380,6 +380,16 @@ pub fn fat_boot() -> TestResult {
     ensure!(read_file(&cx, "/boot/kselftest/mixed case name.txt") == Ok(data.clone()), "read back 100 KB");
     let names = listing(&cx, d).map_err(|x| e("ls", x))?;
     ensure!(names == alloc::vec![(String::from("Mixed Case Name.TXT"), KIND_FILE)], "long name kept: {names:?}");
+    ensure!(vfs::stat(&cx, "/boot/kselftest/ż.txt") == Err(Errno::NotFound), "cache Unicode miss");
+    write_file(&cx, "/boot/kselftest/Ż.txt", b"unicode").map_err(|x| e("Unicode file", x))?;
+    ensure!(read_file(&cx, "/boot/kselftest/ż.txt") == Ok(b"unicode".to_vec()), "Unicode miss invalidated on create");
+    vfs::unlink(&cx, "/boot/kselftest/Ż.txt").map_err(|x| e("unlink Unicode file", x))?;
+    ensure!(vfs::stat(&cx, "/boot/kselftest/ż.txt") == Err(Errno::NotFound), "Unicode hit invalidated on unlink");
+    ensure!(vfs::stat(&cx, "/boot/kselftest/Ος.txt") == Err(Errno::NotFound), "cache contextual Unicode miss");
+    write_file(&cx, "/boot/kselftest/ΟΣ.txt", b"unicode").map_err(|x| e("contextual Unicode file", x))?;
+    ensure!(read_file(&cx, "/boot/kselftest/Ος.txt") == Ok(b"unicode".to_vec()), "contextual Unicode miss invalidated on create");
+    vfs::unlink(&cx, "/boot/kselftest/ΟΣ.txt").map_err(|x| e("unlink contextual Unicode file", x))?;
+    ensure!(vfs::stat(&cx, "/boot/kselftest/Ος.txt") == Err(Errno::NotFound), "contextual Unicode hit invalidated on unlink");
     vfs::rename(&cx, "/boot/kselftest/Mixed Case Name.TXT", "/boot/kselftest/renamed.bin").map_err(|x| e("rename", x))?;
     let h = vfs::open(&cx, "/boot/kselftest/renamed.bin", OPEN_READ, 0).map_err(|x| e("open", x))?;
     ensure!(vfs::unlink(&cx, "/boot/kselftest/renamed.bin") == Err(Errno::Busy), "FAT refuses to remove an open file");
@@ -510,6 +520,126 @@ pub fn concurrent() -> TestResult {
         }
     }
     Ok(())
+}
+
+/// Checks path rules on opens without claiming a complete sandbox.
+pub fn restricted_opens() -> TestResult {
+    use osyx_vfs::{sandbox::PathPolicy, Access};
+    let root = root();
+    let dir = "/tmp/kst-sandbox";
+    remove_tree(dir);
+    vfs::mkdir(&root, dir, 0o755).map_err(|err| e("mkdir", err))?;
+    let result = (|| -> TestResult {
+        let inside = format!("{dir}/inside");
+        let outside = "/tmp/kst-sandbox-outside";
+        write_file(&root, &inside, b"inside").map_err(|err| e("write inside", err))?;
+        write_file(&root, outside, b"outside").map_err(|err| e("write outside", err))?;
+        vfs::symlink(&root, outside, &format!("{dir}/escape")).map_err(|err| e("symlink", err))?;
+        let policy = PathPolicy::new(&[(dir, Access::READ)]).map_err(|err| e("policy", err))?;
+        let restricted = Lookup { path_policy: Some(Arc::new(policy)), ..root.clone() };
+        ensure!(read_file(&restricted, &inside).is_ok(), "allowed file denied");
+        ensure!(vfs::stat(&restricted, "/tmp").is_ok(), "allowed ancestor metadata denied");
+        ensure!(matches!(vfs::open(&restricted, "/tmp", OPEN_READ | OPEN_DIRECTORY, 0), Err(Errno::PermissionDenied)), "ancestor listing allowed");
+        ensure!(matches!(vfs::open(&restricted, outside, OPEN_READ, 0), Err(Errno::PermissionDenied)), "outside file allowed");
+        ensure!(matches!(vfs::open(&restricted, &format!("{dir}/escape"), OPEN_READ, 0), Err(Errno::PermissionDenied)), "symlink escape allowed");
+        ensure!(matches!(vfs::open(&restricted, &inside, OPEN_WRITE, 0), Err(Errno::PermissionDenied)), "write allowed");
+        ensure!(matches!(vfs::open_exec(&restricted, &inside), Err(Errno::PermissionDenied)), "execute allowed");
+        ensure!(matches!(vfs::stat(&restricted, outside), Err(Errno::PermissionDenied)), "outside stat allowed");
+        ensure!(matches!(vfs::unlink(&restricted, &inside), Err(Errno::PermissionDenied)), "unlink allowed");
+        ensure!(matches!(vfs::rename(&restricted, &inside, &format!("{dir}/renamed")), Err(Errno::PermissionDenied)), "rename allowed");
+        ensure!(matches!(vfs::chmod(&restricted, &inside, 0o777), Err(Errno::PermissionDenied)), "chmod allowed");
+        ensure!(matches!(vfs::mkdir(&restricted, &format!("{dir}/subdir"), 0o755), Err(Errno::PermissionDenied)), "mkdir allowed");
+        ensure!(matches!(vfs::symlink(&restricted, outside, &format!("{dir}/newlink")), Err(Errno::PermissionDenied)), "symlink allowed");
+        let new = format!("{dir}/new");
+        ensure!(matches!(create(&restricted, &new, 0o644), Err(Errno::PermissionDenied)), "create allowed");
+        ensure!(matches!(vfs::stat(&root, &new), Err(Errno::NotFound)), "denied create left a file");
+        let rw = Access { read: true, write: true, exec: false };
+        let writable = Lookup { path_policy: Some(Arc::new(PathPolicy::new(&[(dir, rw)]).map_err(|err| e("write policy", err))?)), ..root.clone() };
+        write_file(&writable, &new, b"new").map_err(|err| e("allowed create", err))?;
+        let renamed = format!("{dir}/renamed");
+        vfs::rename(&writable, &new, &renamed).map_err(|err| e("allowed rename", err))?;
+        ensure!(matches!(vfs::rename(&writable, &renamed, outside), Err(Errno::PermissionDenied)), "rename escape allowed");
+        vfs::unlink(&writable, &renamed).map_err(|err| e("allowed unlink", err))?;
+        let _ = vfs::unlink(&root, outside);
+        Ok(())
+    })();
+    let _ = vfs::unlink(&root, "/tmp/kst-sandbox-outside");
+    remove_tree(dir);
+    result
+}
+
+/// Exercise kernel-installed restrictions in a real process and its child.
+pub fn restricted_process() -> TestResult {
+    use crate::{exec::ExecRequest, process};
+    use osyx_abi::{nr, sandbox::SyscallPolicy};
+    use osyx_vfs::{sandbox::PathPolicy, Access};
+    let req = ExecRequest::new("/bin/worker", &["worker", "sandbox"], &[]).map_err(|err| e("request", err))?;
+    let denied_paths = Arc::new(PathPolicy::default());
+    let allowed: Vec<u64> = (0..256).filter(|n| *n != nr::CPU_INFO).collect();
+    let syscalls = Arc::new(SyscallPolicy::new(&allowed));
+    ensure!(matches!(process::spawn_kernel_restricted(&req, denied_paths, syscalls.clone()), Err(process::ExecError::Load(Errno::PermissionDenied))), "executable loaded without permission");
+    let access = Access { read: true, write: false, exec: true };
+    let paths = Arc::new(PathPolicy::new(&[("/bin", access)]).map_err(|err| e("policy", err))?);
+    let pid = process::spawn_kernel_restricted(&req, paths, syscalls).map_err(|err| format!("spawn: {err}"))?;
+    let (_, status) = process::wait(process::KERNEL_PID, pid).map_err(|err| e("wait", err))?;
+    ensure!(status == 0, "restricted worker exited with status {status}");
+    let broker = ExecRequest::new("/bin/worker", &["worker", "sandbox-broker"], &[]).map_err(|err| e("broker request", err))?;
+    let pid = process::spawn(process::KERNEL_PID, &broker).map_err(|err| format!("broker spawn: {err}"))?;
+    let (_, status) = process::wait(process::KERNEL_PID, pid).map_err(|err| e("broker wait", err))?;
+    ensure!(status == 0, "broker test exited with status {status}");
+    Ok(())
+}
+
+/// Verify a held child cannot execute before resume or after termination.
+pub fn suspended_process() -> TestResult {
+    use crate::{exec::ExecRequest, process};
+    let req = ExecRequest::new("/bin/worker", &["worker", "suspend-test"], &[]).map_err(|err| e("request", err))?;
+    let pid = process::spawn(process::KERNEL_PID, &req).map_err(|err| format!("spawn: {err}"))?;
+    let (_, status) = process::wait(process::KERNEL_PID, pid).map_err(|err| e("wait", err))?;
+    ensure!(status == 0, "suspended process test exited with status {status}");
+    Ok(())
+}
+
+/// Run only in an explicitly requested test boot with a fixture, never replace
+/// an installed browser. The caller supplies winrun and sandboxpe modules.
+pub fn restricted_winrun() -> TestResult {
+    use crate::{exec::ExecRequest, process};
+    let cx = root();
+    let image = read_file(&cx, "/bin/sandboxpe").map_err(|err| e("read PE fixture", err))?;
+    if vfs::stat(&cx, "/opt/zen/zen.exe").is_ok() {
+        return Err(String::from("refusing to replace an installed browser"));
+    }
+    let opt_created = vfs::mkdir(&cx, "/opt", 0o755).is_ok();
+    let zen_created = vfs::mkdir(&cx, "/opt/zen", 0o755).is_ok();
+    let mut fixture_created = false;
+    let mut secret_created = false;
+    let result = (|| -> TestResult {
+        // Exclusive creation protects an existing browser even if it appears
+        // after the check above.
+        let mut file = vfs::open(&cx, "/opt/zen/zen.exe", OPEN_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE, 0o755).map_err(|err| e("create PE fixture", err))?;
+        fixture_created = true;
+        let mut done = 0;
+        while done < image.len() {
+            let n = file.write(&image[done..]).map_err(|err| e("write PE fixture", err))?;
+            if n == 0 { return Err(String::from("short write of PE fixture")); }
+            done += n;
+        }
+        drop(file);
+        let mut secret = vfs::open(&cx, "/tmp/sandbox-winrun-secret", OPEN_WRITE | OPEN_CREATE | OPEN_EXCLUSIVE, 0o600).map_err(|err| e("create secret", err))?;
+        secret_created = true;
+        secret.write(b"private").map_err(|err| e("write secret", err))?;
+        drop(secret);
+        let req = ExecRequest::new("/bin/winrun", &["winrun", "/opt/zen/zen.exe"], &["OSYX_EXPERIMENTAL_CONTENT_SANDBOX=1"]).map_err(|err| e("request", err))?;
+        let pid = process::spawn(process::KERNEL_PID, &req).map_err(|err| format!("winrun spawn: {err}"))?;
+        let (_, status) = process::wait(process::KERNEL_PID, pid).map_err(|err| e("winrun wait", err))?;
+        ensure!(status == 0, "Winrun PE fixture exited with status {status}");
+        Ok(())
+    })();
+    if fixture_created { let _ = vfs::unlink(&cx, "/opt/zen/zen.exe"); }
+    if secret_created { let _ = vfs::unlink(&cx, "/tmp/sandbox-winrun-secret"); }
+    if zen_created { let _ = vfs::rmdir(&cx, "/opt/zen"); }
+    if opt_created { let _ = vfs::rmdir(&cx, "/opt"); }
+    result
 }
 
 /// The program loader's lookup and refusals (`spawn` / `execve`), without

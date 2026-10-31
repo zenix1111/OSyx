@@ -32,6 +32,7 @@ fn pm1a_control() -> Option<u16> {
 }
 
 fn shutdown_volumes(what: &str) {
+    crate::drivers::i2c::quiesce();
     kprintln!("power: {what}: unmounting volumes");
     crate::vfs::shutdown();
 }

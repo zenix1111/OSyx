@@ -757,10 +757,14 @@ struct Start {
 /// stack, then releases its C runtime data.
 extern "win64" fn thread_start(param: u64) -> u32 {
     // SAFETY: the box made by `_beginthreadex` for this thread.
-    let s = unsafe { Box::from_raw(param as *mut Start) };
-    // SAFETY: the program's `unsigned (__stdcall *)(void *)`.
-    let f: extern "win64" fn(u64) -> u32 = unsafe { core::mem::transmute(s.func as usize) };
-    let code = f(s.arg);
+    let Start { func, arg } = *unsafe { Box::from_raw(param as *mut Start) };
+    let code = if crate::wow64::is_active() {
+        crate::wow64::run_thread32(func as u32, arg as u32)
+    } else {
+        // SAFETY: the program's `unsigned (__stdcall *)(void *)`.
+        let f: extern "win64" fn(u64) -> u32 = unsafe { core::mem::transmute(func as usize) };
+        f(arg)
+    };
     release_ptd();
     code
 }

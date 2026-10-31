@@ -303,6 +303,13 @@ extern "win64" fn CreateFileMappingA(file: u64, attributes: u64, protect: u32, h
 
 extern "win64" fn MapViewOfFile(section: u64, access: u32, high: u32, low: u32, len: usize) -> u64 {
     match map(section, access, (high as u64) << 32 | low as u64, len as u64) {
+        // A 32-bit caller cannot use a view the kernel placed above 2 GiB
+        // (shared and coherent file sections go wherever it puts them):
+        // fail instead of handing back a truncated pointer.
+        Ok((base, size)) if crate::wow64::is_active() && base.saturating_add(size) > 0x8000_0000 => {
+            let _ = unmap(base);
+            fail(ERROR_NOT_ENOUGH_MEMORY, 0)
+        }
         Ok((base, _)) => base,
         Err(s) => fail(to_win32(s), 0),
     }

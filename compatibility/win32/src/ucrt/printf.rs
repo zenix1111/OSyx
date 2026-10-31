@@ -65,21 +65,26 @@ impl Ch for u16 {
     }
 }
 
-/// The va_list of the Windows x64 convention: 8-byte slots.
-struct Args(*const u64);
+/// Windows x64 uses 8-byte slots; i386 uses 4-byte stack slots.
+struct Args { ptr: *const u8, pe32: bool }
 
 impl Args {
     fn next(&mut self) -> u64 {
         // SAFETY: the caller's va_list holds an argument for every
         // conversion of its format (C contract).
-        let v = unsafe { *self.0 };
+        let v = unsafe { if self.pe32 { core::ptr::read_unaligned(self.ptr.cast::<u32>()) as u64 } else { core::ptr::read_unaligned(self.ptr.cast::<u64>()) } };
         // SAFETY: as above.
-        self.0 = unsafe { self.0.add(1) };
+        self.ptr = unsafe { self.ptr.add(if self.pe32 { 4 } else { 8 }) };
         v
     }
 
+    fn next64(&mut self) -> u64 {
+        let low = self.next();
+        if self.pe32 { low | (self.next() << 32) } else { low }
+    }
+
     fn float(&mut self) -> f64 {
-        f64::from_bits(self.next())
+        f64::from_bits(self.next64())
     }
 }
 
@@ -472,9 +477,9 @@ fn special(x: f64, upper: bool) -> (bool, &'static [u8]) {
 
 /// Formats `fmt` with `args`. `secure`: the `_s` validation (unknown
 /// conversions and %n are invalid parameters).
-fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result<Vec<C>, Failed> {
+fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool, pe32: bool) -> Result<Vec<C>, Failed> {
     let mut out = Out { v: Vec::new() };
-    let mut a = Args(args);
+    let mut a = Args { ptr: args.cast(), pe32 };
     let ffmt = |upper: bool| FloatFmt {
         upper,
         standard: opts & STANDARD_ROUNDING != 0,
@@ -601,7 +606,7 @@ fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result
                 if ty != 'p' && !is_int_size(size) {
                     return Err(invalid());
                 }
-                let raw = a.next();
+                let raw = if size == Size::LongLong { a.next64() } else { a.next() };
                 let signed = matches!(ty, 'd' | 'i');
                 let (neg, mag) = if ty == 'p' {
                     (false, raw)
@@ -611,6 +616,7 @@ fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result
                         (Size::Char, false) => raw as u8 as i128,
                         (Size::Short, true) => raw as i16 as i128,
                         (Size::Short, false) => raw as u16 as i128,
+                        (Size::Ptr, true) if pe32 => raw as i32 as i128,
                         (Size::LongLong | Size::Ptr, true) => raw as i64 as i128,
                         (Size::LongLong | Size::Ptr, false) => raw as i128,
                         (_, true) => raw as i32 as i128,
@@ -624,7 +630,8 @@ fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result
                     'X' | 'p' => (16, true),
                     _ => (10, false),
                 };
-                let prec = if ty == 'p' { Some(sp.prec.unwrap_or(16).max(16)) } else { sp.prec };
+                let ptr_digits = if pe32 { 8 } else { 16 };
+                let prec = if ty == 'p' { Some(sp.prec.unwrap_or(ptr_digits).max(ptr_digits)) } else { sp.prec };
                 let mut body = if mag == 0 && prec == Some(0) { Vec::new() } else { int_body(mag, radix, upper, prec) };
                 let mut prefix: Vec<u8> = Vec::new();
                 if signed {
@@ -703,7 +710,9 @@ fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result
                 let p = a.next();
                 // ANSI_STRING / UNICODE_STRING: Length (bytes), Maximum, Buffer.
                 // SAFETY: the caller's counted-string structure.
-                let (len, buf) = if p == 0 { (0, 0) } else { unsafe { (*(p as *const u16) as usize, *((p + 8) as *const u64)) } };
+                let (len, buf) = if p == 0 { (0, 0) } else { unsafe {
+                    (*(p as *const u16) as usize, if pe32 { *((p + 4) as *const u32) as u64 } else { *((p + 8) as *const u64) })
+                } };
                 let body: Vec<C> = if buf == 0 {
                     units(b"(null)")
                 } else if wide_arg {
@@ -772,6 +781,7 @@ fn format<C: Ch>(opts: u64, fmt: &[C], args: *const u64, secure: bool) -> Result
                     match size {
                         Size::Char => *(p as *mut i8) = n as i8,
                         Size::Short => *(p as *mut i16) = n as i16,
+                        Size::Ptr if pe32 => *(p as *mut i32) = n as i32,
                         Size::LongLong | Size::Ptr => *(p as *mut i64) = n as i64,
                         _ => *(p as *mut i32) = n as i32,
                     }
@@ -813,10 +823,10 @@ fn copy_out<C: Ch>(buf: *mut C, s: &[C], n: usize) {
 }
 
 /// `__stdio_common_vsprintf` / `vswprintf`.
-fn vsprintf<C: Ch>(opts: u64, buf: *mut C, count: usize, fmt: *const C, args: *const u64) -> i32 {
+fn vsprintf<C: Ch>(opts: u64, buf: *mut C, count: usize, fmt: *const C, args: *const u64, pe32: bool) -> i32 {
     validate!(!fmt.is_null(), EINVAL, -1);
     validate!(count == 0 || !buf.is_null(), EINVAL, -1);
-    let s = match format(opts, fmt_units(fmt), args, false) {
+    let s = match format(opts, fmt_units(fmt), args, false, pe32) {
         Ok(s) => s,
         Err(Failed(e)) => {
             set_errno(e);
@@ -864,7 +874,7 @@ fn vsprintf<C: Ch>(opts: u64, buf: *mut C, count: usize, fmt: *const C, args: *c
 fn vsprintf_s<C: Ch>(opts: u64, buf: *mut C, count: usize, fmt: *const C, args: *const u64) -> i32 {
     validate!(!fmt.is_null(), EINVAL, -1);
     validate!(!buf.is_null() && count > 0, EINVAL, -1);
-    let s = match format(opts, fmt_units(fmt), args, true) {
+    let s = match format(opts, fmt_units(fmt), args, true, false) {
         Ok(s) => s,
         Err(Failed(e)) => {
             set_errno(e);
@@ -890,7 +900,7 @@ fn vsnprintf_s<C: Ch>(opts: u64, buf: *mut C, size: usize, count: usize, fmt: *c
         return 0;
     }
     validate!(!buf.is_null() && size > 0, EINVAL, -1);
-    let s = match format(opts, fmt_units(fmt), args, true) {
+    let s = match format(opts, fmt_units(fmt), args, true, false) {
         Ok(s) => s,
         Err(Failed(e)) => {
             set_errno(e);
@@ -916,10 +926,37 @@ fn vsnprintf_s<C: Ch>(opts: u64, buf: *mut C, size: usize, count: usize, fmt: *c
 }
 
 extern "win64" fn __stdio_common_vsprintf(o: u64, b: *mut u8, n: usize, f: *const u8, _l: u64, a: *const u64) -> i32 {
-    vsprintf(o, b, n, f, a)
+    vsprintf(o, b, n, f, a, false)
 }
 extern "win64" fn __stdio_common_vswprintf(o: u64, b: *mut u16, n: usize, f: *const u16, _l: u64, a: *const u64) -> i32 {
-    vsprintf(o, b, n, f, a)
+    vsprintf(o, b, n, f, a, false)
+}
+
+extern "win64" fn legacy_snprintf(b: *mut u8, n: usize, f: *const u8, a: *const u64) -> i32 {
+    vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION, b, n, f, a, false)
+}
+
+extern "win64" fn legacy_snwprintf(b: *mut u16, n: usize, f: *const u16, a: *const u64) -> i32 {
+    vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION | LEGACY_WIDE_SPECIFIERS, b, n, f, a, false)
+}
+
+#[unsafe(naked)]
+extern "win64" fn _snprintf() {
+    core::arch::naked_asm!("mov [rsp+32], r9", "lea r9, [rsp+32]", "jmp {target}", target = sym legacy_snprintf)
+}
+
+#[unsafe(naked)]
+extern "win64" fn _snwprintf() {
+    core::arch::naked_asm!("mov [rsp+32], r9", "lea r9, [rsp+32]", "jmp {target}", target = sym legacy_snwprintf)
+}
+
+/// Legacy MSVCRT formatting with arguments in 32-bit stack slots.
+pub(crate) fn legacy_snprintf32(wide: bool, b: u32, n: u32, f: u32, a: *const u32) -> i32 {
+    if wide {
+        vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION | LEGACY_WIDE_SPECIFIERS, b as *mut u16, n as usize, f as *const u16, a.cast(), true)
+    } else {
+        vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION, b as *mut u8, n as usize, f as *const u8, a.cast(), true)
+    }
 }
 extern "win64" fn __stdio_common_vsprintf_s(o: u64, b: *mut u8, n: usize, f: *const u8, _l: u64, a: *const u64) -> i32 {
     vsprintf_s(o, b, n, f, a)
@@ -957,7 +994,7 @@ extern "win64" fn __stdio_common_vsnwprintf_s(
 /// are stored).
 fn vfprintf<C: Ch>(opts: u64, f: *mut File, fmt: *const C, args: *const u64, secure: bool) -> i32 {
     validate!(!f.is_null() && !fmt.is_null(), EINVAL, -1);
-    let s = match format(opts, fmt_units(fmt), args, secure) {
+    let s = match format(opts, fmt_units(fmt), args, secure, false) {
         Ok(s) => s,
         Err(Failed(e)) => {
             set_errno(e);
@@ -994,21 +1031,31 @@ extern "win64" fn __stdio_common_vfwprintf_s(o: u64, f: *mut File, fmt: *const u
 /// given options.
 #[allow(dead_code)]
 pub fn format_narrow(opts: u64, fmt: &[u8], args: &[u64]) -> Option<String> {
-    format::<u8>(opts, fmt, args.as_ptr(), false).ok().map(|v| String::from_utf8_lossy(&v).into_owned())
+    format::<u8>(opts, fmt, args.as_ptr(), false, false).ok().map(|v| String::from_utf8_lossy(&v).into_owned())
 }
 
 pub(crate) fn win32_wide(fmt: &[u16], args: *const u64) -> Option<Vec<u16>> {
-    format(LEGACY_WIDE_SPECIFIERS, fmt, args, false).ok()
+    format(LEGACY_WIDE_SPECIFIERS, fmt, args, false, false).ok()
 }
 
 pub(crate) fn win32_narrow(fmt: &[u8], args: *const u64) -> Option<Vec<u8>> {
-    format(0, fmt, args, false).ok()
+    format(0, fmt, args, false, false).ok()
+}
+
+pub(crate) fn win32_wide32(fmt: &[u16], args: *const u32) -> Option<Vec<u16>> {
+    format(LEGACY_WIDE_SPECIFIERS, fmt, args.cast(), false, true).ok()
+}
+
+pub(crate) fn win32_narrow32(fmt: &[u8], args: *const u32) -> Option<Vec<u8>> {
+    format(0, fmt, args.cast(), false, true).ok()
 }
 
 pub fn exports() -> Vec<(&'static str, u64)> {
     export_table![
         _set_printf_count_output,
         _get_printf_count_output,
+        _snprintf,
+        _snwprintf,
         __stdio_common_vsprintf,
         __stdio_common_vswprintf,
         __stdio_common_vsprintf_s,

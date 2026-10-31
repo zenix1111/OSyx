@@ -28,6 +28,7 @@
 //! compatibility layer, above this module (see docs/windows-compatibility.md).
 
 pub mod devfs;
+pub mod exfat;
 pub mod ext4;
 pub mod fat;
 pub mod tmpfs;
@@ -43,6 +44,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use osyx_abi::*;
 use osyx_vfs::path::{self, split_last, validate, validate_name};
 use osyx_vfs::perm::{self, may};
+use osyx_vfs::sandbox::PathPolicy;
 use osyx_vfs::{Access, Cred, DirEntry, FsUsage, MountTable, NewNode};
 
 pub type Result<T> = core::result::Result<T, Errno>;
@@ -95,6 +97,11 @@ pub trait Filesystem: Send + Sync {
     }
     fn rename(&self, _sdir: u64, _sname: &str, _ddir: u64, _dname: &str) -> Result<()> {
         Err(Errno::ReadOnly)
+    }
+    /// A second name `name` in `dir` for the non-directory `target` (a hard
+    /// link). File systems without link counts refuse it.
+    fn link(&self, _dir: u64, _name: &str, _target: u64) -> Result<()> {
+        Err(Errno::NotSupported)
     }
     fn set_mode(&self, _ino: u64, _mode: u32) -> Result<()> {
         Err(Errno::ReadOnly)
@@ -175,17 +182,42 @@ pub struct Lookup {
     /// Canonical absolute current directory.
     pub cwd: String,
     pub case_insensitive: bool,
+    /// Experimental path checks. Pre-existing handles and process-level
+    /// enforcement are not yet restricted.
+    pub path_policy: Option<Arc<PathPolicy>>,
 }
 
 impl Lookup {
     pub fn kernel() -> Lookup {
-        Lookup { cred: Cred::ROOT, cwd: String::from("/"), case_insensitive: false }
+        Lookup { cred: Cred::ROOT, cwd: String::from("/"), case_insensitive: false, path_policy: None }
     }
 
     /// The calling process's credentials and current directory.
     pub fn current() -> Lookup {
-        let (cred, cwd) = crate::process::current_identity();
-        Lookup { cred, cwd, case_insensitive: false }
+        crate::process::current_lookup()
+    }
+
+    fn check_path(&self, path: &str, access: Access) -> Result<()> {
+        if self.path_policy.as_ref().is_some_and(|policy| !policy.allows(path, access)) {
+            return Err(Errno::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn check_traverse(&self, path: &str) -> Result<()> {
+        if self.path_policy.as_ref().is_some_and(|policy| !policy.may_traverse(path)) {
+            return Err(Errno::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn check_metadata(&self, path: &str) -> Result<()> {
+        if self.path_policy.as_ref().is_some_and(|policy| {
+            !policy.allows(path, Access::READ) && !policy.may_inspect_ancestor(path)
+        }) {
+            return Err(Errno::PermissionDenied);
+        }
+        Ok(())
     }
 }
 
@@ -290,7 +322,10 @@ fn cache_forget(mount: u64, dir: u64, name: &str) {
     let lo = (mount, dir, false, String::new());
     let hi = (mount, dir, true, String::from("\u{10ffff}"));
     let stale: Vec<(u64, u64, bool, String)> =
-        t.range(lo..=hi).filter(|(_, c)| c.stored.eq_ignore_ascii_case(name)).map(|(k, _)| k.clone()).collect();
+        t.range(lo..=hi)
+            .filter(|(_, c)| path::fold_case(&c.stored) == path::fold_case(name))
+            .map(|(k, _)| k.clone())
+            .collect();
     for k in stale {
         t.remove(&k);
     }
@@ -323,6 +358,7 @@ fn root_entry() -> Result<WalkEntry> {
 /// symbolic link is followed.
 pub fn walk(cx: &Lookup, p: &str, follow_last: bool) -> Result<Node> {
     validate(p)?;
+    cx.check_traverse("/")?;
     let mut queue: VecDeque<String> = VecDeque::new();
     if !p.starts_with('/') {
         queue.extend(path::components(&cx.cwd).map(String::from));
@@ -343,6 +379,7 @@ pub fn walk(cx: &Lookup, p: &str, follow_last: bool) -> Result<Node> {
         }
         let (mount, dir_ino) = {
             let cur = stack.last().expect("walk stack never empty");
+            cx.check_traverse(&cur.node.path)?;
             if cur.st.kind != KIND_DIR {
                 return Err(Errno::NotADirectory);
             }
@@ -377,6 +414,7 @@ pub fn walk(cx: &Lookup, p: &str, follow_last: bool) -> Result<Node> {
             }
         };
         let canon = path::join(&stack.last().expect("walk stack never empty").node.path, &stored);
+        cx.check_traverse(&canon)?;
         let last = queue.is_empty();
         let (child, cacheable) = match mount_at(&canon) {
             Some(m) => (Node { ino: m.fs.root(), mount: m, path: canon }, false),
@@ -412,7 +450,9 @@ pub fn walk(cx: &Lookup, p: &str, follow_last: bool) -> Result<Node> {
             stack.push(WalkEntry { node: child, st: FileStat::default() });
         }
     }
-    Ok(stack.pop().expect("walk stack never empty").node)
+    let node = stack.pop().expect("walk stack never empty").node;
+    cx.check_traverse(&node.path)?;
+    Ok(node)
 }
 
 /// Resolves the directory that would contain `p`, and the final name.
@@ -491,6 +531,9 @@ pub fn mount_fs(at: &str, source: &str, flags: u64, fs: Arc<dyn Filesystem>) -> 
 
 /// Unmounts the volume mounted exactly at `p` (after resolving it).
 pub fn unmount(cx: &Lookup, p: &str) -> Result<()> {
+    if cx.path_policy.is_some() {
+        return Err(Errno::PermissionDenied);
+    }
     let at = walk(cx, p, true)?.path;
     if at == "/" {
         return Err(Errno::Busy);
@@ -512,6 +555,42 @@ pub fn unmount(cx: &Lookup, p: &str) -> Result<()> {
     }
     kprintln!("vfs: {} unmounted from {}", m.fs.fs_type(), m.path);
     Ok(())
+}
+
+/// Takes the volumes mounted at `paths` out of the mount table in one
+/// step, so a group of volumes (the partitions of one USB stick) is either
+/// all detached or none is. Without `force`, a volume with open files or
+/// other mounts below it makes the whole call fail with `Busy` and changes
+/// nothing; `force` (the device is gone) detaches regardless, and open
+/// files then fail with I/O errors. The caller finishes each volume with
+/// `fs.unmount()`.
+pub fn detach_volumes(paths: &[String], force: bool) -> Result<Vec<Arc<Mount>>> {
+    let mut order: Vec<&String> = paths.iter().collect();
+    // Innermost first.
+    order.sort_by_key(|p| core::cmp::Reverse(p.len()));
+    let mut t = MOUNTS.lock();
+    let found: Vec<Arc<Mount>> = order.iter().filter_map(|p| t.exact(p).cloned()).collect();
+    if !force {
+        for m in &found {
+            // The table and `found` hold references; anything more is an
+            // open file or an operation in progress.
+            if Arc::strong_count(m) > 2 {
+                return Err(Errno::Busy);
+            }
+            let nested = t.iter().any(|(p, _)| p != m.path && path::is_within(p, &m.path) && !paths.iter().any(|q| q == p));
+            if nested {
+                return Err(Errno::Busy);
+            }
+        }
+    }
+    for m in &found {
+        if t.remove(&m.path).is_err() && force {
+            kprintln!("vfs: {} still has mounts below it", m.path);
+        }
+    }
+    drop(t);
+    cache_invalidate();
+    Ok(found)
 }
 
 /// Starts the write-back thread: once a second it lets every volume write
@@ -546,8 +625,13 @@ pub fn mounts() -> Vec<Arc<Mount>> {
 /// True if a mounted volume lives on block device `name` (a disk or one
 /// of its partitions).
 pub fn device_in_use(name: &str) -> bool {
+    let devs = crate::block::devices();
+    let parent_of = |n: &str| devs.iter().find(|d| d.name() == n).and_then(|d| d.parent_name().map(String::from));
+    let wanted_parent = parent_of(name);
     mounts().iter().any(|m| {
-        m.fs.backing_device().is_some_and(|d| d == name || d.starts_with(name) || name.starts_with(d.as_str()))
+        m.fs.backing_device().is_some_and(|d| {
+            d == name || wanted_parent.as_deref() == Some(d.as_str()) || parent_of(&d).as_deref() == Some(name)
+        })
     })
 }
 
@@ -567,15 +651,21 @@ pub fn shutdown() {
 // ---- operations on paths ---------------------------------------------------
 
 pub fn stat(cx: &Lookup, p: &str) -> Result<FileStat> {
-    walk(cx, p, true)?.stat()
+    let n = walk(cx, p, true)?;
+    cx.check_metadata(&n.path)?;
+    n.stat()
 }
 
 pub fn lstat(cx: &Lookup, p: &str) -> Result<FileStat> {
-    walk(cx, p, false)?.stat()
+    let n = walk(cx, p, false)?;
+    cx.check_metadata(&n.path)?;
+    n.stat()
 }
 
 pub fn mkdir(cx: &Lookup, p: &str, mode: u32) -> Result<()> {
     let (dir, name) = walk_parent(cx, p)?;
+    cx.check_path(&dir.path, Access::WRITE)?;
+    cx.check_path(&path::join(&dir.path, &name), Access::WRITE)?;
     if walk(cx, p, false).is_ok() {
         return Err(Errno::AlreadyExists);
     }
@@ -590,6 +680,8 @@ pub fn mkdir(cx: &Lookup, p: &str, mode: u32) -> Result<()> {
 pub fn symlink(cx: &Lookup, target: &str, p: &str) -> Result<()> {
     validate(target)?;
     let (dir, name) = walk_parent(cx, p)?;
+    cx.check_path(&dir.path, Access::WRITE)?;
+    cx.check_path(&path::join(&dir.path, &name), Access::WRITE)?;
     if walk(cx, p, false).is_ok() {
         return Err(Errno::AlreadyExists);
     }
@@ -601,8 +693,35 @@ pub fn symlink(cx: &Lookup, target: &str, p: &str) -> Result<()> {
     r.map(|_| ())
 }
 
+/// Creates `new` as another name of the file `existing` (a hard link; a
+/// symbolic link is linked itself, not followed).
+pub fn link(cx: &Lookup, existing: &str, new: &str) -> Result<()> {
+    let src = walk(cx, existing, false)?;
+    let st = src.stat()?;
+    if st.kind == KIND_DIR {
+        return Err(Errno::IsADirectory);
+    }
+    let (dir, name) = walk_parent(cx, new)?;
+    if !Arc::ptr_eq(&src.mount, &dir.mount) {
+        return Err(Errno::CrossDevice);
+    }
+    check_dir_write(&dir, &cx.cred)?;
+    if walk(cx, new, false).is_ok() {
+        return Err(Errno::AlreadyExists);
+    }
+    if !may(&st, &cx.cred, Access::READ) {
+        return Err(Errno::PermissionDenied);
+    }
+    let r = dir.mount.fs.link(dir.ino, &name, src.ino);
+    if r.is_ok() {
+        cache_forget(dir.mount.id, dir.ino, &name);
+    }
+    r
+}
+
 pub fn readlink(cx: &Lookup, p: &str) -> Result<String> {
     let n = walk(cx, p, false)?;
+    cx.check_path(&n.path, Access::READ)?;
     if n.stat()?.kind != KIND_SYMLINK {
         return Err(Errno::InvalidArgument);
     }
@@ -613,8 +732,10 @@ pub fn readlink(cx: &Lookup, p: &str) -> Result<String> {
 /// empty directory (`dir == true`).
 fn remove(cx: &Lookup, p: &str, dir_wanted: bool) -> Result<()> {
     let (dir, name) = walk_parent(cx, p)?;
+    cx.check_path(&dir.path, Access::WRITE)?;
     let dst = check_dir_write(&dir, &cx.cred)?;
     let victim = existing_entry(cx, &dir, &name)?;
+    cx.check_path(&victim.path, Access::WRITE)?;
     let vst = victim.stat()?;
     if !perm::may_delete(&dst, &vst, &cx.cred) {
         return Err(Errno::PermissionDenied);
@@ -642,22 +763,26 @@ pub fn rmdir(cx: &Lookup, p: &str) -> Result<()> {
 pub fn rename(cx: &Lookup, from: &str, to: &str) -> Result<()> {
     let (sdir, sname) = walk_parent(cx, from)?;
     let (ddir, dname) = walk_parent(cx, to)?;
+    cx.check_path(&sdir.path, Access::WRITE)?;
+    cx.check_path(&ddir.path, Access::WRITE)?;
     if !Arc::ptr_eq(&sdir.mount, &ddir.mount) {
         return Err(Errno::CrossDevice);
     }
     let sst = check_dir_write(&sdir, &cx.cred)?;
     let dst = check_dir_write(&ddir, &cx.cred)?;
     let src = existing_entry(cx, &sdir, &sname)?;
+    cx.check_path(&src.path, Access::WRITE)?;
     if !perm::may_delete(&sst, &src.stat()?, &cx.cred) {
         return Err(Errno::PermissionDenied);
     }
     match existing_entry(cx, &ddir, &dname) {
         Ok(target) => {
+            cx.check_path(&target.path, Access::WRITE)?;
             if !perm::may_delete(&dst, &target.stat()?, &cx.cred) {
                 return Err(Errno::PermissionDenied);
             }
         }
-        Err(Errno::NotFound) => {}
+        Err(Errno::NotFound) => cx.check_path(&path::join(&ddir.path, &dname), Access::WRITE)?,
         Err(e) => return Err(e),
     }
     // A directory may not move below itself (also across mount-free paths
@@ -675,6 +800,7 @@ pub fn rename(cx: &Lookup, from: &str, to: &str) -> Result<()> {
 
 pub fn chmod(cx: &Lookup, p: &str, mode: u32) -> Result<()> {
     let n = walk(cx, p, true)?;
+    cx.check_path(&n.path, Access::WRITE)?;
     n.mount.writable()?;
     if !perm::may_chmod(&n.stat()?, &cx.cred) {
         return Err(Errno::PermissionDenied);
@@ -687,6 +813,7 @@ pub fn chmod(cx: &Lookup, p: &str, mode: u32) -> Result<()> {
 /// Resolves a new current directory; returns its canonical path.
 pub fn chdir(cx: &Lookup, p: &str) -> Result<String> {
     let n = walk(cx, p, true)?;
+    cx.check_traverse(&n.path)?;
     let st = n.stat()?;
     if st.kind != KIND_DIR {
         return Err(Errno::NotADirectory);
@@ -699,6 +826,7 @@ pub fn chdir(cx: &Lookup, p: &str) -> Result<String> {
 
 pub fn statfs(cx: &Lookup, p: &str) -> Result<FsStat> {
     let n = walk(cx, p, true)?;
+    cx.check_path(&n.path, Access::READ)?;
     let u = n.mount.fs.usage();
     let mut out = FsStat {
         block_size: u.block_size,
@@ -758,6 +886,8 @@ pub fn open(cx: &Lookup, p: &str, flags: u64, mode: u32) -> Result<OpenFile> {
             Ok(n) => n,
             Err(Errno::NotFound) => {
                 let (dir, name) = walk_parent(cx, p)?;
+                cx.check_path(&dir.path, Access::WRITE)?;
+                cx.check_path(&path::join(&dir.path, &name), Access { read: flags & OPEN_READ != 0, write, exec: false })?;
                 check_dir_write(&dir, &cx.cred)?;
                 let ino = dir.mount.fs.create(dir.ino, &name, NewNode::File, mode & MODE_PERMS, &cx.cred)?;
                 cache_forget(dir.mount.id, dir.ino, &name);
@@ -769,6 +899,7 @@ pub fn open(cx: &Lookup, p: &str, flags: u64, mode: u32) -> Result<OpenFile> {
     } else {
         walk(cx, p, follow)?
     };
+    cx.check_path(&node.path, Access { read: flags & OPEN_READ != 0, write, exec: false })?;
     let st = node.stat()?;
     if st.kind == KIND_SYMLINK {
         return Err(Errno::Loop);
@@ -822,6 +953,7 @@ pub fn open(cx: &Lookup, p: &str, flags: u64, mode: u32) -> Result<OpenFile> {
 /// execute permission, not read permission (root: any execute bit).
 pub fn open_exec(cx: &Lookup, p: &str) -> Result<OpenFile> {
     let node = walk(cx, p, true)?;
+    cx.check_path(&node.path, Access::EXEC)?;
     let st = node.stat()?;
     if st.kind != KIND_FILE || !may(&st, &cx.cred, Access::EXEC) {
         return Err(Errno::PermissionDenied);
@@ -940,7 +1072,14 @@ impl OpenFile {
             KIND_DIR => Err(Errno::IsADirectory),
             KIND_FILE if self.device.is_none() => {
                 let t0 = crate::interrupts::uptime_ms();
-                let r = crate::filecache::read(self.cache_key(), self.pos, buf, |off, b| self.node.mount.fs.read(self.node.ino, off, b));
+                let source = crate::filecache::Source { fs: self.node.mount.fs.clone(), ino: self.node.ino };
+                let r = crate::filecache::read(
+                    self.cache_key(),
+                    self.pos,
+                    buf,
+                    |off, b| self.node.mount.fs.read(self.node.ino, off, b),
+                    Some(&source),
+                );
                 let ms = crate::interrupts::uptime_ms().saturating_sub(t0);
                 if ms >= 40 {
                     // TEMP I/O diagnostics: which read blocks its thread this long.
@@ -1067,9 +1206,12 @@ impl OpenFile {
 
 // ---- mount from user space ----------------------------------------------------
 
-/// `mount(2)`: `fstype` is "tmpfs", "fat32" or "ext4"; disk file systems
+/// `mount(2)`: `fstype` is "tmpfs", "fat32", "exfat" or "ext4"; disk file systems
 /// take a block device node path as `source`.
 pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, size_limit: u64) -> Result<()> {
+    if cx.path_policy.is_some() {
+        return Err(Errno::PermissionDenied);
+    }
     if !cx.cred.is_root() {
         return Err(Errno::PermissionDenied);
     }
@@ -1085,7 +1227,7 @@ pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, 
             let limit = if size_limit == 0 { tmpfs::DEFAULT_LIMIT } else { size_limit };
             Arc::new(tmpfs::TmpfsVolume::new(limit, 0o1777))
         }
-        "fat32" | "ext4" => {
+        "fat32" | "ext4" | "exfat" => {
             let dev = walk(cx, source, true)?;
             let disk = dev.mount.fs.device(dev.ino).and_then(|d| d.block()).ok_or(Errno::InvalidArgument)?;
             if device_in_use(disk.name()) {
@@ -1101,8 +1243,21 @@ pub fn mount(cx: &Lookup, source: &str, target: &str, fstype: &str, flags: u64, 
 
 /// Opens a disk file system driver on `disk`.
 pub fn mount_disk(fstype: &str, disk: Arc<dyn crate::block::BlockDev>, read_only: bool) -> Result<Arc<dyn Filesystem>> {
+    mount_disk_owned(fstype, disk, read_only, None)
+}
+
+/// Like [`mount_disk`]; `owner` (uid, gid) becomes the owner of every file
+/// and directory of a FAT32 or exFAT volume, which have no owners of their
+/// own (ext4 keeps the ones on disk). Root owns them otherwise.
+pub fn mount_disk_owned(
+    fstype: &str,
+    disk: Arc<dyn crate::block::BlockDev>,
+    read_only: bool,
+    owner: Option<(u32, u32)>,
+) -> Result<Arc<dyn Filesystem>> {
     match fstype {
-        "fat32" => Ok(Arc::new(fat::FatVolume::mount(disk, read_only)?)),
+        "fat32" => Ok(Arc::new(fat::FatVolume::mount(disk, read_only, owner)?)),
+        "exfat" => Ok(Arc::new(exfat::ExfatVolume::mount(disk, read_only, owner)?)),
         "ext4" => Ok(Arc::new(ext4::Ext4Volume::mount(disk, read_only)?)),
         _ => Err(Errno::InvalidArgument),
     }

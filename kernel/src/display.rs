@@ -250,17 +250,58 @@ pub fn init_gpu(gpu: Arc<VirtioGpu>, footer_right: &str, mode: Option<(u32, u32)
         Some((i, s)) => (i as u32, (s.rect.w, s.rect.h)),
         None => (0, (1024, 768)),
     };
-    let edid = if gpu.has_edid() { gpu.edid(index).map(|e| e.len()).unwrap_or(0) } else { 0 };
-    let (w, h) = mode.unwrap_or(native);
-    let (out, va) = match create_gpu_output(&gpu, index, w, h) {
-        Ok(x) => x,
-        Err(e) => {
-            crate::kprintln!("display: virtio-gpu scanout setup failed: {}", e);
-            return false;
+    let edid = if gpu.has_edid() { gpu.edid(index).ok().filter(|e| e.len() >= osyx_display::edid::BLOCK_LEN) } else { None };
+    let edid_len = edid.as_ref().map(|e| e.len()).unwrap_or(0);
+    let edid = match edid.as_deref().map(osyx_display::Edid::parse) {
+        Some(Ok(edid)) => {
+            let name = edid.name.as_deref().unwrap_or("(unnamed)");
+            let (pw, ph, refresh) = edid.preferred_mode().map(|m| (m.width as u32, m.height as u32, m.refresh_mhz)).unwrap_or((0, 0, 0));
+            crate::kprintln!(
+                "display: EDID {} {} {:04x}: {}x{} cm, {} mode(s), preferred {}x{}@{} Hz, {} extension(s)",
+                edid.vendor(),
+                name,
+                edid.product,
+                edid.width_cm,
+                edid.height_cm,
+                edid.modes.len(),
+                pw,
+                ph,
+                (refresh + 500) / 1000,
+                edid.extensions
+            );
+            Some(edid)
+        }
+        Some(Err(e)) => {
+            crate::kprintln!("display: EDID rejected: {:?}", e);
+            None
+        }
+        None => None,
+    };
+    let mut chosen = mode.or_else(|| {
+        edid.as_ref().and_then(|e| e.preferred_mode()).map(|m| {
+            crate::kprintln!("display: EDID preferred mode {}x{}@{} Hz", m.width, m.height, (m.refresh_mhz + 500) / 1000);
+            (m.width as u32, m.height as u32)
+        })
+    });
+    // Never let a monitor-supplied mode take the output down: retry the
+    // scanout's own size when the preferred mode cannot be set.
+    let (out, va) = loop {
+        let (w, h) = chosen.unwrap_or(native);
+        match create_gpu_output(&gpu, index, w, h) {
+            Ok(x) => break x,
+            Err(e) if mode.is_none() && chosen != Some(native) => {
+                crate::kprintln!("display: mode {}x{} failed ({}); using the scanout mode {}x{}", w, h, e, native.0, native.1);
+                chosen = Some(native);
+            }
+            Err(e) => {
+                crate::kprintln!("display: virtio-gpu scanout setup failed: {}", e);
+                return false;
+            }
         }
     };
+    let (w, h) = chosen.unwrap_or(native);
     crate::kprintln!(
-        "display: virtio-gpu at {}: {} scanout(s), using scanout {} at {}x{} (preferred {}x{}), resource {}, {} KiB backing in {} frames, EDID {} bytes, cursor queue {}",
+        "display: virtio-gpu at {}: {} scanout(s), using scanout {} at {}x{} (preferred {}x{}), resource {}, {} KiB backing in {} frames, EDID {}, cursor queue {}",
         gpu.location,
         gpu.num_scanouts,
         index,
@@ -271,7 +312,7 @@ pub fn init_gpu(gpu: Arc<VirtioGpu>, footer_right: &str, mode: Option<(u32, u32)
         out.resource,
         out.backing.size() / 1024,
         out.backing.pages(),
-        edid,
+        edid_len,
         if gpu.has_cursor() { "yes" } else { "no" }
     );
     let Ok(assets) = Assets::embedded() else { return false };

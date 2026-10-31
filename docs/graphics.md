@@ -58,6 +58,16 @@ keyboard layout (US, Polish) is applied by PRISM.
 framebuffer is mapped write-combining into the caller, one owner at a time),
 `display_release`. When the owner exits the kernel status screen returns.
 
+EDID base blocks and CEA-861 extensions are decoded by the host-tested
+`drivers/display` crate. When the VirtIO-GPU offers an EDID, the kernel logs
+the monitor, its mode count and the preferred mode, and starts the scanout at
+the preferred mode; if the device cannot take it, the scanout's own size is
+used. The `display.mode=WxH` kernel option still overrides both. AMD display
+functions are identified at boot (`kernel/src/drivers/amdgpu.rs`: DCN
+generation for known device IDs and the ATOM header in the VBIOS ROM), but
+native DCN modesetting is not implemented and the GOP framebuffer stays in
+use.
+
 **IPC** (ABI v7): pipes, named-service channels (`channel_listen` is root
 only; messages up to 64 KiB with up to 4 passed handles; per-direction
 bounds of 256 messages / 1 MiB, then `WouldBlock`), shared memory objects,
@@ -131,12 +141,41 @@ on the root file system, search, Enter), the desktop context menu,
 notification bubbles (from any client, the clock, crashed applications) and
 the restart / shut down confirmation (kernel `power`).
 
+### Files
+
+Several files at once: Ctrl+click marks a row, Shift+click or Shift+arrows a
+range, a rubber band over empty space the rows it touches, Ctrl+A all. Copy
+(Ctrl+C), Cut (Ctrl+X), Paste (Ctrl+V; a name that exists becomes
+`name (copy).ext`), Delete (Trash), dragging, Pack (Ctrl+P: one uncompressed
+`.tar`) and Extract here (Ctrl+E) work on the whole selection. Extraction
+reads tar, tar.gz/tgz, zip (stored and deflated, CRC checked), 7z and single
+.gz files into a folder named after the archive; paths that would leave it
+are refused and a failed extraction leaves no folder behind.
+
+A double click opens a file with the program the user chose for its
+extension, else with an installed application that lists it, else by Files
+itself: text and source in the viewer, images and web pages in the default
+browser, archives are extracted. Audio, video and PDF need an application:
+an application says so with `Handles=mp4,mkv,video` in its `.app` file
+(extensions or the kinds `text source html image audio video pdf archive`).
+The right-click menu has "Open with" for every program that can open the
+file (the hex viewer always can) and "Always open .ext with ...", which is
+saved in `~/.config/osyx/openwith.conf` (`mp4=/opt/player`). The logic is in
+`userspace/filekit` (host-tested); the file operations in
+`userspace/desktop/src/fileops.rs`.
+
 AXIS is a first, small version of the shell: built-in commands on
 `os_std::fs` (`ls cat cd mkdir rm mv cp stat ps kill mounts free uptime …`),
 Python-style `name = expr` and `print(...)`, `$name` expansion, and every
 other word runs a program from `/bin`, `/usr/bin`, `/system/bin` with the
-terminal's pipes as its standard streams. Pipelines, redirection, blocks and
-job control are not implemented yet.
+terminal's pipes as its standard streams. `<`, `>` and `>>` redirect the
+standard input and output of a command — built-ins included, using
+`os_std::io::redirect_stdin`/`redirect_stdout` — and `|` connects programs
+and at most one built-in into a pipeline. The built-in stage runs in the
+shell process after the programs around it have started, so waiting for
+output cannot deadlock. `if cond { ... } else { ... }` and
+`for name in words { ... }` group lines; conditions are expressions with
+`==`, `!=`, `<`, `>`, `<=` and `>=`. Still open: job control.
 
 ## Boot
 
@@ -147,7 +186,9 @@ cannot start, init exits and the kernel status screen stays.
 ## Testing
 
 * Host: `drivers/usb` (registers, TRBs, rings, contexts, descriptors, HID
-  reports, malformed input), `graphics/prism-proto`, `graphics/prism-core`
+  reports, malformed input), `drivers/display` (EDID base and CEA-861
+  parsing, checksums, detailed timings, mode selection, truncated and
+  malformed blocks), `graphics/prism-proto`, `graphics/prism-core`
   (blending, clipping, damage, stacking, focus, resizing, input routing,
   protocol validation, disconnect clean-up, limits), `graphics/ui` (layout,
   focus, every widget's behaviour, clipping, icons, dates and time zones).
@@ -192,7 +233,7 @@ own launcher entries. They draw through the same PRISM compositor.
   the toolkit apps redraw whole windows).
 * Popups and notifications are square (no per-pixel alpha in the toolkit
   yet; the protocol supports ARGB buffers).
-* HID: boot-protocol keyboards only; no hubs (devices on root ports only);
+* HID: boot-protocol keyboards; xHCI hubs are supported;
   no isochronous or bulk endpoints; no USB 3 streams.
 * No IOMMU support (none is assumed); DMA buffers are kernel pages.
 * AXIS is minimal (see above); the terminal is a line-mode terminal.

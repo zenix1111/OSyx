@@ -158,7 +158,7 @@ fn default_dacl(uid: u32) -> Vec<u8> {
     security::build_acl(&[(0, 0, 0x1000_0000, user_sid(uid)), (0, 0, 0x1000_0000, sid(5, &[18]))])
 }
 
-fn initial(uid: u32, gid: u32) -> TokenData {
+pub(crate) fn initial(uid: u32, gid: u32) -> TokenData {
     TokenData {
         impersonation: None,
         integrity: if uid == 0 { INTEGRITY_HIGH } else { INTEGRITY_MEDIUM },
@@ -332,7 +332,7 @@ extern "win64" fn GetTokenInformation(h: u64, class: u32, out: *mut u8, size: u3
 
 // ---- opening and duplicating ------------------------------------------------------------
 
-fn new_handle(uid: u32, gid: u32, access: u32, d: TokenData) -> u64 {
+pub(crate) fn new_handle(uid: u32, gid: u32, access: u32, d: TokenData) -> u64 {
     objects::insert(Object::Token(Arc::new(Token { uid, gid, access, state: Arc::new(TokenState { data: Mutex::new(d) }) })))
 }
 

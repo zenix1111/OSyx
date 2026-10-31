@@ -19,17 +19,26 @@ const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
 // ---- heap ---------------------------------------------------------------------
 
-extern "win64" fn RtlAllocateHeap(_heap: u64, flags: u32, size: usize) -> u64 {
+extern "win64" fn RtlAllocateHeap(heap: u64, flags: u32, size: usize) -> u64 {
+    if crate::heaps::is_private(heap) {
+        return crate::heaps::alloc(heap, flags, size);
+    }
     kernel32::heap_alloc(size, flags & HEAP_ZERO_MEMORY != 0).unwrap_or(0)
 }
 
-extern "win64" fn RtlFreeHeap(_heap: u64, _flags: u32, p: u64) -> u8 {
+extern "win64" fn RtlFreeHeap(heap: u64, flags: u32, p: u64) -> u8 {
+    if crate::heaps::is_private(heap) {
+        return u8::from(crate::heaps::free(heap, flags, p) != 0);
+    }
     u8::from(kernel32::heap_free(p))
 }
 
 /// Blocks never grow in place (one allocator, exact-size blocks), so
 /// HEAP_REALLOC_IN_PLACE_ONLY succeeds only when shrinking or equal.
-extern "win64" fn RtlReAllocateHeap(_heap: u64, flags: u32, p: u64, size: usize) -> u64 {
+extern "win64" fn RtlReAllocateHeap(heap: u64, flags: u32, p: u64, size: usize) -> u64 {
+    if crate::heaps::is_private(heap) {
+        return crate::heaps::realloc(heap, flags, p, size);
+    }
     if p == 0 {
         return 0;
     }

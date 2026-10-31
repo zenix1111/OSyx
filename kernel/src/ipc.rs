@@ -147,6 +147,16 @@ pub struct Listener {
 
 static SERVICES: IrqSpinLock<BTreeMap<String, Weak<Listener>>> = IrqSpinLock::new(BTreeMap::new());
 
+/// Anonymous endpoints are never published in the service namespace.
+pub fn pair(pid: u64, uid: u32) -> (Endpoint, Endpoint) {
+    let ch = Arc::new(Channel {
+        sides: IrqSpinLock::new([Side::default(), Side::default()]),
+        waitq: [WaitQueue::new(), WaitQueue::new()],
+        owners: [(pid, uid), (pid, uid)],
+    });
+    (Endpoint { ch: ch.clone(), side: 0 }, Endpoint { ch, side: 1 })
+}
+
 fn check_name(name: &str) -> Result<(), Errno> {
     let ok = !name.is_empty()
         && name.len() <= MAX_SERVICE_NAME

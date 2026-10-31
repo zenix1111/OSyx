@@ -12,6 +12,7 @@ extern crate alloc;
 pub mod mounts;
 pub mod path;
 pub mod perm;
+pub mod sandbox;
 
 pub use mounts::MountTable;
 pub use osyx_abi::{Errno, FileStat};

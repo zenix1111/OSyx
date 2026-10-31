@@ -1,4 +1,4 @@
-//! `winrun` — runs Windows x64 (PE32+) programs on OSyx.
+//! `winrun` — runs Windows x64 (PE32+) and 32-bit (PE32) programs on OSyx.
 //!
 //! `winrun [-v] program.exe [arguments...]` loads the program and the DLLs
 //! it needs through the OSyx PE loader (`osyx-pe-loader`), with OSyx's own
@@ -7,6 +7,10 @@
 //! a Windows-sized stack, runs DLL initialisation and calls the entry
 //! point. The program's exit code is winrun's exit code. A fault in the
 //! program ends only this process.
+//!
+//! A PE32 program is mapped below 4 GiB and entered in compatibility mode
+//! through the 32-bit bridge; winrun itself is linked at 0x4000_0000 so all
+//! of its code stays addressable by 32-bit code.
 
 #![no_std]
 #![no_main]
@@ -22,6 +26,7 @@ macro_rules! export_table {
 
 mod crypt32;
 mod commdlg;
+mod comctl32;
 mod cryptbase;
 mod dbghelp;
 mod error;
@@ -29,6 +34,9 @@ mod eventlog;
 mod exceptions;
 mod files;
 mod fls;
+mod heaps;
+mod ini;
+mod ktm;
 mod iphlpapi;
 mod kernel32;
 mod keyed;
@@ -73,6 +81,8 @@ mod etw;
 mod credman;
 mod accounts;
 mod capi;
+mod bcrypt;
+mod newlibs;
 mod minordlls;
 mod dwmapi;
 mod dwrite;
@@ -80,10 +90,12 @@ mod inherit;
 mod propsys;
 mod pipes;
 mod ws2_32;
+mod wow64;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use os_std::prelude::*;
+use osyx_pe::PeFile;
 
 /// `-v`: the module summary, every thread as it starts, and the loader's
 /// diagnostics. Set once in `main` before anything else runs.
@@ -176,6 +188,10 @@ fn main() -> i32 {
                 return 126;
             }
         }
+        if name == inherit::DIRECT_CHANNEL && inherit::start_direct_service().is_err() {
+            eprintln!("winrun: cannot start direct handle service");
+            return 126;
+        }
     }
     if let Some(i) = env.iter().position(|(k, _)| k == "OSYX_WINRUN_CWD") {
         let (_, dir) = env.remove(i);
@@ -195,7 +211,7 @@ fn main() -> i32 {
     // A Windows profile always has these folders (created at first logon);
     // programs read them without asking for creation.
     if os_sys::stat(if home.is_empty() { "/" } else { home }).is_ok() {
-        for d in ["AppData", "AppData/Roaming", "AppData/Local", "AppData/LocalLow", "AppData/Local/Temp"] {
+        for d in ["AppData", "AppData/Roaming", "AppData/Local", "AppData/LocalLow", "AppData/Local/Temp", "AppData/Local/Microsoft", "AppData/Local/Microsoft/Windows", "AppData/Local/Microsoft/Windows/INetCache", "AppData/Local/Microsoft/Windows/INetCookies", "AppData/Local/Microsoft/Windows/History"] {
             let _ = os_sys::mkdir(&format!("{home}/{d}"), 0o755);
         }
     }
@@ -229,10 +245,43 @@ fn main() -> i32 {
             env.push((String::from(k), String::from(v)));
         }
     }
+    // A 32-bit program reads pointers the runtime hands out (command line,
+    // environment, heap blocks): from here on all memory the runtime maps
+    // must be below 4 GiB, above the program, the bridge arena and winrun.
+    let pe32_bytes = os_std::fs::read(&exe).ok().filter(|b| PeFile::parse_any(b).is_ok_and(|pe| pe.is_pe32()));
+    if pe32_bytes.is_some() {
+        os_sys::set_low_map(0x5000_0000);
+    }
+    let mut std_override = [None; 3];
+    if let Some(i) = env.iter().position(|(k, _)| k == process::STD_HANDLES_ENV) {
+        let (_, spec) = env.remove(i);
+        if spec.len() != 3 || !spec.bytes().all(|b| matches!(b, b'c' | b'n' | b'i')) {
+            eprintln!("winrun: invalid standard handle specification");
+            return 126;
+        }
+        for (i, b) in spec.bytes().enumerate() {
+            std_override[i] = match b { b'n' => Some(0), b'i' => Some(u64::MAX), _ => None };
+        }
+    }
     let env_strings: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    kernel32::init_process(&exe, &cmd, env);
+    kernel32::init_process(&exe, &cmd, env, std_override);
     winsta::clear_markers();
     exceptions::install();
+    // A 32-bit image cannot start through the PE32+ path: it is linked at
+    // 0x400000, must stay below 4 GiB and is entered in compatibility mode
+    // through the bridge. Read the file to tell the widths apart; the PE32+
+    // path below reads it again exactly as before.
+    if let Some(bytes) = pe32_bytes {
+        let mut args = args.clone();
+        if let Some(a) = args.first_mut() {
+            *a = exe.clone();
+        }
+        if let Err(e) = loader::run_pe32(bytes, &args, &cmd, &env_strings) {
+            eprintln!("winrun: {e}");
+            return 126;
+        }
+        return 0;
+    }
     let started = match loader::start(&exe, &cmd, &env_strings) {
         Ok(s) => s,
         Err(e) => {

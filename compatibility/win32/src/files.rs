@@ -254,8 +254,40 @@ extern "win64" fn CopyFile2(from: *const u16, to: *const u16, params: *const u8)
     }
 }
 
-extern "win64" fn CreateHardLinkW(_link: *const u16, _target: *const u16, _sa: u64) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+/// CreateHardLinkW(new, existing, reserved): a second name for a file.
+/// Errors are those of Windows: an existing target name is
+/// ERROR_ALREADY_EXISTS, a missing source ERROR_FILE_NOT_FOUND, a directory
+/// source ERROR_ACCESS_DENIED, another volume ERROR_NOT_SAME_DEVICE and a
+/// volume without hard links (FAT) ERROR_INVALID_FUNCTION.
+extern "win64" fn CreateHardLinkW(new: *const u16, existing: *const u16, sa: u64) -> i32 {
+    if let Err(e) = crate::security::validate_attributes(sa) {
+        return fail(e, 0);
+    }
+    // SAFETY: NUL-terminated names.
+    let (Some(new), Some(existing)) = (unsafe { kernel32::sw(new) }, unsafe { kernel32::sw(existing) }) else {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let src = match kernel32::locate(&existing) {
+        Ok((p, true)) => p,
+        Ok((_, false)) => return fail(ERROR_FILE_NOT_FOUND, 0),
+        Err(e) => return fail(e, 0),
+    };
+    let (dst, exists) = match kernel32::locate(&new) {
+        Ok(x) => x,
+        Err(e) => return fail(e, 0),
+    };
+    if exists {
+        return fail(ERROR_ALREADY_EXISTS, 0);
+    }
+    if os_sys::lstat(&src).is_ok_and(|s| s.kind == osyx_abi::KIND_DIR) {
+        return fail(ERROR_ACCESS_DENIED, 0);
+    }
+    match os_sys::link(&src, &dst) {
+        Ok(()) => 1,
+        Err(osyx_abi::Errno::NotSupported) => fail(ERROR_INVALID_FUNCTION, 0),
+        Err(osyx_abi::Errno::NotFound) => fail(ERROR_PATH_NOT_FOUND, 0),
+        Err(e) => fail(errno_to_win32(e), 0),
+    }
 }
 
 const SYMBOLIC_LINK_FLAG_DIRECTORY: u32 = 0x1;

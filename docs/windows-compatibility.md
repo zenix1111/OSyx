@@ -198,11 +198,11 @@ GetWindow(GW_OWNER) and GetAncestor(GA_ROOTOWNER). Native child controls
 inside a parent client area remain unsupported.
 
 DirectWrite exposes the original IDWriteFactory font/file/face APIs,
-custom font loaders, metrics, character maps, TrueType outlines and glyph
+custom font loaders, metrics, character maps, TrueType, CFF and default-instance CFF2 outlines and glyph
 coverage rasterization. The bundled unmodified Lato and KaTeX fonts and
 their SIL OFL license are in `graphics/assets/fonts/windows`; registry
 substitutes map common Windows family names to them. There is no hinting,
-ClearType subpixel filtering, CFF outline rendering, DirectWrite text
+ClearType subpixel filtering, custom variation-axis selection, DirectWrite text
 layout/analysis or newer factory interface support. Existing GDI atlas
 fonts remain separate from these DirectWrite font faces.
 

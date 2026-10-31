@@ -122,11 +122,84 @@ extern "win64" fn SetupDiDestroyDeviceInfoList(set: u64) -> i32 {
     }
 }
 
+extern "win64" fn SetupDiEnumDeviceInterfaces(set: u64, _dev: u64, guid: u64, _index: u32, data: u64) -> i32 {
+    if guid == 0 || data == 0 || unsafe { teb::get::<u32>(data, 0) } != 32 {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    if !SETS.lock().unwrap().contains_key(&set) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    fail(ERROR_NO_MORE_ITEMS, 0)
+}
+
+extern "win64" fn SetupDiGetDeviceInterfaceDetailW(
+    set: u64,
+    iface_data: u64,
+    _detail: u64,
+    _detail_size: u32,
+    _required: *mut u32,
+    _dev_data: u64,
+) -> i32 {
+    if iface_data == 0 || unsafe { teb::get::<u32>(iface_data, 0) } != 32 {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    if !SETS.lock().unwrap().contains_key(&set) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    fail(ERROR_NO_MORE_ITEMS, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn SetupDiGetDevicePropertyW(
+    set: u64,
+    data: u64,
+    key: u64,
+    prop_type: *mut u32,
+    _buf: *mut u8,
+    _size: u32,
+    _required: *mut u32,
+    flags: u32,
+) -> i32 {
+    if data == 0 || unsafe { teb::get::<u32>(data, 0) } != 32 || key == 0 || prop_type.is_null() || flags != 0 {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    let sets = SETS.lock().unwrap();
+    let Some(list) = sets.get(&set) else {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    };
+    let index = unsafe { teb::get::<u64>(data, 24) } as usize;
+    if index >= list.len() {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    fail(ERROR_NOT_FOUND, 0)
+}
+
+extern "win64" fn SetupDiOpenDevRegKey(
+    set: u64,
+    data: u64,
+    _scope: u32,
+    _hw_profile: u32,
+    _key_type: u32,
+    _sam: u32,
+) -> u64 {
+    if data == 0 || unsafe { teb::get::<u32>(data, 0) } != 32 {
+        return fail(ERROR_INVALID_PARAMETER, u64::MAX);
+    }
+    if !SETS.lock().unwrap().contains_key(&set) {
+        return fail(ERROR_INVALID_HANDLE, u64::MAX);
+    }
+    fail(ERROR_FILE_NOT_FOUND, u64::MAX)
+}
+
 pub fn exports() -> Vec<(&'static str, u64)> {
     export_table![
         SetupDiGetClassDevsW,
         SetupDiEnumDeviceInfo,
+        SetupDiEnumDeviceInterfaces,
+        SetupDiGetDeviceInterfaceDetailW,
         SetupDiGetDeviceRegistryPropertyW,
+        SetupDiGetDevicePropertyW,
+        SetupDiOpenDevRegKey,
         SetupDiDestroyDeviceInfoList
     ]
 }

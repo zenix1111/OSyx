@@ -19,22 +19,29 @@ const INVALID_SOCKET: u64 = u64::MAX;
 const SOCKET_ERROR: i32 = -1;
 const AF_INET: u16 = 2;
 const AF_INET6: i32 = 23;
+const AI_PASSIVE: i32 = 1;
+const AI_NUMERICHOST: i32 = 4;
+const AI_NUMERICSERV: i32 = 8;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
 const SOL_SOCKET: i32 = 0xFFFF;
 const SO_REUSEADDR: i32 = 0x4;
 const SO_KEEPALIVE: i32 = 0x8;
+const SO_LINGER: i32 = 0x80;
 const SO_BROADCAST: i32 = 0x20;
 const SO_SNDTIMEO: i32 = 0x1005;
 const SO_RCVTIMEO: i32 = 0x1006;
 const SO_ERROR: i32 = 0x1007;
 const SO_TYPE: i32 = 0x1008;
 const IPPROTO_TCP: i32 = 6;
+const IPPROTO_UDP: i32 = 17;
 const TCP_NODELAY: i32 = 1;
 const FIONBIO: u32 = 0x8004_667E;
 const MSG_PEEK: i32 = 2;
+const MSG_WAITALL: i32 = 8;
 
 const WSAEINTR: u32 = 10004;
+const WSAEACCES: u32 = 10013;
 const WSAEFAULT: u32 = 10014;
 const WSAEINVAL: u32 = 10022;
 const WSAEMFILE: u32 = 10024;
@@ -52,6 +59,7 @@ const WSAECONNRESET: u32 = 10054;
 const WSAENOBUFS: u32 = 10055;
 const WSAEISCONN: u32 = 10056;
 const WSAENOTCONN: u32 = 10057;
+const WSAESHUTDOWN: u32 = 10058;
 const WSAETIMEDOUT: u32 = 10060;
 const WSAECONNREFUSED: u32 = 10061;
 const WSAEHOSTUNREACH: u32 = 10065;
@@ -61,6 +69,7 @@ const WSATRY_AGAIN: u32 = 11002;
 const WSAVERNOTSUPPORTED: u32 = 10092;
 const WSANO_DATA: u32 = 11004;
 const WSAEINVALIDPROVIDER: u32 = 10105;
+const WSATYPE_NOT_FOUND: u32 = 10109;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 fn wsa(e: Errno) -> u32 {
@@ -79,6 +88,7 @@ fn wsa(e: Errno) -> u32 {
         Errno::NameNotFound => WSAHOST_NOT_FOUND,
         Errno::DnsFailure => WSATRY_AGAIN,
         Errno::Interrupted => WSAEINTR,
+        Errno::PermissionDenied => WSAEACCES,
         Errno::Fault => WSAEFAULT,
         Errno::NoMemory => WSAENOBUFS,
         Errno::TooManyHandles => WSAEMFILE,
@@ -102,6 +112,17 @@ struct Sock {
     fd: u64,
     stream: bool,
     nonblocking: bool,
+    /// SO_LINGER seconds; zero means off.
+    linger: u16,
+    /// SO_RCVTIMEO/SO_SNDTIMEO in milliseconds; zero means forever.
+    recv_timeout: u32,
+    send_timeout: u32,
+    /// SO_REUSEADDR/SO_KEEPALIVE, accepted as no-ops but reported back.
+    reuseaddr: bool,
+    keepalive: bool,
+    /// `shutdown(SD_RECEIVE)` / `shutdown(SD_SEND)` were called.
+    read_shutdown: bool,
+    write_shutdown: bool,
 }
 
 static SOCKETS: Mutex<BTreeMap<u64, Sock>> = Mutex::new(BTreeMap::new());
@@ -122,6 +143,15 @@ fn started() -> bool {
 /// The kernel socket of SOCKET `s`.
 fn fd(s: u64) -> Result<(u64, bool), u32> {
     socket_state(s).map(|s| (s.fd, s.stream))
+}
+
+/// Reject I/O after the matching half of the socket was shut down.
+fn check_shutdown(s: u64, read: bool) -> Result<(), u32> {
+    let st = socket_state(s)?;
+    if (read && st.read_shutdown) || (!read && st.write_shutdown) {
+        return Err(WSAESHUTDOWN);
+    }
+    Ok(())
 }
 
 fn socket_state(s: u64) -> Result<Sock, u32> {
@@ -228,7 +258,18 @@ extern "win64" fn socket(af: i32, kind: i32, proto: i32) -> u64 {
             let mut n = NEXT.lock().unwrap();
             let s = *n;
             *n += 4;
-            SOCKETS.lock().unwrap().insert(s, Sock { fd, stream, nonblocking: false });
+            SOCKETS.lock().unwrap().insert(s, Sock {
+                fd,
+                stream,
+                nonblocking: false,
+                linger: 0,
+                recv_timeout: 0,
+                send_timeout: 0,
+                reuseaddr: false,
+                keepalive: false,
+                read_shutdown: false,
+                write_shutdown: false,
+            });
             s
         }
         Err(e) => err(wsa(e), INVALID_SOCKET),
@@ -287,6 +328,11 @@ extern "win64" fn accept(s: u64, addr: *mut u8, len: *mut i32) -> u64 {
         if !listener.stream {
             return Err(WSAEOPNOTSUPP);
         }
+        // A caller-supplied address needs room for sockaddr_in; Windows
+        // rejects the call before taking a pending connection.
+        if !addr.is_null() && (len.is_null() || unsafe { *len } < 16) {
+            return Err(WSAEFAULT);
+        }
         let (nfd, peer) = os_sys::sock_accept(listener.fd).map_err(wsa)?;
         // Winsock accept inherits the listener's blocking mode. OSyx's
         // native accept creates a blocking endpoint, so apply it here.
@@ -300,28 +346,49 @@ extern "win64" fn accept(s: u64, addr: *mut u8, len: *mut i32) -> u64 {
         let mut n = NEXT.lock().unwrap();
         let ns = *n;
         *n += 4;
-        SOCKETS.lock().unwrap().insert(ns, Sock { fd: nfd, stream: true, nonblocking: listener.nonblocking });
+        SOCKETS.lock().unwrap().insert(ns, Sock {
+            fd: nfd,
+            stream: true,
+            nonblocking: listener.nonblocking,
+            linger: 0,
+            recv_timeout: 0,
+            send_timeout: 0,
+            reuseaddr: false,
+            keepalive: false,
+            read_shutdown: false,
+            write_shutdown: false,
+        });
         Ok(ns)
     })();
     r.unwrap_or_else(|e| err(e, INVALID_SOCKET))
 }
 
 fn flags(f: i32) -> Result<u64, u32> {
-    if f & !MSG_PEEK != 0 {
+    if f & !(MSG_PEEK | MSG_WAITALL) != 0 {
         return Err(WSAEOPNOTSUPP);
     }
-    Ok(if f & MSG_PEEK != 0 { net::MSG_PEEK } else { 0 })
+    let mut fl = 0;
+    if f & MSG_PEEK != 0 {
+        fl |= net::MSG_PEEK;
+    }
+    if f & MSG_WAITALL != 0 {
+        fl |= net::MSG_WAITALL;
+    }
+    Ok(fl)
 }
 
 extern "win64" fn send(s: u64, buf: *const u8, len: i32, f: i32) -> i32 {
     trace_io(format_args!("send({s:#x}, {len}) begin"));
     let r = (|| {
         let (fd, _) = fd(s)?;
+        check_shutdown(s, false)?;
         if f != 0 {
             return Err(WSAEOPNOTSUPP);
         }
-        // SAFETY: the caller's buffer of `len` bytes.
-        let data = unsafe { core::slice::from_raw_parts(buf, len.max(0) as usize) };
+        // SAFETY: the caller's buffer of `len` bytes; a zero-length send may
+        // pass a NULL pointer, which never becomes a real slice.
+        let (n, p) = (len.max(0) as usize, if len > 0 { buf } else { core::ptr::NonNull::dangling().as_ptr() });
+        let data = unsafe { core::slice::from_raw_parts(p, n) };
         os_sys::sock_send(fd, data, None, 0).map_err(wsa)
     })();
     trace_io(format_args!("send({s:#x}) -> {r:?}"));
@@ -331,12 +398,15 @@ extern "win64" fn send(s: u64, buf: *const u8, len: i32, f: i32) -> i32 {
 extern "win64" fn sendto(s: u64, buf: *const u8, len: i32, f: i32, to: *const u8, tolen: i32) -> i32 {
     let r = (|| {
         let (fd, _) = fd(s)?;
+        check_shutdown(s, false)?;
         if f != 0 {
             return Err(WSAEOPNOTSUPP);
         }
         let a = if to.is_null() { None } else { Some(read_addr(to, tolen)?) };
-        // SAFETY: the caller's buffer of `len` bytes.
-        let data = unsafe { core::slice::from_raw_parts(buf, len.max(0) as usize) };
+        // SAFETY: the caller's buffer of `len` bytes; a zero-length send may
+        // pass a NULL pointer, which never becomes a real slice.
+        let (n, p) = (len.max(0) as usize, if len > 0 { buf } else { core::ptr::NonNull::dangling().as_ptr() });
+        let data = unsafe { core::slice::from_raw_parts(p, n) };
         os_sys::sock_send(fd, data, a.as_ref(), 0).map_err(wsa)
     })();
     r.map_or_else(|e| err(e, SOCKET_ERROR), |n| n as i32)
@@ -349,12 +419,25 @@ extern "win64" fn recv(s: u64, buf: *mut u8, len: i32, f: i32) -> i32 {
 extern "win64" fn recvfrom(s: u64, buf: *mut u8, len: i32, f: i32, from: *mut u8, fromlen: *mut i32) -> i32 {
     trace_io(format_args!("recv({s:#x}, {len}) begin"));
     let r = (|| {
-        let (fd, _) = fd(s)?;
+        let (fd, stream) = fd(s)?;
+        check_shutdown(s, true)?;
+        // Reject a too-small peer address buffer before the datagram is
+        // consumed, as Windows does.
+        if !from.is_null() && (fromlen.is_null() || unsafe { *fromlen } < 16) {
+            return Err(WSAEFAULT);
+        }
         let fl = flags(f)?;
-        // SAFETY: the caller's buffer of `len` bytes.
-        let data = unsafe { core::slice::from_raw_parts_mut(buf, len.max(0) as usize) };
+        // SAFETY: the caller's buffer of `len` bytes; a zero-length receive
+        // may pass a NULL pointer, which never becomes a real slice.
+        let (n, p) = (len.max(0) as usize, if len > 0 { buf } else { core::ptr::NonNull::dangling().as_ptr() });
+        let data = unsafe { core::slice::from_raw_parts_mut(p, n) };
         let (n, peer) = os_sys::sock_recv(fd, data, fl).map_err(wsa)?;
         write_addr(&peer, from, fromlen);
+        // A datagram longer than the buffer was truncated; the bytes are
+        // delivered, but Winsock reports the original size.
+        if datagram_truncated(fd, stream, n)? {
+            return Err(WSAEMSGSIZE);
+        }
         Ok(n)
     })();
     trace_io(format_args!("recv({s:#x}) -> {r:?}"));
@@ -364,11 +447,20 @@ extern "win64" fn recvfrom(s: u64, buf: *mut u8, len: i32, f: i32, from: *mut u8
 extern "win64" fn shutdown(s: u64, how: i32) -> i32 {
     result((|| {
         let (fd, _) = fd(s)?;
-        match how {
-            0 => Ok(()), // SD_RECEIVE: nothing to tell the peer
-            1 | 2 => os_sys::sock_ctl(fd, net::ctl::SHUTDOWN_WRITE, 0).map(|_| ()).map_err(wsa),
-            _ => Err(WSAEINVAL),
+        let (read, write) = match how {
+            0 => (true, false),       // SD_RECEIVE
+            1 => (false, true),       // SD_SEND
+            2 => (true, true),        // SD_BOTH
+            _ => return Err(WSAEINVAL),
+        };
+        if write {
+            os_sys::sock_ctl(fd, net::ctl::SHUTDOWN_WRITE, 0).map_err(wsa)?;
         }
+        if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+            sock.read_shutdown |= read;
+            sock.write_shutdown |= write;
+        }
+        Ok(())
     })())
 }
 
@@ -387,28 +479,80 @@ extern "win64" fn setsockopt(s: u64, level: i32, name: i32, val: *const u8, len:
         };
         match (level, name) {
             (SOL_SOCKET, SO_RCVTIMEO) => {
-                os_sys::sock_ctl(fd, net::ctl::RECV_TIMEOUT, int()? as u64 * 1_000_000).map(|_| ()).map_err(wsa)
+                let ms = int()?;
+                os_sys::sock_ctl(fd, net::ctl::RECV_TIMEOUT, ms as u64 * 1_000_000).map_err(wsa)?;
+                if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    sock.recv_timeout = ms;
+                }
+                Ok(())
             }
             (SOL_SOCKET, SO_SNDTIMEO) => {
-                os_sys::sock_ctl(fd, net::ctl::SEND_TIMEOUT, int()? as u64 * 1_000_000).map(|_| ()).map_err(wsa)
+                let ms = int()?;
+                os_sys::sock_ctl(fd, net::ctl::SEND_TIMEOUT, ms as u64 * 1_000_000).map_err(wsa)?;
+                if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    sock.send_timeout = ms;
+                }
+                Ok(())
             }
             (SOL_SOCKET, SO_BROADCAST) => {
                 os_sys::sock_ctl(fd, net::ctl::BROADCAST, (int()? != 0) as u64).map(|_| ()).map_err(wsa)
             }
-            // OSyx lets a port be bound again once its old connection is
-            // gone, and does not delay small segments: both are the default.
-            (SOL_SOCKET, SO_REUSEADDR) | (IPPROTO_TCP, TCP_NODELAY) => int().map(|_| ()),
+            (SOL_SOCKET, SO_REUSEADDR) => {
+                let on = int()? != 0;
+                if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    sock.reuseaddr = on;
+                }
+                Ok(())
+            }
+            (SOL_SOCKET, SO_KEEPALIVE) => {
+                let on = int()? != 0;
+                if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    sock.keepalive = on;
+                }
+                Ok(())
+            }
+            (IPPROTO_TCP, TCP_NODELAY) => int().map(|_| ()),
+            // Linger 0 closes abortively, which the kernel can do; a positive
+            // linger only records the value (close never leaves data behind).
+            (SOL_SOCKET, SO_LINGER) => {
+                if val.is_null() || len < 4 {
+                    return Err(WSAEFAULT);
+                }
+                // SAFETY: the caller's struct linger { u16 l_onoff, l_linger }.
+                let (onoff, linger) = unsafe {
+                    (core::ptr::read_unaligned(val as *const u16), core::ptr::read_unaligned((val as *const u16).add(1)))
+                };
+                let abortive = onoff != 0 && linger == 0;
+                os_sys::sock_ctl(fd, net::ctl::RESET_ON_CLOSE, abortive as u64).map_err(wsa)?;
+                if let Some(sock) = SOCKETS.lock().unwrap().get_mut(&s) {
+                    sock.linger = if onoff != 0 { linger } else { 0 };
+                }
+                Ok(())
+            }
             _ => Err(WSAENOPROTOOPT),
         }
     })())
 }
 
-/// The options OSyx can report: the socket type, the pending error (OSyx
-/// reports errors on the failing call, so none is ever pending) and the
-/// fixed behaviours setsockopt accepts.
+/// The options OSyx can report: the socket type, the pending connect error
+/// (a failed non-blocking connect is otherwise only visible on the next
+/// call) and the fixed behaviours setsockopt accepts.
 extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *mut i32) -> i32 {
     result((|| {
-        let (_, stream) = fd(s)?;
+        let st = socket_state(s)?;
+        let stream = st.stream;
+        if (level, name) == (SOL_SOCKET, SO_LINGER) {
+            // SAFETY: the caller's value buffer of `*len` bytes.
+            unsafe {
+                if val.is_null() || len.is_null() || *len < 4 {
+                    return Err(WSAEFAULT);
+                }
+                core::ptr::write_unaligned(val as *mut u16, (st.linger != 0) as u16);
+                core::ptr::write_unaligned((val as *mut u16).add(1), st.linger);
+                *len = 4;
+            }
+            return Ok(());
+        }
         let v: u32 = match (level, name) {
             (SOL_SOCKET, SO_TYPE) => {
                 if stream {
@@ -417,7 +561,16 @@ extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *
                     SOCK_DGRAM as u32
                 }
             }
-            (SOL_SOCKET, SO_ERROR | SO_REUSEADDR | SO_KEEPALIVE) => 0,
+            // A failed non-blocking connect reports its failure through
+            // SO_ERROR, which also clears it.
+            (SOL_SOCKET, SO_ERROR) => {
+                let code = os_sys::sock_ctl(st.fd, net::ctl::ERROR, 0).unwrap_or(0);
+                Errno::from_raw(code).map_or(0, wsa)
+            }
+            (SOL_SOCKET, SO_REUSEADDR) => st.reuseaddr as u32,
+            (SOL_SOCKET, SO_KEEPALIVE) => st.keepalive as u32,
+            (SOL_SOCKET, SO_RCVTIMEO) => st.recv_timeout,
+            (SOL_SOCKET, SO_SNDTIMEO) => st.send_timeout,
             (IPPROTO_TCP, TCP_NODELAY) if stream => 1,
             _ => return Err(WSAENOPROTOOPT),
         };
@@ -436,13 +589,23 @@ extern "win64" fn getsockopt(s: u64, level: i32, name: i32, val: *mut u8, len: *
 extern "win64" fn ioctlsocket(s: u64, cmd: u32, arg: *mut u32) -> i32 {
     result((|| {
         let (fd, _) = fd(s)?;
-        if cmd != FIONBIO || arg.is_null() {
-            return Err(WSAEINVAL);
+        if arg.is_null() {
+            return Err(WSAEFAULT);
         }
-        // SAFETY: the caller's argument.
-        let on = unsafe { *arg } != 0;
-        os_sys::sock_ctl(fd, net::ctl::NONBLOCK, on as u64).map_err(wsa)?;
-        SOCKETS.lock().unwrap().get_mut(&s).ok_or(WSAENOTSOCK)?.nonblocking = on;
+        match cmd {
+            FIONBIO => {
+                // SAFETY: the caller's argument.
+                let on = unsafe { *arg } != 0;
+                os_sys::sock_ctl(fd, net::ctl::NONBLOCK, on as u64).map_err(wsa)?;
+                SOCKETS.lock().unwrap().get_mut(&s).ok_or(WSAENOTSOCK)?.nonblocking = on;
+            }
+            FIONREAD => {
+                let n = os_sys::sock_ctl(fd, net::ctl::AVAILABLE, 0).map_err(wsa)?;
+                // SAFETY: the caller's 4-byte out argument.
+                unsafe { core::ptr::write_unaligned(arg, n as u32) };
+            }
+            _ => return Err(WSAEINVAL),
+        }
         Ok(())
     })())
 }
@@ -599,6 +762,27 @@ extern "win64" fn gethostbyaddr(addr: *const u8, len: i32, kind: i32) -> u64 {
 /// The protocols of Windows' default etc\protocol that OSyx implements.
 const PROTOCOLS: [(&str, i16); 4] = [("ip", 0), ("icmp", 1), ("tcp", 6), ("udp", 17)];
 
+/// Common named services of Windows' default etc\services.
+const SERVICES: [(&str, u16); 9] = [
+    ("ftp", 21),
+    ("ssh", 22),
+    ("smtp", 25),
+    ("domain", 53),
+    ("http", 80),
+    ("pop3", 110),
+    ("ntp", 123),
+    ("imap", 143),
+    ("https", 443),
+];
+
+/// The port a decimal string or a known service name stands for.
+fn service_port(service: &str) -> Option<u16> {
+    match service.parse() {
+        Ok(p) => Some(p),
+        Err(_) => SERVICES.iter().find(|(n, _)| n.eq_ignore_ascii_case(service)).map(|&(_, p)| p),
+    }
+}
+
 /// protoent (x64): p_name, p_aliases, p_proto (i16), in a per-thread buffer.
 fn protoent(name: &str, proto: i16) -> u64 {
     let buf = thread_buffer(2, 64);
@@ -641,7 +825,9 @@ extern "win64" fn getprotobynumber(number: i32) -> u64 {
 
 extern "win64" fn gethostname(buf: *mut u8, len: i32) -> i32 {
     let name = host_name();
-    if buf.is_null() || (len as usize) < name.len() + 1 {
+    // A signed length: casting a negative one would look large and let the
+    // copy run past a tiny caller buffer.
+    if buf.is_null() || len <= 0 || (len as usize) < name.len() + 1 {
         return err(WSAEFAULT, SOCKET_ERROR);
     }
     // SAFETY: the caller's buffer holds the name and its NUL.
@@ -658,17 +844,16 @@ extern "win64" fn getaddrinfo(node: *const u8, service: *const u8, hints: *const
     if !started() {
         return WSANOTINITIALISED as i32;
     }
+    if res.is_null() {
+        return WSAEFAULT as i32;
+    }
     // SAFETY: NULL or NUL-terminated strings.
     let (n, svc) = unsafe { (crate::path::ansi_to_string(node), crate::path::ansi_to_string(service)) };
-    let port: u16 = match svc.as_deref().map(str::parse) {
-        None => 0,
-        Some(Ok(p)) => p,
-        Some(Err(_)) => return WSATRY_AGAIN as i32, // named services: not supported
-    };
-    let (mut socktype, mut proto) = (0i32, 0i32);
+    let (mut flags, mut socktype, mut proto) = (0i32, 0i32, 0i32);
     if !hints.is_null() {
         // SAFETY: the caller's ADDRINFOA hints.
         unsafe {
+            flags = teb::get(hints as u64, 0);
             let family: i32 = teb::get(hints as u64, 4);
             if family != 0 && family != AF_INET as i32 {
                 return WSAEAFNOSUPPORT as i32;
@@ -677,11 +862,37 @@ extern "win64" fn getaddrinfo(node: *const u8, service: *const u8, hints: *const
             proto = teb::get(hints as u64, 12);
         }
     }
+    if flags & AI_NUMERICSERV != 0 && svc.as_deref().is_some_and(|s| s.parse::<u16>().is_err()) {
+        // EAI_NONAME: the service had to be a number.
+        return WSAHOST_NOT_FOUND as i32;
+    }
+    let port: u16 = match svc.as_deref() {
+        None => 0,
+        Some(s) => match service_port(s) {
+            Some(p) => p,
+            // EAI_SERVICE: the name is known to be a service, it just is not one.
+            None => return WSATYPE_NOT_FOUND as i32,
+        },
+    };
+    // No type means the common TCP stream; the protocol follows from it.
+    if socktype == 0 {
+        socktype = SOCK_STREAM;
+    }
+    if proto == 0 {
+        proto = if socktype == SOCK_DGRAM { IPPROTO_UDP } else { IPPROTO_TCP };
+    }
     let addrs = match n {
+        // AI_NUMERICHOST: never fall back to a name lookup.
+        Some(n) if flags & AI_NUMERICHOST != 0 => match parse_ipv4(&n) {
+            Some(a) => alloc::vec![a],
+            None => return WSAHOST_NOT_FOUND as i32,
+        },
         Some(n) => match resolve(&n) {
             Ok(a) => a,
             Err(e) => return e as i32,
         },
+        // AI_PASSIVE asks for the wildcard address a server can bind.
+        None if flags & AI_PASSIVE != 0 => alloc::vec![[0, 0, 0, 0]],
         None => alloc::vec![[127, 0, 0, 1]],
     };
     let mut head = 0u64;
@@ -732,7 +943,7 @@ extern "win64" fn WSASocketW(af: i32, kind: i32, proto: i32, info: *const u8, gr
 
 const FIONREAD: u32 = 0x4004_667F;
 
-/// WSAIoctl: FIONBIO only, synchronously. Extension functions
+/// WSAIoctl: FIONBIO and FIONREAD, synchronously. Extension functions
 /// (SIO_GET_EXTENSION_FUNCTION_POINTER: ConnectEx, AcceptEx, ...) need
 /// overlapped I/O and are reported unsupported, so callers fall back.
 #[allow(clippy::too_many_arguments)]
@@ -741,18 +952,18 @@ extern "win64" fn WSAIoctl(
     code: u32,
     input: *const u8,
     in_len: u32,
-    _output: *mut u8,
-    _out_len: u32,
+    output: *mut u8,
+    out_len: u32,
     returned: *mut u32,
     overlapped: *mut u8,
     completion: u64,
 ) -> i32 {
     result((|| {
-        fd(s)?;
+        let (fd, _) = fd(s)?;
         if !overlapped.is_null() || completion != 0 {
             return Err(WSAEOPNOTSUPP);
         }
-        match code {
+        let written = match code {
             FIONBIO => {
                 if input.is_null() || in_len < 4 {
                     return Err(WSAEFAULT);
@@ -762,16 +973,225 @@ extern "win64" fn WSAIoctl(
                 if ioctlsocket(s, FIONBIO, &mut v) != 0 {
                     return Err(teb::last_error());
                 }
+                0
             }
-            FIONREAD => return Err(WSAEOPNOTSUPP),
+            FIONREAD => {
+                if output.is_null() || out_len < 4 {
+                    return Err(WSAEFAULT);
+                }
+                let n = os_sys::sock_ctl(fd, net::ctl::AVAILABLE, 0).map_err(wsa)?;
+                // SAFETY: the caller's 4-byte output buffer.
+                unsafe { core::ptr::write_unaligned(output as *mut u32, n as u32) };
+                4
+            }
             _ => return Err(WSAEINVAL),
-        }
+        };
         if !returned.is_null() {
             // SAFETY: the caller's out count.
-            unsafe { *returned = 0 };
+            unsafe { *returned = written };
         }
         Ok(())
     })())
+}
+
+/// x64 WSABUF entries: ULONG len, four bytes of padding, CHAR *buf.
+fn wsa_bufs(bufs: *const u8, count: u32) -> Result<Vec<(u32, u64)>, u32> {
+    if count > 0 && bufs.is_null() {
+        return Err(WSAEFAULT);
+    }
+    let base = bufs as u64;
+    let mut parts = Vec::with_capacity(count as usize);
+    for i in 0..count as u64 {
+        let off = (i * 16) as usize;
+        // SAFETY: the caller's WSABUF array.
+        let (len, p) = unsafe { (teb::get::<u32>(base, off), teb::get::<u64>(base, off + 8)) };
+        if len > 0 && p == 0 {
+            return Err(WSAEFAULT);
+        }
+        parts.push((len, p));
+    }
+    Ok(parts)
+}
+
+/// The WSABUFs read as one contiguous buffer.
+fn wsa_gather(bufs: *const u8, count: u32) -> Result<Vec<u8>, u32> {
+    let mut data = Vec::new();
+    for (len, p) in wsa_bufs(bufs, count)? {
+        // A zero-length entry may carry a NULL pointer.
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: the caller's WSABUF of `len` bytes.
+        data.extend_from_slice(unsafe { core::slice::from_raw_parts(p as *const u8, len as usize) });
+    }
+    Ok(data)
+}
+
+/// One receive scattered over the WSABUFs; returns the byte count, peer and
+/// whether the datagram was longer than the buffers.
+fn wsa_receive(fd: u64, bufs: *const u8, count: u32, fl: u64, stream: bool) -> Result<(usize, SockAddr, bool), u32> {
+    let parts = wsa_bufs(bufs, count)?;
+    let total: usize = parts.iter().map(|p| p.0 as usize).sum();
+    let mut data = alloc::vec![0u8; total];
+    let (n, from) = os_sys::sock_recv(fd, &mut data, fl).map_err(wsa)?;
+    let truncated = datagram_truncated(fd, stream, n)?;
+    let mut done = 0;
+    for (len, p) in parts {
+        let take = (len as usize).min(n - done);
+        if take == 0 {
+            continue;
+        }
+        // SAFETY: the caller's WSABUF of `len` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), p as *mut u8, take) };
+        done += take;
+    }
+    Ok((n, from, truncated))
+}
+
+/// WSASend: gathers the WSABUFs into one stream write or datagram.
+/// Completion ports are not offered, so only the synchronous form works.
+extern "win64" fn WSASend(s: u64, bufs: *const u8, count: u32, sent: *mut u32, f: u32, overlapped: *mut u8, completion: u64) -> i32 {
+    let r = (|| {
+        let (fd, _) = fd(s)?;
+        check_shutdown(s, false)?;
+        if f != 0 || !overlapped.is_null() || completion != 0 {
+            return Err(WSAEOPNOTSUPP);
+        }
+        let data = wsa_gather(bufs, count)?;
+        os_sys::sock_send(fd, &data, None, 0).map_err(wsa)
+    })();
+    match r {
+        Ok(n) => {
+            if !sent.is_null() {
+                // SAFETY: the caller's out count.
+                unsafe { *sent = n as u32 };
+            }
+            0
+        }
+        Err(e) => err(e, SOCKET_ERROR),
+    }
+}
+
+/// WSASendTo: like WSASend, with the destination of a datagram.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn WSASendTo(
+    s: u64,
+    bufs: *const u8,
+    count: u32,
+    sent: *mut u32,
+    f: u32,
+    to: *const u8,
+    tolen: i32,
+    overlapped: *mut u8,
+    completion: u64,
+) -> i32 {
+    let r = (|| {
+        let (fd, _) = fd(s)?;
+        check_shutdown(s, false)?;
+        if f != 0 || !overlapped.is_null() || completion != 0 {
+            return Err(WSAEOPNOTSUPP);
+        }
+        let to = if to.is_null() { None } else { Some(read_addr(to, tolen)?) };
+        let data = wsa_gather(bufs, count)?;
+        os_sys::sock_send(fd, &data, to.as_ref(), 0).map_err(wsa)
+    })();
+    match r {
+        Ok(n) => {
+            if !sent.is_null() {
+                // SAFETY: the caller's out count.
+                unsafe { *sent = n as u32 };
+            }
+            0
+        }
+        Err(e) => err(e, SOCKET_ERROR),
+    }
+}
+
+/// The received count and in/out flags of a WSARecv-style call.
+fn recv_result(r: Result<(usize, *mut u32, bool), u32>, received: *mut u32) -> i32 {
+    match r {
+        Ok((n, f, truncated)) => {
+            if !received.is_null() {
+                // SAFETY: the caller's out count.
+                unsafe { *received = n as u32 };
+            }
+            if !f.is_null() {
+                // SAFETY: the caller's in/out flags; nothing partial to report.
+                unsafe { *f = 0 };
+            }
+            if truncated {
+                return err(WSAEMSGSIZE, SOCKET_ERROR);
+            }
+            0
+        }
+        Err(e) => err(e, SOCKET_ERROR),
+    }
+}
+
+/// Whether the last receive truncated a datagram (Winsock WSAEMSGSIZE).
+fn datagram_truncated(fd: u64, stream: bool, n: usize) -> Result<bool, u32> {
+    if stream {
+        return Ok(false);
+    }
+    let total = os_sys::sock_ctl(fd, net::ctl::LAST_MSG_LEN, 0).map_err(wsa)?;
+    Ok(total as usize > n)
+}
+
+/// WSARecv: one receive scattered over the WSABUFs.
+extern "win64" fn WSARecv(
+    s: u64,
+    bufs: *const u8,
+    count: u32,
+    received: *mut u32,
+    f: *mut u32,
+    overlapped: *mut u8,
+    completion: u64,
+) -> i32 {
+    let r = (|| {
+        let (fd, stream) = fd(s)?;
+        check_shutdown(s, true)?;
+        if !overlapped.is_null() || completion != 0 {
+            return Err(WSAEOPNOTSUPP);
+        }
+        // SAFETY: the caller's in/out flags.
+        let user_flags = if f.is_null() { 0 } else { unsafe { *f as i32 } };
+        let fl = flags(user_flags)?;
+        let (n, _, truncated) = wsa_receive(fd, bufs, count, fl, stream)?;
+        Ok((n, f, truncated))
+    })();
+    recv_result(r, received)
+}
+
+/// WSARecvFrom: like WSARecv, also returning the sender's address.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn WSARecvFrom(
+    s: u64,
+    bufs: *const u8,
+    count: u32,
+    received: *mut u32,
+    f: *mut u32,
+    from: *mut u8,
+    fromlen: *mut i32,
+    overlapped: *mut u8,
+    completion: u64,
+) -> i32 {
+    let r = (|| {
+        let (fd, stream) = fd(s)?;
+        check_shutdown(s, true)?;
+        if !overlapped.is_null() || completion != 0 {
+            return Err(WSAEOPNOTSUPP);
+        }
+        if !from.is_null() && (fromlen.is_null() || unsafe { *fromlen } < 16) {
+            return Err(WSAEFAULT);
+        }
+        // SAFETY: the caller's in/out flags.
+        let user_flags = if f.is_null() { 0 } else { unsafe { *f as i32 } };
+        let fl = flags(user_flags)?;
+        let (n, peer, truncated) = wsa_receive(fd, bufs, count, fl, stream)?;
+        write_addr(&peer, from, fromlen);
+        Ok((n, f, truncated))
+    })();
+    recv_result(r, received)
 }
 
 /// WSASendMsg: WSAMSG { name, namelen, lpBuffers, dwBufferCount, Control,
@@ -780,6 +1200,7 @@ extern "win64" fn WSAIoctl(
 extern "win64" fn WSASendMsg(s: u64, msg: *const u8, f: u32, sent: *mut u32, overlapped: *mut u8, completion: u64) -> i32 {
     let r = (|| {
         let (fd, _) = fd(s)?;
+        check_shutdown(s, false)?;
         if msg.is_null() {
             return Err(WSAEFAULT);
         }
@@ -787,24 +1208,20 @@ extern "win64" fn WSASendMsg(s: u64, msg: *const u8, f: u32, sent: *mut u32, ove
             return Err(WSAEOPNOTSUPP);
         }
         // SAFETY: the caller's WSAMSG (x64 layout: 56 bytes) and WSABUFs.
-        let (to, data) = unsafe {
+        let (to, bufs, count) = unsafe {
             let m = msg as u64;
             let name: u64 = teb::get(m, 0);
             let name_len: i32 = teb::get(m, 8);
             let bufs: u64 = teb::get(m, 16);
             let count: u32 = teb::get(m, 24);
+            // Control is a WSABUF at 32; ancillary messages are not supported.
             if teb::get::<u32>(m, 32) != 0 {
                 return Err(WSAEINVAL);
             }
             let to = if name == 0 { None } else { Some(read_addr(name as *const u8, name_len)?) };
-            let mut data = Vec::new();
-            for i in 0..count as u64 {
-                let len: u32 = teb::get(bufs, (i * 16) as usize);
-                let p: u64 = teb::get(bufs, (i * 16 + 8) as usize);
-                data.extend_from_slice(core::slice::from_raw_parts(p as *const u8, len as usize));
-            }
-            (to, data)
+            (to, bufs, count)
         };
+        let data = wsa_gather(bufs as *const u8, count)?;
         os_sys::sock_send(fd, &data, to.as_ref(), 0).map_err(wsa)
     })();
     match r {
@@ -1003,6 +1420,9 @@ extern "win64" fn __WSAFDIsSet(s: u64, set: *const u8) -> i32 {
 /// writing (the exception set is reported empty); timeval {sec, usec}.
 extern "win64" fn select(_nfds: i32, rd: *mut u8, wr: *mut u8, ex: *mut u8, timeout: *const i32) -> i32 {
     trace_io(format_args!("select begin"));
+    if rd.is_null() && wr.is_null() && ex.is_null() {
+        return err(WSAEINVAL, SOCKET_ERROR);
+    }
     let read_set = |p: *mut u8| -> Vec<u64> {
         if p.is_null() {
             return Vec::new();
@@ -1014,6 +1434,13 @@ extern "win64" fn select(_nfds: i32, rd: *mut u8, wr: *mut u8, ex: *mut u8, time
         }
     };
     let (r, w) = (read_set(rd), read_set(wr));
+    // The exception set is always reported empty (OSyx has no OOB data), but
+    // an invalid handle in it is still an error, as on Windows.
+    for s in read_set(ex) {
+        if let Err(e) = fd(s) {
+            return err(e, SOCKET_ERROR);
+        }
+    }
     let mut items = Vec::new();
     for (&s, ev) in
         r.iter().map(|s| (s, osyx_abi::ipc::WAIT_READABLE)).chain(w.iter().map(|s| (s, osyx_abi::ipc::WAIT_WRITABLE)))
@@ -1026,8 +1453,14 @@ extern "win64" fn select(_nfds: i32, rd: *mut u8, wr: *mut u8, ex: *mut u8, time
     let ns = if timeout.is_null() {
         u64::MAX
     } else {
-        // SAFETY: the caller's timeval.
-        unsafe { (*timeout).max(0) as u64 * 1_000_000_000 + (*timeout.add(1)).max(0) as u64 * 1000 }
+        // SAFETY: the caller's timeval {sec, usec}.
+        unsafe {
+            let (sec, usec) = (*timeout, *timeout.add(1));
+            if sec < 0 || usec < 0 || usec >= 1_000_000 {
+                return err(WSAEINVAL, SOCKET_ERROR);
+            }
+            sec as u64 * 1_000_000_000 + usec as u64 * 1000
+        }
     };
     let mut raw: Vec<os_sys::ipc::WaitItem> = items.iter().map(|(_, i)| *i).collect();
     if let Err(e) = os_sys::wait_handles(&mut raw, ns) {
@@ -1049,6 +1482,21 @@ extern "win64" fn select(_nfds: i32, rd: *mut u8, wr: *mut u8, ex: *mut u8, time
             }
         }
     };
+    if r.is_empty() && w.is_empty() {
+        // No descriptor can become ready: Windows simply waits out the
+        // timeout (forever when there is none). The kernel's wait rejects an
+        // empty handle list, so sleep here instead.
+        if timeout.is_null() {
+            loop {
+                os_sys::sleep(1_000_000_000);
+            }
+        }
+        os_sys::sleep(ns);
+        write_set(rd, &[]);
+        write_set(wr, &[]);
+        write_set(ex, &[]);
+        return 0;
+    }
     let ready = |ev: u32| -> Vec<u64> {
         items
             .iter()
@@ -1104,6 +1552,10 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         __WSAFDIsSet,
         WSASocketW,
         WSAIoctl,
+        WSASend,
+        WSASendTo,
+        WSARecv,
+        WSARecvFrom,
         WSASendMsg,
         inet_pton,
         inet_ntop,

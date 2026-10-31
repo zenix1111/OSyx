@@ -64,6 +64,46 @@ unsafe fn write_string(pointer: u64, capacity: usize, text: &str, wide: bool) ->
     true
 }
 
+/// OPENFILENAME of a 32-bit caller (76 bytes, or 88 with the Windows 2000
+/// fields) widened into the 136-byte x64 layout and copied back.
+fn dialog32(ofn: u64, wide: bool, save: bool) -> i32 {
+    set_error(0);
+    if ofn == 0 {
+        set_error(2);
+        return 0;
+    }
+    // SAFETY: the caller's OPENFILENAME; its size is checked first.
+    let size = unsafe { teb::get::<u32>(ofn, 0) };
+    if size != 76 && size != 88 {
+        set_error(1);
+        return 0;
+    }
+    #[repr(align(8))]
+    struct Native([u8; 136]);
+    let mut native = Native([0; 136]);
+    let n = native.0.as_mut_ptr() as u64;
+    // SAFETY: both structures are large enough for the offsets used.
+    unsafe {
+        teb::put(n, 0, 136u32);
+        teb::put(n, 8, teb::get::<i32>(ofn, 4) as i64 as u64);
+        for (from, to) in [(12, 24), (28, 48), (36, 64), (44, 80), (48, 88), (60, 104)] {
+            teb::put(n, to, teb::get::<u32>(ofn, from) as u64);
+        }
+        for (from, to) in [(24, 44), (32, 56), (40, 72), (52, 96)] {
+            teb::put(n, to, teb::get::<u32>(ofn, from));
+        }
+    }
+    let result = dialog(n, wide, save);
+    // SAFETY: as above.
+    unsafe {
+        teb::put(ofn, 24, teb::get::<u32>(n, 44));
+        teb::put(ofn, 52, teb::get::<u32>(n, 96));
+        teb::put(ofn, 56, teb::get::<u16>(n, 100));
+        teb::put(ofn, 58, teb::get::<u16>(n, 102));
+    }
+    result
+}
+
 fn dialog(ofn: u64, wide: bool, save: bool) -> i32 {
     set_error(0);
     if ofn == 0 {
@@ -199,15 +239,27 @@ fn dialog(ofn: u64, wide: bool, save: bool) -> i32 {
 }
 
 extern "win64" fn GetOpenFileNameW(ofn: u64) -> i32 {
+    if crate::wow64::is_active() {
+        return dialog32(ofn, true, false);
+    }
     dialog(ofn, true, false)
 }
 extern "win64" fn GetOpenFileNameA(ofn: u64) -> i32 {
+    if crate::wow64::is_active() {
+        return dialog32(ofn, false, false);
+    }
     dialog(ofn, false, false)
 }
 extern "win64" fn GetSaveFileNameW(ofn: u64) -> i32 {
+    if crate::wow64::is_active() {
+        return dialog32(ofn, true, true);
+    }
     dialog(ofn, true, true)
 }
 extern "win64" fn GetSaveFileNameA(ofn: u64) -> i32 {
+    if crate::wow64::is_active() {
+        return dialog32(ofn, false, true);
+    }
     dialog(ofn, false, true)
 }
 
@@ -263,6 +315,11 @@ fn browse(info: u64, wide: bool) -> u64 {
         return 0;
     }
     let (owner, root, display, title, callback) = unsafe {
+        if crate::wow64::is_active() {
+            (teb::get::<u32>(info, 0) as u64, teb::get::<u32>(info, 4) as u64,
+             teb::get::<u32>(info, 8) as u64, string(teb::get::<u32>(info, 12) as u64, wide),
+             teb::get::<u32>(info, 20) as u64)
+        } else {
         (
             teb::get::<u64>(info, 0),
             teb::get::<u64>(info, 8),
@@ -270,6 +327,7 @@ fn browse(info: u64, wide: bool) -> u64 {
             string(teb::get::<u64>(info, 24), wide),
             teb::get::<u64>(info, 40),
         )
+        }
     };
     // Callback/window-message customization is not silently ignored.
     if callback != 0 || root != 0 && pidl_path(root).is_none() {
@@ -297,12 +355,12 @@ fn browse(info: u64, wide: bool) -> u64 {
     if pidl != 0 {
         unsafe {
             write_string(display, 260, selection.path.rsplit('/').next().unwrap_or("C:"), wide);
-            teb::put(info, 56, 0i32);
+            teb::put(info, if crate::wow64::is_active() { 28 } else { 56 }, 0i32);
         }
     }
     pidl
 }
-extern "win64" fn SHBrowseForFolderW(info: u64) -> u64 {
+pub(crate) extern "win64" fn SHBrowseForFolderW(info: u64) -> u64 {
     browse(info, true)
 }
 extern "win64" fn SHBrowseForFolderA(info: u64) -> u64 {
@@ -321,8 +379,42 @@ extern "win64" fn ILFree(pidl: u64) {
     crate::ole32::CoTaskMemFree(pidl);
 }
 
+extern "win64" fn ChooseColorW(cc: u64) -> i32 {
+    set_error(0);
+    if cc == 0 {
+        set_error(2); // CDERR_INITIALIZATION
+        return 0;
+    }
+    if unsafe { teb::get::<u32>(cc, 0) } != 72 {
+        set_error(1); // CDERR_STRUCTSIZE
+        return 0;
+    }
+    0 // cancelled
+}
+
+extern "win64" fn PrintDlgExW(pd: u64) -> u32 {
+    if pd == 0 || unsafe { teb::get::<u32>(pd, 0) } != 136 {
+        return 0x8007_0057; // E_INVALIDARG
+    }
+    // PD_RETURNDEFAULT = 0x0400: OSyx has no default printer.
+    if unsafe { teb::get::<u32>(pd, 28) } & 0x0400 != 0 {
+        set_error(0x1008); // PDERR_NODEFAULTPRN
+        return 0x8000_4005; // E_FAIL
+    }
+    unsafe { teb::put(pd, 128, 0u32) }; // PD_RESULT_CANCEL
+    0 // S_OK
+}
+
 pub fn exports() -> Vec<(&'static str, u64)> {
-    export_table![GetOpenFileNameW, GetOpenFileNameA, GetSaveFileNameW, GetSaveFileNameA, CommDlgExtendedError]
+    export_table![
+        GetOpenFileNameW,
+        GetOpenFileNameA,
+        GetSaveFileNameW,
+        GetSaveFileNameA,
+        ChooseColorW,
+        PrintDlgExW,
+        CommDlgExtendedError
+    ]
 }
 pub fn shell_exports() -> Vec<(&'static str, u64)> {
     export_table![

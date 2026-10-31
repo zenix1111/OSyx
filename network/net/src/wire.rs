@@ -80,6 +80,16 @@ impl Ipv4Addr {
         self.to_u32() & mask == other.to_u32() & mask
     }
 
+    /// Whether `self` is the directed broadcast of the subnet `base/prefix`.
+    /// Every host bit must be set; /31 and /32 have no broadcast address.
+    pub fn is_subnet_broadcast(&self, base: Ipv4Addr, prefix: u8) -> bool {
+        if prefix >= 31 {
+            return false;
+        }
+        let host = !prefix_mask(prefix);
+        self.in_subnet(base, prefix) && self.to_u32() & host == host
+    }
+
     /// Parses dotted-quad notation (exactly four decimal parts 0..=255).
     pub fn parse(s: &str) -> Option<Ipv4Addr> {
         let mut out = [0u8; 4];

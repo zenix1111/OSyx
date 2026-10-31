@@ -144,6 +144,27 @@ void __stdcall start(void) {
     check("VariantClear releases it", VariantClear(&w) == S_OK && refs == 1 && w.vt == VT_EMPTY);
     v.vt = 0x7f;
     check("VariantClear rejects an unknown type", VariantClear(&v) == DISP_E_BADVARTYPE);
+    SAFEARRAY *sa = SafeArrayCreateVector(VT_I4, 0, 3);
+    LONG idx = 1, val = 42, out_val = 0, lb = -1, ub = -1;
+    void *sa_data = NULL;
+    check("SafeArrayCreateVector and bounds", sa != NULL && SafeArrayGetLBound(sa, 1, &lb) == S_OK && lb == 0 && SafeArrayGetUBound(sa, 1, &ub) == S_OK && ub == 2);
+    check("SafeArrayPutElement and GetElement", sa && SafeArrayPutElement(sa, &idx, &val) == S_OK && SafeArrayGetElement(sa, &idx, &out_val) == S_OK && out_val == 42);
+    check("SafeArrayAccessData and UnaccessData", sa && SafeArrayAccessData(sa, &sa_data) == S_OK && ((LONG *)sa_data)[1] == 42 && SafeArrayUnaccessData(sa) == S_OK);
+    v.vt = VT_ARRAY | VT_I4;
+    v.parray = sa;
+    check("VariantClear destroys a SAFEARRAY", VariantClear(&v) == S_OK && v.vt == VT_EMPTY);
+    IStream *stm = NULL;
+    HGLOBAL hstm = NULL;
+    ULONG written = 0, read_cb = 0;
+    char stm_buf[8] = {0};
+    LARGE_INTEGER zero_pos = {0};
+    check("CreateStreamOnHGlobal and GetHGlobalFromStream",
+          CreateStreamOnHGlobal(NULL, TRUE, &stm) == S_OK && stm &&
+          stm->lpVtbl->Write(stm, "OSyx", 4, &written) == S_OK && written == 4 &&
+          stm->lpVtbl->Seek(stm, zero_pos, STREAM_SEEK_SET, NULL) == S_OK &&
+          stm->lpVtbl->Read(stm, stm_buf, 4, &read_cb) == S_OK && read_cb == 4 && mem_eq(stm_buf, "OSyx", 4) &&
+          GetHGlobalFromStream(stm, &hstm) == S_OK && hstm != NULL);
+    if (stm) stm->lpVtbl->Release(stm);
 
     /* ---- window stations and desktops ---- */
     HWINSTA ws = GetProcessWindowStation();
@@ -253,6 +274,8 @@ void __stdcall start(void) {
     check("the issuer's unit", cert && CertGetNameStringW(cert, CERT_NAME_ATTR_TYPE, CERT_NAME_ISSUER_FLAG, szOID_ORGANIZATIONAL_UNIT_NAME, cn, 64) && wcs_eq(cn, L"Compatibility"));
     check("a missing attribute is empty", cert && CertGetNameStringW(cert, CERT_NAME_ATTR_TYPE, 0, szOID_LOCALITY_NAME, cn, 64) == 1 && cn[0] == 0);
     check("the context decodes the certificate", cert && cert->pCertInfo->SerialNumber.cbData == 4 && cert->pCertInfo->SerialNumber.pbData[3] == 0x12 && cert->pCertInfo->dwVersion == CERT_V3);
+    char x500[128] = {0};
+    check("CertNameToStrA formats X500 subject", cert && CertNameToStrA(X509_ASN_ENCODING, &cert->pCertInfo->Subject, CERT_X500_NAME_STR, x500, sizeof x500) > 1 && str_eq(x500, "C=PL, O=OSyx, OU=Compatibility, CN=OSyx Test Signer"));
     check("only one certificate matches", cert && CertFindCertificateInStore(store, enc, 0, CERT_FIND_ANY, NULL, CertDuplicateCertificateContext(cert)) == NULL && GetLastError() == (DWORD)CRYPT_E_NOT_FOUND);
     CertFreeCertificateContext(cert);
     check("CertCloseStore", store && CertCloseStore(store, 0));

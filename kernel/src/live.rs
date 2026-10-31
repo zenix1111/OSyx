@@ -121,7 +121,7 @@ fn unpack_cpio(raw: &[u8]) -> Result<usize, &'static str> {
         }
         let path = alloc::format!("/{name}");
         let cred = Cred { uid: e.uid, gid: e.gid };
-        let cx = Lookup { cred, cwd: String::from("/"), case_insensitive: false };
+        let cx = Lookup { cred, cwd: String::from("/"), case_insensitive: false, path_policy: None };
         // A node owned by an unprivileged user needs a parent that user may
         // search (and, for the immediate one, write).
         let widened = widen_parents(&root, &path, cred.uid)?;

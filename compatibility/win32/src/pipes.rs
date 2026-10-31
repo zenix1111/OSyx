@@ -938,10 +938,54 @@ pub(crate) fn relay_out(h: u64) -> Result<(u32, u32), u32> {
     Ok((id, flags))
 }
 
+/// Relay a connected pipe through an explicitly transferred channel, without
+/// giving the receiving process access to the named IPC namespace.
+pub(crate) fn relay_out_channel(h: u64) -> Result<(u64, u32), u32> {
+    let p = pipe(h)?;
+    let chan = p.chan()?;
+    let (parent, child) = os_sys::channel_pair().map_err(errno_to_win32)?;
+    let parent = Fd(parent);
+    let child = Fd(child);
+    let flags = if p.message_type { RELAY_MESSAGE } else { 0 }
+        | if p.read_message.load(Ordering::SeqCst) { RELAY_READ_MESSAGE } else { 0 }
+        | if p.nowait.load(Ordering::SeqCst) { RELAY_NOWAIT } else { 0 }
+        | if p.overlapped { RELAY_OVERLAPPED } else { 0 };
+    let spawned = os_std::thread::Builder::new().stack_size(64 << 10).spawn(move || {
+        // Move the owning wrapper, not just its numeric handle, into the worker.
+        let parent = parent;
+        let rest = core::mem::take(&mut *p.rest.lock().unwrap());
+        if !rest.is_empty() && !forward(parent.0, &rest) { return; }
+        let mut buf = alloc::vec![0u8; CHUNK];
+        loop {
+            let mut items = [
+                os_sys::ipc::WaitItem { handle: chan.0, events: osyx_abi::ipc::WAIT_READABLE | osyx_abi::ipc::WAIT_HANGUP, revents: 0 },
+                os_sys::ipc::WaitItem { handle: parent.0, events: osyx_abi::ipc::WAIT_READABLE | osyx_abi::ipc::WAIT_HANGUP, revents: 0 },
+            ];
+            if os_sys::wait_handles(&mut items, u64::MAX).is_err() { return; }
+            for (from, to, ready) in [(chan.0, parent.0, items[0].revents), (parent.0, chan.0, items[1].revents)] {
+                if ready == 0 { continue; }
+                match os_sys::channel_recv(from, &mut buf, &mut []) {
+                    Ok((n, _)) if forward(to, &buf[..n]) => {}
+                    Err(Errno::WouldBlock) => {}
+                    _ => return,
+                }
+            }
+        }
+    });
+    spawned.map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
+    let handle = child.0;
+    core::mem::forget(child);
+    Ok((handle, flags))
+}
+
 /// The pipe handle another process (`pid`) relays to this one.
 pub(crate) fn relay_in(pid: u64, id: u32, flags: u32) -> Result<Object, u32> {
     let c = os_sys::channel_connect(&relay_name(pid, id)).map_err(errno_to_win32)?;
-    Ok(Object::Pipe(Arc::new(PipeObj {
+    Ok(relay_in_channel(c, flags))
+}
+
+pub(crate) fn relay_in_channel(c: u64, flags: u32) -> Object {
+    Object::Pipe(Arc::new(PipeObj {
         server: false,
         message_type: flags & RELAY_MESSAGE != 0,
         read_message: AtomicBool::new(flags & RELAY_READ_MESSAGE != 0),
@@ -959,7 +1003,7 @@ pub(crate) fn relay_in(pid: u64, id: u32, flags: u32) -> Result<Object, u32> {
         cancel: AtomicU64::new(0),
         pending: AtomicU32::new(0),
         disconnected: AtomicBool::new(false),
-    })))
+    }))
 }
 
 pub fn exports() -> Vec<(&'static str, u64)> {

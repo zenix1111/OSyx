@@ -338,6 +338,30 @@ impl TmpFs {
         Ok(ino)
     }
 
+    /// Gives the existing non-directory node `target` a second name.
+    pub fn link(&mut self, dir: u64, name: &str, target: u64) -> Result<()> {
+        validate_name(name)?;
+        if self.entries(dir)?.contains_key(name) {
+            return Err(Errno::AlreadyExists);
+        }
+        if matches!(self.node(target)?.data, Data::Dir { .. }) {
+            return Err(Errno::IsADirectory);
+        }
+        if self.node(target)?.nlink == 0 {
+            return Err(Errno::NotFound);
+        }
+        self.charge(NODE_COST + name.len() as u64)?;
+        let now = (self.clock)();
+        let n = self.node_mut(target)?;
+        n.nlink += 1;
+        n.ctime = now;
+        self.entries_mut(dir)?.insert(name.to_string(), target);
+        let parent = self.node_mut(dir)?;
+        parent.mtime = now;
+        parent.ctime = now;
+        Ok(())
+    }
+
     /// Records one more user of `ino` (an open file handle).
     pub fn open(&mut self, ino: u64) -> Result<()> {
         self.node_mut(ino)?.open += 1;

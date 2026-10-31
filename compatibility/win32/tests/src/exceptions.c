@@ -71,6 +71,10 @@ void __stdcall start(void) {
     check("RaiseException dispatches arguments and resumes its caller",seen==6&&shape_ok);
     HANDLE t1=CreateThread(NULL,0,thread_probe,NULL,0,NULL),t2=CreateThread(NULL,0,thread_probe,NULL,0,NULL);DWORD e1=99,e2=99;
     BOOL joined=t1&&t2&&WaitForSingleObject(t1,2000)==WAIT_OBJECT_0&&WaitForSingleObject(t2,2000)==WAIT_OBJECT_0&&GetExitCodeThread(t1,&e1)&&GetExitCodeThread(t2,&e2);
+    if (!(joined&&e1==0&&e2==0&&seen==8&&shape_ok)) {
+        put("exceptions: thread details joined="); put_uint(joined); put(" e1="); put_uint(e1);
+        put(" e2="); put_uint(e2); put(" seen="); put_uint(seen); put(" shape="); put_uint(shape_ok); put("\r\n");
+    }
     check("vectored faults resume separate Windows threads",joined&&e1==0&&e2==0&&seen==8&&shape_ok);
     if(t1)CloseHandle(t1);if(t2)CloseHandle(t2);
     check("vectored continuation callbacks run after recovery",continued==8);

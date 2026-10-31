@@ -1,4 +1,7 @@
-//! OSyx system call ABI, version 11.
+//! OSyx system call ABI, version 13.
+//!
+//! Version 13 adds SET_FS32_BASE: the FS base that 32-bit compatibility-mode
+//! code uses (see [`wow64`]). 64-bit code keeps using SET_FS_BASE.
 //!
 //! Version 11 adds DISCARD for demand-zero anonymous memory.
 //!
@@ -45,10 +48,16 @@
 
 #![no_std]
 
-pub mod ipc;
-pub mod net;
+extern crate alloc;
 
-pub const ABI_VERSION: u32 = 11;
+pub mod battery;
+pub mod ipc;
+pub mod media;
+pub mod net;
+pub mod sandbox;
+pub mod wow64;
+
+pub const ABI_VERSION: u32 = 13;
 pub mod fault;
 
 /// Highest user virtual address + 1 (the canonical lower half).
@@ -363,6 +372,54 @@ pub mod nr {
     /// the caller's process (0: unknown), which inherits the caller's
     /// priority while it waits.
     pub const FUTEX_WAIT_OWNED: u64 = 95;
+    /// `set_fs32_base(base: u64) -> 0`: FS base for 32-bit compatibility-mode
+    /// code, which reads its TEB at `fs:[0x18]`. The kernel stores it in the
+    /// thread's 32-bit FS data descriptor, switched in with the thread on
+    /// every context switch. IA-32e keeps one hidden FS base, so a non-zero
+    /// base also replaces what 64-bit code sees until it calls
+    /// [`SET_FS_BASE`] again; 0 restores the thread's 64-bit base. `base`
+    /// must be page-aligned, below 4 GiB and (unless 0) in the user half.
+    pub const SET_FS32_BASE: u64 = 96;
+    /// `thread_suspend(tid, op) -> previous suspend count` for a thread of
+    /// the caller's process (tid 0 = the caller); `op` is one of
+    /// [`crate::suspend`]. A suspended thread stops at its next return to
+    /// user mode (a thread waiting inside the kernel finishes its wait
+    /// first), as on Windows. `Busy` once the count is [`crate::suspend::MAX`].
+    pub const THREAD_SUSPEND: u64 = 97;
+    /// `thread_times(tid) -> cpu_ticks`: scheduler samples (one per
+    /// millisecond) the thread of the caller's process has run for.
+    pub const THREAD_TIMES: u64 = 98;
+    /// `working_set(pid, buf, cap) -> count`: writes the resident pages of
+    /// process `pid` (the caller's own or, for root or the owner, another)
+    /// into `buf` (`cap` u64 entries) and returns how many pages are
+    /// resident in all; entries beyond `cap` are not written. An entry is
+    /// the page-aligned user address with the protection in its low bits:
+    /// bit 0 writable, bit 1 executable.
+    pub const WORKING_SET: u64 = 99;
+    /// `link(existing, new) -> 0`: a second name (hard link) for the file
+    /// `existing`. `AlreadyExists`, `IsADirectory`, `CrossDevice` as for
+    /// `rename`.
+    pub const LINK: u64 = 100;
+    /// `spawn_restricted(exec: *const ExecArgs, policy: *const sandbox::SpawnPolicy)`.
+    pub const SPAWN_RESTRICTED: u64 = 101;
+    /// `channel_pair(out: *mut [u64; 2]) -> 0`: anonymous connected endpoints.
+    pub const CHANNEL_PAIR: u64 = 102;
+    /// Start a child with redirected streams and its initial thread held.
+    pub const SPAWN_STDIO_SUSPENDED: u64 = 103;
+    /// Resume a direct child's initial thread; return the previous hold count.
+    pub const RESUME_CHILD: u64 = 104;
+    /// Grant an existing channel to a live, restricted direct child.
+    pub const GRANT_CHILD_CHANNEL: u64 = 105;
+}
+
+/// Operations of `nr::THREAD_SUSPEND`.
+pub mod suspend {
+    /// Reads the suspend count.
+    pub const QUERY: u64 = 0;
+    pub const SUSPEND: u64 = 1;
+    pub const RESUME: u64 = 2;
+    /// MAXIMUM_SUSPEND_COUNT of Windows.
+    pub const MAX: u32 = 127;
 }
 
 /// Thread priorities (`nr::THREAD_PRIORITY`).
@@ -397,11 +454,17 @@ pub mod firmware {
     /// `(bus << 16 | device << 8 | function, offset, width | 0x100 to
     /// write, value) -> value read`: PCI configuration, segment 0.
     pub const PCI: u64 = 4;
+    /// `(buf, len) -> devices claimed`: hands the kernel the HID over I2C
+    /// devices that the ACPI service found (`osyx_i2c::spec` encoding). The
+    /// call returns when every device has been probed (bounded); a device
+    /// the kernel cannot or will not drive is logged and left alone.
+    pub const I2C_HID: u64 = 5;
 }
 
-/// Battery state published by the ACPI service in [`BATTERY_STATUS_PATH`]
-/// as one line: `percent charging ac` (`percent` 0-100, `charging` and
-/// `ac` 0 or 1), or `none` when the machine reports no battery.
+/// Battery state published by the ACPI service in [`BATTERY_STATUS_PATH`]:
+/// a first line `percent charging ac` (`percent` 0-100, `charging` and
+/// `ac` 0 or 1), or `none` when the machine reports no battery, and an
+/// optional second line of `key=value` details. See [`battery`].
 pub const BATTERY_STATUS_PATH: &str = "/run/battery";
 
 /// `map_ex` flags.

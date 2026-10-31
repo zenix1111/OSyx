@@ -53,7 +53,31 @@ pub fn pipe(out: u64) -> Result<u64, Errno> {
     Ok(0)
 }
 
+pub fn channel_pair(out: u64) -> Result<u64, Errno> {
+    if !user_range_ok(out, 16) {
+        return Err(Errno::Fault);
+    }
+    let (cred, _) = process::current_identity();
+    let (a, b) = ipc::pair(sched::current_pid(), cred.uid);
+    let handles = process::add_objects(alloc::vec![Object::Channel(Arc::new(a)), Object::Channel(Arc::new(b))])?;
+    let pair = [handles[0], handles[1]];
+    if let Err(err) = put_user(out, &pair) {
+        let _ = process::close_handle(pair[0]);
+        let _ = process::close_handle(pair[1]);
+        return Err(err);
+    }
+    Ok(0)
+}
+
 pub fn spawn_stdio(args: u64, stdio: u64) -> Result<u64, Errno> {
+    spawn_stdio_impl(args, stdio, false)
+}
+
+pub fn spawn_stdio_suspended(args: u64, stdio: u64) -> Result<u64, Errno> {
+    spawn_stdio_impl(args, stdio, true)
+}
+
+fn spawn_stdio_impl(args: u64, stdio: u64, suspended: bool) -> Result<u64, Errno> {
     let req = ExecRequest::from_user(args)?;
     let raw: [u64; 3] = get_user(stdio)?;
     let mut objs: [Option<Object>; 3] = [None, None, None];
@@ -66,7 +90,63 @@ pub fn spawn_stdio(args: u64, stdio: u64) -> Result<u64, Errno> {
             objs[i] = Some(o);
         }
     }
-    process::spawn_with_stdio(sched::current_pid(), &req, objs).map_err(|e| e.errno())
+    if suspended {
+        process::spawn_with_stdio_suspended(sched::current_pid(), &req, objs).map_err(|e| e.errno())
+    } else {
+        process::spawn_with_stdio(sched::current_pid(), &req, objs).map_err(|e| e.errno())
+    }
+}
+
+pub fn spawn_restricted(args: u64, policy: u64) -> Result<u64, Errno> {
+    use osyx_abi::sandbox::{PathRule, SpawnPolicy, SyscallPolicy, MAX_PATH_RULES, MAX_SYSCALL_RULES, MAX_SPAWN_CHANNELS, PATH_EXEC, PATH_READ, PATH_WRITE, SPAWN_SUSPENDED};
+    use osyx_vfs::{sandbox::PathPolicy, Access};
+    if process::current_path_restricted() {
+        return Err(Errno::PermissionDenied);
+    }
+    let p: SpawnPolicy = get_user(policy)?;
+    if p.path_count > MAX_PATH_RULES || p.syscall_count > MAX_SYSCALL_RULES || p.channel_count > MAX_SPAWN_CHANNELS || p.flags & !SPAWN_SUSPENDED != 0 || (p.channel_count != 0 && p.broker_handle == HANDLE_NONE) {
+        return Err(Errno::InvalidArgument);
+    }
+    let broker = if p.broker_handle == HANDLE_NONE {
+        None
+    } else {
+        let object = process::get_object(p.broker_handle)?;
+        if !matches!(object, Object::Channel(_)) {
+            return Err(Errno::InvalidArgument);
+        }
+        Some(object)
+    };
+    let mut channels = Vec::with_capacity(p.channel_count as usize);
+    for i in 0..p.channel_count {
+        let offset = i.checked_mul(8).ok_or(Errno::InvalidArgument)?;
+        let handle: u64 = get_user(p.channels.checked_add(offset).ok_or(Errno::Fault)?)?;
+        let object = process::get_object(handle)?;
+        if !matches!(object, Object::Channel(_)) { return Err(Errno::InvalidArgument); }
+        channels.push(object);
+    }
+    let mut rules = Vec::with_capacity(p.path_count as usize);
+    for i in 0..p.path_count {
+        let offset = i.checked_mul(core::mem::size_of::<PathRule>() as u64).ok_or(Errno::InvalidArgument)?;
+        let rule: PathRule = get_user(p.paths.checked_add(offset).ok_or(Errno::Fault)?)?;
+        if rule.path_len == 0 || rule.path_len > osyx_abi::MAX_PATH as u64 || rule.access == 0 || rule.access & !(PATH_READ | PATH_WRITE | PATH_EXEC) != 0 {
+            return Err(Errno::InvalidArgument);
+        }
+        let mut bytes = alloc::vec![0u8; rule.path_len as usize];
+        copy_from_user(&mut bytes, rule.path)?;
+        let path = alloc::string::String::from_utf8(bytes).map_err(|_| Errno::InvalidArgument)?;
+        let access = Access { read: rule.access & PATH_READ != 0, write: rule.access & PATH_WRITE != 0, exec: rule.access & PATH_EXEC != 0 };
+        rules.push((path, access));
+    }
+    let borrowed: Vec<_> = rules.iter().map(|(path, access)| (path.as_str(), *access)).collect();
+    let paths = Arc::new(PathPolicy::new(&borrowed)?);
+    let mut allowed = alloc::vec![0u64; p.syscall_count as usize];
+    if !allowed.is_empty() {
+        // SAFETY: u64 is padding-free and every bit pattern is valid.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(allowed.as_mut_ptr() as *mut u8, allowed.len() * 8) };
+        copy_from_user(bytes, p.syscalls)?;
+    }
+    let req = ExecRequest::from_user(args)?;
+    process::spawn_restricted(sched::current_pid(), &req, paths, Arc::new(SyscallPolicy::new(&allowed)), broker, channels, p.flags & SPAWN_SUSPENDED != 0).map_err(|e| e.errno())
 }
 
 /// Reads standard input (handle 0) when it was redirected.
@@ -118,6 +198,9 @@ fn user_name(ptr: u64, len: u64) -> Result<alloc::string::String, Errno> {
 }
 
 pub fn channel_listen(name: u64, len: u64) -> Result<u64, Errno> {
+    if process::current_path_restricted() {
+        return Err(Errno::PermissionDenied);
+    }
     let name = user_name(name, len)?;
     let (cred, _) = process::current_identity();
     // System-wide services stay privileged. Applications may create
@@ -132,6 +215,11 @@ pub fn channel_listen(name: u64, len: u64) -> Result<u64, Errno> {
 }
 
 pub fn channel_connect(name: u64, len: u64) -> Result<u64, Errno> {
+    // Global services share the caller's uid and may expose privileged
+    // operations. Only an explicit broker grant can safely open them.
+    if process::current_path_restricted() {
+        return Err(Errno::PermissionDenied);
+    }
     let name = user_name(name, len)?;
     let (cred, _) = process::current_identity();
     let ep = ipc::connect(&name, sched::current_pid(), cred.uid)?;
@@ -270,6 +358,11 @@ pub fn channel_recv(handle: u64, msg: u64) -> Result<u64, Errno> {
         return Err(Errno::Fault);
     }
     let received = c.recv(cap, max_objects)?;
+    // A transferred file section can bypass the receiver's path policy.
+    // Reject the whole message until a broker can validate such grants.
+    if process::current_path_restricted() && received.objects.iter().any(|o| matches!(o, Object::FileMap(_) | Object::File(_))) {
+        return Err(Errno::PermissionDenied);
+    }
     let len = received.data.len();
     copy_to_user(m.data, &received.data)?;
     let handles = if received.objects.is_empty() { Vec::new() } else { process::add_objects(received.objects)? };
@@ -315,7 +408,7 @@ pub fn filemap_create(file: u64, size: u64, writable: u64) -> Result<u64, Errno>
 pub fn filemap_map(handle: u64, offset: u64, len: u64, writable: u64) -> Result<u64, Errno> {
     if writable > 1 { return Err(Errno::InvalidArgument); }
     let Object::FileMap(section) = process::get_object(handle)? else { return Err(Errno::BadHandle) };
-    section.map(offset, len, writable != 0)
+    crate::filemap::Section::map(&section, offset, len, writable != 0)
 }
 
 /// The shared-image key of `file` at `[addr, addr + len)` for the caller.
@@ -349,6 +442,11 @@ pub fn image_query(file: u64) -> Result<u64, Errno> {
 }
 
 pub fn image_publish(file: u64, addr: u64, len: u64) -> Result<u64, Errno> {
+    // Image cache is shared by uid and its published bytes are not verified.
+    // A restricted process must not poison images used by its broker.
+    if process::current_path_restricted() {
+        return Err(Errno::PermissionDenied);
+    }
     let key = image_key(file, addr, len)?;
     if crate::image::lookup(&key).is_some() {
         return Err(Errno::AlreadyExists);
@@ -433,6 +531,16 @@ pub fn display_release() -> Result<u64, Errno> {
 pub fn proc_info(pid: u64, out: u64) -> Result<u64, Errno> {
     put_user(out, &process::info(pid)?)?;
     Ok(0)
+}
+
+/// `working_set(pid, buf, cap)`: the resident user pages of a process.
+pub fn working_set(pid: u64, buf: u64, cap: u64) -> Result<u64, Errno> {
+    let me = sched::current_pid();
+    let pid = if pid == 0 { me } else { pid };
+    let root = process::working_set_root(pid, me)?;
+    let (pages, total) = crate::mem::paging::user_pages(root, cap.min(1 << 22) as usize);
+    put_slice(buf, pages.len() as u64 * 8, &pages)?;
+    Ok(total)
 }
 
 pub fn proc_list(buf: u64, len: u64) -> Result<u64, Errno> {

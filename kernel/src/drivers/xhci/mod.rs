@@ -1394,6 +1394,18 @@ impl Xhci {
             self.release_device(child);
         }
         if let Some(dev) = self.devices.get_mut(&slot) {
+            // A mass-storage drive: its I/O fails from now on, queued
+            // requests end at once, and the storage manager takes the
+            // volumes away (from its own thread: unmounting writes to the
+            // disk through this very controller thread).
+            if let Some(state) = &dev.storage {
+                state.gone.store(true, Ordering::Release);
+                storage::fail_pending(self.index, slot);
+                kprintln!("usb {}: storage {} removed", dev.name, state.disk_name);
+                if !state.disk_name.is_empty() {
+                    crate::media::disk_gone(&state.disk_name);
+                }
+            }
             crate::wireless::usb_gone(&dev.name);
             if let Some(bt) = &dev.bt {
                 crate::bluetooth::unregister(bt.unit());

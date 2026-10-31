@@ -67,16 +67,104 @@ extern "win64" fn OpenThread(_access: u32, inherit: i32, tid: u32) -> u64 {
     }
 }
 
-extern "win64" fn GetThreadTimes(_h: u64, _c: *mut u64, _e: *mut u64, _k: *mut u64, _u: *mut u64) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+/// The thread behind a handle, as (tid, object): the pseudo handle is the
+/// calling thread.
+fn thread_of(h: u64) -> Option<(u32, Option<alloc::sync::Arc<objects::ThreadObj>>)> {
+    match objects::get(h) {
+        Some(Object::Thread(t)) => Some((t.tid.load(Ordering::SeqCst), Some(t))),
+        _ if h == objects::CURRENT_THREAD => {
+            let tid = kernel32::GetThreadId(h);
+            let obj = objects::find(|o| matches!(o, Object::Thread(t) if t.tid.load(Ordering::SeqCst) == tid)).and_then(|o| match o {
+                Object::Thread(t) => Some(t),
+                _ => None,
+            });
+            Some((tid, obj))
+        }
+        _ => None,
+    }
 }
 
-extern "win64" fn QueryThreadCycleTime(_h: u64, _cycles: *mut u64) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+/// Scheduler samples (milliseconds) the thread has run for.
+fn thread_ticks(tid: u32, obj: &Option<alloc::sync::Arc<objects::ThreadObj>>) -> u64 {
+    match obj {
+        Some(t) if t.done.load(Ordering::SeqCst) => t.final_ticks.load(Ordering::SeqCst),
+        _ => os_sys::thread_times(tid as u64).unwrap_or(0),
+    }
 }
 
-extern "win64" fn QueryProcessCycleTime(_h: u64, _cycles: *mut u64) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+/// GetThreadTimes: creation and exit time (the exit time is 0 while it runs)
+/// and the CPU time. The scheduler samples a thread once per millisecond
+/// without telling kernel from user mode, so all of it is reported as user
+/// time and the kernel time is 0.
+extern "win64" fn GetThreadTimes(h: u64, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32 {
+    let Some((tid, obj)) = thread_of(h) else { return fail(ERROR_INVALID_HANDLE, 0) };
+    if creation.is_null() || exit.is_null() || kernel.is_null() || user.is_null() {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    let created = obj.as_ref().map_or(0, |t| t.created_ns.load(Ordering::SeqCst));
+    let exited = obj.as_ref().map_or(0, |t| t.exited_ns.load(Ordering::SeqCst));
+    // SAFETY: the caller's FILETIMEs.
+    unsafe {
+        core::ptr::write_unaligned(creation, kernel32::filetime(created as i64));
+        core::ptr::write_unaligned(exit, if exited == 0 { 0 } else { kernel32::filetime(exited as i64) });
+        core::ptr::write_unaligned(kernel, 0);
+        core::ptr::write_unaligned(user, thread_ticks(tid, &obj) * 10_000);
+    }
+    1
+}
+
+/// QueryThreadCycleTime: the thread's CPU time in TSC cycles.
+extern "win64" fn QueryThreadCycleTime(h: u64, cycles: *mut u64) -> i32 {
+    let Some((tid, obj)) = thread_of(h) else { return fail(ERROR_INVALID_HANDLE, 0) };
+    if cycles.is_null() {
+        return fail(ERROR_NOACCESS, 0);
+    }
+    // SAFETY: the caller's out pointer.
+    unsafe { *cycles = (thread_ticks(tid, &obj) as u128 * tsc_hz() as u128 / 1000) as u64 };
+    1
+}
+
+/// TSC cycles per second, measured once against the monotonic clock (which
+/// the kernel derives from the same counter, at nanosecond resolution).
+pub(crate) fn tsc_hz() -> u64 {
+    static HZ: AtomicU64 = AtomicU64::new(0);
+    let known = HZ.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    let (ns0, c0) = (os_sys::clock(osyx_abi::CLOCK_MONOTONIC).unwrap_or(0), rdtsc());
+    os_std::thread::sleep(core::time::Duration::from_millis(5));
+    let (ns1, c1) = (os_sys::clock(osyx_abi::CLOCK_MONOTONIC).unwrap_or(0), rdtsc());
+    let hz = (c1 - c0) as u128 * 1_000_000_000 / (ns1.saturating_sub(ns0).max(1)) as u128;
+    HZ.store(hz as u64, Ordering::Relaxed);
+    hz as u64
+}
+
+fn rdtsc() -> u64 {
+    // SAFETY: RDTSC exists on every x86-64 and has no side effects.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// QueryProcessCycleTime: the process's CPU time (the scheduler samples, one
+/// per millisecond) in TSC cycles.
+extern "win64" fn QueryProcessCycleTime(h: u64, cycles: *mut u64) -> i32 {
+    if !is_process(h) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
+    if cycles.is_null() {
+        return fail(ERROR_NOACCESS, 0);
+    }
+    let pid = match objects::get(h) {
+        Some(Object::Process(p)) => p.pid,
+        _ => kernel32::pid(),
+    };
+    let info = match os_sys::proc_info(pid) {
+        Ok(i) => i,
+        Err(e) => return fail(errno_to_win32(e), 0),
+    };
+    // SAFETY: the caller's out pointer.
+    unsafe { *cycles = (info.cpu_ticks as u128 * tsc_hz() as u128 / 1000) as u64 };
+    1
 }
 
 /// Only the calling thread can end itself (ExitThread); OSyx offers no way
@@ -435,9 +523,54 @@ extern "win64" fn K32GetProcessMemoryInfo(h: u64, out: *mut u8, cb: u32) -> i32 
 
 /// PSAPI_WORKING_SET_INFORMATION lists every resident page; OSyx has no
 /// call that enumerates them.
-extern "win64" fn K32QueryWorkingSet(_h: u64, _buf: *mut u8, _len: u32) -> i32 {
-    fail(ERROR_NOT_SUPPORTED, 0)
+/// PSAPI_WORKING_SET_BLOCK protection of a page, from the leaf's bits.
+fn working_set_protection(writable: bool, executable: bool) -> u64 {
+    match (writable, executable) {
+        (false, false) => 1, // PAGE_READONLY
+        (false, true) => 3,  // PAGE_EXECUTE_READ
+        (true, false) => 4,  // PAGE_READWRITE
+        (true, true) => 6,   // PAGE_EXECUTE_READWRITE
+    }
 }
+
+/// K32QueryWorkingSet: PSAPI_WORKING_SET_INFORMATION, a count followed by
+/// one word per resident page (the page address with the protection in the
+/// low bits). Pages are reported unshared (share count 0): the kernel does
+/// not count the sharers of a frame. A buffer that is too small gets the
+/// count and ERROR_BAD_LENGTH, as on Windows.
+extern "win64" fn K32QueryWorkingSet(h: u64, buf: *mut u8, len: u32) -> i32 {
+    let pid = match objects::get(h) {
+        Some(Object::Process(p)) => p.pid,
+        _ if h == objects::CURRENT_PROCESS => kernel32::pid(),
+        _ => return fail(ERROR_INVALID_HANDLE, 0),
+    };
+    if buf.is_null() {
+        return fail(ERROR_NOACCESS, 0);
+    }
+    let cap = (len as usize).saturating_sub(8) / 8;
+    let mut pages = alloc::vec![0u64; cap];
+    let total = match os_sys::working_set(pid, &mut pages) {
+        Ok(n) => n,
+        Err(e) => return fail(errno_to_win32(e), 0),
+    };
+    if len < 8 {
+        return fail(ERROR_BAD_LENGTH_P, 0);
+    }
+    // SAFETY: the caller's buffer holds `len` bytes: the count, then `cap` words.
+    unsafe {
+        core::ptr::write_unaligned(buf as *mut u64, total);
+        for (i, e) in pages.iter().take(total.min(cap as u64) as usize).enumerate() {
+            let word = (e & !0xFFF) | working_set_protection(e & 1 != 0, e & 2 != 0);
+            core::ptr::write_unaligned(buf.add(8 + i * 8) as *mut u64, word);
+        }
+    }
+    if total > cap as u64 {
+        return fail(ERROR_BAD_LENGTH_P, 0);
+    }
+    1
+}
+
+const ERROR_BAD_LENGTH_P: u32 = 24;
 
 /// The image path in NT device form (\Device\HarddiskVolume1\...).
 extern "win64" fn K32GetProcessImageFileNameW(h: u64, buf: *mut u16, size: u32) -> u32 {

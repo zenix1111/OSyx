@@ -83,6 +83,20 @@ fn compare(a: &[char], b: &[char], ignore_case: bool) -> Ordering {
 
 #[allow(clippy::too_many_arguments)]
 /// Compares two NUL-terminated strings in CompareString order.
+/// [`compare_wide`] for NUL-terminated ANSI strings (UTF-8 with Latin-1
+/// fallback, as everywhere in the runtime).
+pub(crate) fn compare_ansi(a: *const u8, b: *const u8, ignore_case: bool) -> Ordering {
+    let decode = |s: *const u8| -> Vec<char> {
+        // SAFETY: the caller passes NUL-terminated strings.
+        let bytes = unsafe { core::ffi::CStr::from_ptr(s.cast()) }.to_bytes();
+        match core::str::from_utf8(bytes) {
+            Ok(t) => t.chars().collect(),
+            Err(_) => bytes.iter().map(|&b| b as char).collect(),
+        }
+    };
+    compare(&decode(a), &decode(b), ignore_case)
+}
+
 pub(crate) fn compare_wide(a: *const u16, b: *const u16, ignore_case: bool) -> Ordering {
     let (Some(x), Some(y)) = (units(a, -1), units(b, -1)) else { return Ordering::Equal };
     compare(&chars(&x), &chars(&y), ignore_case)
@@ -395,6 +409,10 @@ extern "win64" fn GetUserDefaultLangID() -> u16 {
     LCID_EN_US as u16
 }
 
+extern "win64" fn GetUserDefaultUILanguage() -> u16 {
+    LCID_EN_US as u16
+}
+
 extern "win64" fn GetUserDefaultLCID() -> u32 {
     LCID_EN_US
 }
@@ -440,6 +458,7 @@ pub fn exports() -> Vec<(&'static str, u64)> {
         GetCPInfo,
         GetLocaleInfoEx,
         GetUserDefaultLangID,
+        GetUserDefaultUILanguage,
         GetUserDefaultLCID,
         GetUserDefaultLocaleName,
         EnumSystemLocalesEx,

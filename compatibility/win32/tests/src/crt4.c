@@ -131,8 +131,22 @@ static void multibyte(void) {
         setlocale(2,"C");
     }
 }
+static void legacy_format(void) {
+    HMODULE crt = LoadLibraryA("msvcrt.dll");
+    int (*narrow)(char *, size_t, const char *, ...) = crt ? (void *)GetProcAddress(crt, "_snprintf") : NULL;
+    int (*wide)(wchar_t *, size_t, const wchar_t *, ...) = crt ? (void *)GetProcAddress(crt, "_snwprintf") : NULL;
+    char buf[16] = {0}; wchar_t wbuf[16] = {0};
+    check("_snprintf formats x64 variadic arguments", narrow && narrow(buf, sizeof buf, "%s:%d", "os", 42) == 5 && strcmp(buf, "os:42") == 0);
+    check("_snwprintf formats x64 variadic arguments", wide && wide(wbuf, 16, L"%s:%u", L"os", 42) == 5 && wcscmp(wbuf, L"os:42") == 0);
+    buf[4] = 'X';
+    check("_snprintf truncates without writing a terminator", narrow && narrow(buf, 4, "%s", "hello") == -1 && buf[3] == 'l' && buf[4] == 'X');
+    long long (*crt_time)(long long *) = crt ? (void *)GetProcAddress(crt, "time") : NULL;
+    struct { long long seconds; uint64_t guard; } now = { 0, 0xa5a5a5a5a5a5a5a5ULL };
+    long long seconds = crt_time ? crt_time(&now.seconds) : -1;
+    check("msvcrt x64 time writes eight bytes", crt_time && seconds > 0 && now.seconds == seconds && now.guard == 0xa5a5a5a5a5a5a5a5ULL && crt_time(NULL) >= seconds);
+}
 void __stdcall start(void) {
     _set_invalid_parameter_handler(invalid);
-    environment(); files(); multibyte();
+    environment(); files(); multibyte(); legacy_format();
     finish("crt4");
 }

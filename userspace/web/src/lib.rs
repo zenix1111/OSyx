@@ -27,6 +27,9 @@ use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedS
 const MAX_REDIRECTS: usize = 8;
 const MAX_HEADER: usize = 64 * 1024;
 const IO_TIMEOUT_SECS: u64 = 30;
+/// One dead A record must not stall the whole request: give each address
+/// this long before trying the next.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 fn osyx_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     let mut f = os_std::fs::File::open("/dev/random").map_err(|_| getrandom::Error::UNSUPPORTED)?;
@@ -91,7 +94,8 @@ fn connect(url: &Url) -> Result<TcpStream, String> {
     let addrs = os_std::net::lookup_host(&url.host).map_err(|e| format!("cannot resolve {}: {e}", url.host))?;
     let mut last = format!("{} has no IPv4 address", url.host);
     for a in addrs {
-        match TcpStream::connect(&(a, url.port)) {
+        let timeout = Some(os_std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS));
+        match TcpStream::connect_timeout(&os_std::net::SocketAddr::new(a, url.port), timeout) {
             Ok(s) => {
                 let _ = s.set_read_timeout(Some(os_std::time::Duration::from_secs(IO_TIMEOUT_SECS)));
                 return Ok(s);

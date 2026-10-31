@@ -267,6 +267,70 @@ pub(super) fn duplicate_bitmap(g: &mut Gui, h: u64) -> Option<u64> {
     Some(insert_bitmap(g, copy))
 }
 
+pub(super) fn bitmap_size(g: &Gui, h: u64) -> Option<(u32, u32)> {
+    g.bitmaps.get(&h).map(|b| (b.dib.w, b.dib.h))
+}
+
+pub(super) fn bitmap_pixels(g: &Gui, h: u64) -> Option<(u32, u32, Vec<Color>)> {
+    g.bitmaps.get(&h).map(|b| (b.dib.w, b.dib.h, b.pixels()))
+}
+
+/// Load a file-backed RT_BITMAP DIB after validating all bytes that
+/// `Dib::read` and the pixel copy will access.
+pub(super) fn resource_bitmap(g: &mut Gui, data: &[u8]) -> Option<u64> {
+    let rd16 = |n: usize| Some(u16::from_le_bytes(data.get(n..n + 2)?.try_into().ok()?));
+    let rd32 = |n: usize| Some(u32::from_le_bytes(data.get(n..n + 4)?.try_into().ok()?));
+    let header = rd32(0)? as usize;
+    if !(40..=124).contains(&header) || header > data.len() { return None; }
+    let bpp = rd16(14)?;
+    let compression = rd32(16)?;
+    let masks = if compression == 3 && header == 40 { 12 } else { 0 };
+    let palette = if bpp <= 8 { let n = rd32(32)? as usize; if n == 0 { 1usize.checked_shl(bpp as u32)? } else { n } } else { 0 };
+    let offset = header.checked_add(masks)?.checked_add(palette.checked_mul(4)?)?;
+    if offset > data.len() { return None; }
+    let dib = Dib::read(data.as_ptr(), 0)?;
+    if offset.checked_add(dib.bytes())? > data.len() { return None; }
+    let mut bitmap = Bitmap::new(dib, false);
+    let len = bitmap.dib.bytes();
+    bitmap.bits_mut().copy_from_slice(&data[offset..offset + len]);
+    Some(insert_bitmap(g, bitmap))
+}
+
+/// Decode a 32-bit BI_RGB RT_ICON DIB, including its AND mask.
+pub(super) fn resource_icon(g: &mut Gui, data: &[u8]) -> Option<(u64, u64)> {
+    let rd16 = |n: usize| Some(u16::from_le_bytes(data.get(n..n + 2)?.try_into().ok()?));
+    let rd32 = |n: usize| Some(u32::from_le_bytes(data.get(n..n + 4)?.try_into().ok()?));
+    let header = rd32(0)? as usize;
+    let width = rd32(4)? as i32;
+    let total_height = rd32(8)? as i32;
+    if !(40..=124).contains(&header) || header > data.len() || width <= 0 || total_height <= 0 ||
+        total_height % 2 != 0 || rd16(12)? != 1 || rd16(14)? != 32 || rd32(16)? != 0 { return None; }
+    let height = total_height / 2;
+    let color_dib = Dib::new(width, height, 32)?;
+    let mask_dib = Dib::new(width, height, 1)?;
+    let end_color = header.checked_add(color_dib.bytes())?;
+    let end_mask = end_color.checked_add(mask_dib.bytes())?;
+    if end_mask > data.len() { return None; }
+    let mut color = Bitmap::new(color_dib, false);
+    let mut mask = Bitmap::new(mask_dib, false);
+    color.bits_mut().copy_from_slice(&data[header..end_color]);
+    mask.bits_mut().copy_from_slice(&data[end_color..end_mask]);
+    let alpha_present = color.bits().chunks_exact(4).any(|pixel| pixel[3] != 0);
+    if !alpha_present {
+        let (w, h) = (width as usize, height as usize);
+        let stride = mask.dib.stride;
+        for y in 0..h {
+            for x in 0..w {
+                let transparent = mask.bits()[y * stride + x / 8] & (0x80 >> (x % 8)) != 0;
+                color.bits_mut()[(y * w + x) * 4 + 3] = if transparent { 0 } else { 255 };
+            }
+        }
+    }
+    let mask_handle = insert_bitmap(g, mask);
+    let color_handle = insert_bitmap(g, color);
+    Some((mask_handle, color_handle))
+}
+
 fn insert_bitmap(g: &mut Gui, b: Bitmap) -> u64 {
     let h = g.handle();
     g.bitmaps.insert(h, b);
@@ -794,7 +858,7 @@ fn fast_blit(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i3
     })
 }
 
-extern "win64" fn BitBlt(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, rop: u32) -> Bool {
+pub(super) extern "win64" fn BitBlt(dst: u64, x: i32, y: i32, w: i32, h: i32, src: u64, sx: i32, sy: i32, rop: u32) -> Bool {
     if !matches!(rop & !0x40000000, 0xcc0020 | 0x42 | 0xff0062) || w < 0 || h < 0 {
         return fail(ERROR_NOT_SUPPORTED, FALSE);
     }
@@ -1773,7 +1837,8 @@ extern "win64" fn GetGlyphOutlineW(
     need
 }
 extern "win64" fn GetOutlineTextMetricsA(_dc: u64, _size: u32, _out: *mut u8) -> u32 {
-    0
+    // OSyx fonts are not TrueType outlines: there is no OUTLINETEXTMETRIC to report.
+    fail(ERROR_NOT_SUPPORTED, 0)
 }
 extern "win64" fn GetICMProfileW(dc: u64, size: *mut u32, _out: *mut u16) -> Bool {
     if size.is_null() {
@@ -1793,14 +1858,12 @@ extern "win64" fn SetPixelFormat(_dc: u64, _format: i32, _pfd: *const u8) -> Boo
 extern "win64" fn SwapBuffers(_dc: u64) -> Bool {
     fail(ERROR_NOT_SUPPORTED, FALSE)
 }
-extern "win64" fn ExtEscape(
-    _dc: u64,
-    _escape: i32,
-    _count: i32,
-    _input: *const u8,
-    _out_count: i32,
-    _output: *mut u8,
-) -> i32 {
+/// Escapes are printer and driver commands; a display DC supports none
+/// (QUERYESCSUPPORT included), which Windows answers with 0.
+extern "win64" fn ExtEscape(dc: u64, _escape: i32, _count: i32, _input: *const u8, _out_count: i32, _output: *mut u8) -> i32 {
+    if with(|g| !g.dcs.contains_key(&dc)) {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    }
     0
 }
 

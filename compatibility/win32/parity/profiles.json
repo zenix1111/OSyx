@@ -1,0 +1,18 @@
+{
+  "comment": "Application import profiles for scripts/winparity.py. Paths are relative to the repository root and may be absent (build/ is not committed); an absent file is reported, never assumed.",
+  "profiles": {
+    "steam": {
+      "description": "Steam installer (32-bit NSIS SteamSetup.exe) and its extracted NSIS plug-in DLLs (see scripts/win-parity.ps1 -ExtractSteam).",
+      "pe": ["build/steam/core/SteamSetup.exe", "build/steam/plugins/*.dll"]
+    },
+    "zen": {
+      "description": "Zen Browser 1.x (64-bit): launcher, Gecko core and NSS, including delay-loaded imports.",
+      "pe": [
+        "build/zen/1.23.4b/core/zen.exe",
+        "build/zen/1.23.4b/core/xul.dll",
+        "build/zen/1.23.4b/core/mozglue.dll",
+        "build/zen/1.23.4b/core/nss3.dll"
+      ]
+    }
+  }
+}

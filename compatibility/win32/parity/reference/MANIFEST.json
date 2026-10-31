@@ -1,0 +1,621 @@
+{
+ "dlls": {
+  "advapi32.dll": {
+   "x64": {
+    "exports": 853,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 1
+   },
+   "x86": {
+    "exports": 853,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 1
+   }
+  },
+  "avrt.dll": {
+   "x64": {
+    "exports": 20,
+    "file_version": "10.0.26100.8972",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 20,
+    "file_version": "10.0.26100.4202",
+    "ordinal_only": 0
+   }
+  },
+  "bcrypt.dll": {
+   "x64": {
+    "exports": 60,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 60,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "bcryptprimitives.dll": {
+   "x64": {
+    "exports": 11,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 11,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "cfgmgr32.dll": {
+   "x64": {
+    "exports": 283,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 283,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "combase.dll": {
+   "x64": {
+    "exports": 466,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 142
+   },
+   "x86": {
+    "exports": 410,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 122
+   }
+  },
+  "comctl32.dll": {
+   "x64": {
+    "exports": 119,
+    "file_version": "5.82.26100.8328",
+    "ordinal_only": 62
+   },
+   "x86": {
+    "exports": 118,
+    "file_version": "5.82.26100.8521",
+    "ordinal_only": 62
+   }
+  },
+  "comdlg32.dll": {
+   "x64": {
+    "exports": 28,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 2
+   },
+   "x86": {
+    "exports": 28,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 2
+   }
+  },
+  "crypt32.dll": {
+   "x64": {
+    "exports": 295,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 12
+   },
+   "x86": {
+    "exports": 310,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 12
+   }
+  },
+  "cryptbase.dll": {
+   "x64": {
+    "exports": 11,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 11,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "d3d11.dll": {
+   "x64": {
+    "exports": 51,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 51,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "d3dcompiler_47.dll": {
+   "x64": {
+    "exports": 29,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 29,
+    "file_version": "10.0.26100.9168",
+    "ordinal_only": 0
+   }
+  },
+  "dbghelp.dll": {
+   "x64": {
+    "exports": 252,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 16
+   },
+   "x86": {
+    "exports": 250,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 20
+   }
+  },
+  "dnsapi.dll": {
+   "x64": {
+    "exports": 353,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 353,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "dwmapi.dll": {
+   "x64": {
+    "exports": 44,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 74
+   },
+   "x86": {
+    "exports": 44,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 74
+   }
+  },
+  "dwrite.dll": {
+   "x64": {
+    "exports": 1,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 1,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "dxgi.dll": {
+   "x64": {
+    "exports": 20,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 20,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "gdi32.dll": {
+   "x64": {
+    "exports": 995,
+    "file_version": "10.0.26100.8328",
+    "ordinal_only": 14
+   },
+   "x86": {
+    "exports": 995,
+    "file_version": "10.0.26100.8521",
+    "ordinal_only": 14
+   }
+  },
+  "imm32.dll": {
+   "x64": {
+    "exports": 137,
+    "file_version": "10.0.26100.9278",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 137,
+    "file_version": "10.0.26100.9278",
+    "ordinal_only": 0
+   }
+  },
+  "iphlpapi.dll": {
+   "x64": {
+    "exports": 313,
+    "file_version": "10.0.26100.9278",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 313,
+    "file_version": "10.0.26100.8875",
+    "ordinal_only": 0
+   }
+  },
+  "kernel32.dll": {
+   "x64": {
+    "exports": 1698,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 1670,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "kernelbase.dll": {
+   "x64": {
+    "exports": 2037,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 2037,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "ktmw32.dll": {
+   "x64": {
+    "exports": 44,
+    "file_version": "10.0.26100.8521",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 44,
+    "file_version": "10.0.26100.8521",
+    "ordinal_only": 0
+   }
+  },
+  "msvcrt.dll": {
+   "x64": {
+    "exports": 1330,
+    "file_version": "7.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 1440,
+    "file_version": "7.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "ntdll.dll": {
+   "x64": {
+    "exports": 2522,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 1
+   },
+   "x86": {
+    "exports": 2523,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "ole32.dll": {
+   "x64": {
+    "exports": 549,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 8
+   },
+   "x86": {
+    "exports": 479,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 8
+   }
+  },
+  "oleacc.dll": {
+   "x64": {
+    "exports": 28,
+    "file_version": "7.2.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 28,
+    "file_version": "7.2.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "oleaut32.dll": {
+   "x64": {
+    "exports": 425,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 4
+   },
+   "x86": {
+    "exports": 409,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 4
+   }
+  },
+  "propsys.dll": {
+   "x64": {
+    "exports": 224,
+    "file_version": "7.0.26100.9549",
+    "ordinal_only": 44
+   },
+   "x86": {
+    "exports": 224,
+    "file_version": "7.0.26100.9549",
+    "ordinal_only": 44
+   }
+  },
+  "psapi.dll": {
+   "x64": {
+    "exports": 27,
+    "file_version": "10.0.26100.8521",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 27,
+    "file_version": "10.0.26100.8521",
+    "ordinal_only": 0
+   }
+  },
+  "rpcrt4.dll": {
+   "x64": {
+    "exports": 556,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 1
+   },
+   "x86": {
+    "exports": 570,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 1
+   }
+  },
+  "secur32.dll": {
+   "x64": {
+    "exports": 98,
+    "file_version": "10.0.26100.7705",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 98,
+    "file_version": "10.0.26100.7705",
+    "ordinal_only": 0
+   }
+  },
+  "setupapi.dll": {
+   "x64": {
+    "exports": 682,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 682,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "shcore.dll": {
+   "x64": {
+    "exports": 97,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 105
+   },
+   "x86": {
+    "exports": 97,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 101
+   }
+  },
+  "shell32.dll": {
+   "x64": {
+    "exports": 479,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 364
+   },
+   "x86": {
+    "exports": 479,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 364
+   }
+  },
+  "shfolder.dll": {
+   "x64": {
+    "exports": 2,
+    "file_version": "10.0.26100.1",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 2,
+    "file_version": "10.0.26100.1",
+    "ordinal_only": 0
+   }
+  },
+  "shlwapi.dll": {
+   "x64": {
+    "exports": 380,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 551
+   },
+   "x86": {
+    "exports": 380,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 546
+   }
+  },
+  "ucrtbase.dll": {
+   "x64": {
+    "exports": 2484,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 2542,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "uiautomationcore.dll": {
+   "x64": {
+    "exports": 110,
+    "file_version": "7.2.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 110,
+    "file_version": "7.2.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "user32.dll": {
+   "x64": {
+    "exports": 1050,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 160
+   },
+   "x86": {
+    "exports": 1043,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 160
+   }
+  },
+  "userenv.dll": {
+   "x64": {
+    "exports": 59,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 20
+   },
+   "x86": {
+    "exports": 59,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 20
+   }
+  },
+  "uxtheme.dll": {
+   "x64": {
+    "exports": 85,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 114
+   },
+   "x86": {
+    "exports": 85,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 114
+   }
+  },
+  "version.dll": {
+   "x64": {
+    "exports": 17,
+    "file_version": "10.0.26100.1150",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 17,
+    "file_version": "10.0.26100.1",
+    "ordinal_only": 0
+   }
+  },
+  "windowscodecs.dll": {
+   "x64": {
+    "exports": 117,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 117,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "wininet.dll": {
+   "x64": {
+    "exports": 299,
+    "file_version": "11.0.26100.9711",
+    "ordinal_only": 28
+   },
+   "x86": {
+    "exports": 299,
+    "file_version": "11.0.26100.9711",
+    "ordinal_only": 28
+   }
+  },
+  "winmm.dll": {
+   "x64": {
+    "exports": 180,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 1
+   },
+   "x86": {
+    "exports": 192,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 1
+   }
+  },
+  "winspool.drv": {
+   "x64": {
+    "exports": 198,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 59
+   },
+   "x86": {
+    "exports": 198,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 59
+   }
+  },
+  "wintrust.dll": {
+   "x64": {
+    "exports": 165,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 165,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   }
+  },
+  "ws2_32.dll": {
+   "x64": {
+    "exports": 196,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 181,
+    "file_version": "10.0.26100.9711",
+    "ordinal_only": 0
+   }
+  },
+  "wsock32.dll": {
+   "x64": {
+    "exports": 75,
+    "file_version": "10.0.26100.1",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 75,
+    "file_version": "10.0.26100.1",
+    "ordinal_only": 0
+   }
+  },
+  "wtsapi32.dll": {
+   "x64": {
+    "exports": 78,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   },
+   "x86": {
+    "exports": 78,
+    "file_version": "10.0.26100.9549",
+    "ordinal_only": 0
+   }
+  }
+ },
+ "generated": "2026-10-31T10:07:55Z",
+ "schema": 1,
+ "tool": "scripts/winparity.py reference",
+ "windows_dir": "C:\\WINDOWS",
+ "windows_version": "10.0.26100.9711"
+}
